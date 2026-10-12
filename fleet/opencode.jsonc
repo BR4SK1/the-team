@@ -1,0 +1,27 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agents": {
+    "cal": {
+      "permissions": [
+        { "action": "edit", "resource": "*", "effect": "deny" },
+        { "action": "shell", "resource": "*", "effect": "deny" },
+        { "action": "subagent", "resource": "*", "effect": "deny" },
+        { "action": "subagent", "resource": "planner", "effect": "allow" },
+        { "action": "subagent", "resource": "research", "effect": "allow" },
+        { "action": "subagent", "resource": "frontend", "effect": "allow" },
+        { "action": "subagent", "resource": "worker", "effect": "allow" }
+      ]
+    },
+    "planner": {
+      "permissions": [
+        { "action": "edit", "resource": "*", "effect": "deny" },
+        { "action": "shell", "resource": "*", "effect": "ask" },
+        { "action": "shell", "resource": "git status *", "effect": "allow" },
+        { "action": "shell", "resource": "git diff *", "effect": "allow" },
+        { "action": "shell", "resource": "git log *", "effect": "allow" }
+      ]
+    }
+  }
+  // Add shared OpenCode settings here. This file is a fragment for review and
+  // merging into each device's OpenCode configuration, not an auto-loaded file.
+}

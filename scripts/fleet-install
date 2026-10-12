@@ -1,0 +1,90 @@
+#!/usr/bin/env python3
+"""Link the-team's OpenCode assets into a user's config directory."""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import sys
+
+
+START = "<!-- the-team:begin -->"
+END = "<!-- the-team:end -->"
+ASSET_DIRS = ("agents", "skills", "commands")
+
+
+def install_assets(repo: Path, config_dir: Path) -> None:
+    for name in ASSET_DIRS:
+        source_dir = repo / "fleet" / name
+        target_dir = config_dir / name
+        entries = [p for p in source_dir.iterdir() if p.name != ".gitkeep"]
+        if not entries:
+            continue
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for source in entries:
+            target = target_dir / source.name
+            if target.is_symlink() and target.resolve() == source.resolve():
+                continue
+            if target.exists() or target.is_symlink():
+                raise FileExistsError(
+                    f"Refusing to replace existing OpenCode asset: {target}"
+                )
+            target.symlink_to(source, target_is_directory=source.is_dir())
+            print(f"linked {target} -> {source}")
+
+
+def install_instructions(repo: Path, config_dir: Path) -> None:
+    source = repo / "fleet" / "AGENTS.md"
+    target = config_dir / "AGENTS.md"
+    body = source.read_text(encoding="utf-8").strip()
+    block = f"{START}\n{body}\n{END}"
+    existing = target.read_text(encoding="utf-8") if target.exists() else ""
+
+    if existing.count(START) != existing.count(END) or existing.count(START) > 1:
+        raise ValueError(f"Incomplete the-team managed markers in {target}")
+
+    if START in existing:
+        start = existing.index(START)
+        end = existing.index(END) + len(END)
+        updated = existing[:start] + block + existing[end:]
+    else:
+        updated = existing.rstrip()
+        if updated:
+            updated += "\n\n"
+        updated += block + "\n"
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(updated, encoding="utf-8")
+    print(f"updated managed instructions in {target}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config-dir",
+        type=Path,
+        help="OpenCode config directory (defaults to XDG_CONFIG_HOME/opencode or ~/.config/opencode)",
+    )
+    args = parser.parse_args()
+
+    repo = Path(__file__).resolve().parent.parent
+    xdg = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    config_dir = (args.config_dir or xdg / "opencode").expanduser().resolve()
+
+    try:
+        config_dir.mkdir(parents=True, exist_ok=True)
+        install_assets(repo, config_dir)
+        install_instructions(repo, config_dir)
+    except (OSError, ValueError) as error:
+        print(f"fleet-install: {error}", file=sys.stderr)
+        return 1
+
+    print(f"Installed the-team assets into {config_dir}")
+    print("Review fleet/opencode.jsonc and profiles/ for settings to merge locally.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
