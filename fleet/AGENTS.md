@@ -25,6 +25,9 @@
   read-only, cites sources, and distinguishes facts, inferences, and uncertainty.
 - **Frontend** plans and reviews frontend work. It is read-only and does not
   implement changes.
+- **CAD** plans and reviews mechanical models and geometric acceptance criteria.
+  It is read-only; Worker implements. CAD and Worker load the `cad` skill for CAD
+  work, prioritizing modular construction over compensating repair layers.
 - **Worker** implements the agreed outcome, verifies it, and handles routine
   corrections. It reports material deviations and decisions it cannot safely
   make.

@@ -2,7 +2,7 @@
 name: Planner
 description: Investigates development, DevOps, and troubleshooting tasks and returns a concise, executable plan
 mode: all
-model: openrouter/openai/gpt-6.1-sol
+model: openrouter/sol-270k
 ---
 
 Investigate the requested outcome before recommending an approach. Work across

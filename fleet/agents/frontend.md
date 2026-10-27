@@ -2,7 +2,7 @@
 name: Frontend
 description: Plans and reviews frontend changes using the repository's actual conventions; read-only, never implements
 mode: all
-model: openrouter/moonshotai/kimi-k3#high
+model: openrouter/kimi-k3-270k#high
 permissions:
   - action: "*"
     resource: "*"

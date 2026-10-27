@@ -1,5 +1,88 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  "providers": {
+    "openrouter": {
+      "models": {
+        // Shared fleet aliases; upstream IDs stay versioned and explicit.
+        // Pricing metadata checked 2026-10-26; estimates may vary by route.
+        // GPT Sol and Luna enter their higher context tier at 272k prompt tokens.
+        "sol-270k": {
+          "modelID": "openai/gpt-6.1-sol",
+          "name": "GPT-6.1 Sol (fleet, 270k context)",
+          "capabilities": {
+            "tools": true,
+            "temperature": false,
+            "input": ["text", "image", "file"],
+            "output": ["text"],
+            "reasoning": {
+              "supported": true,
+              "effort": ["low", "medium", "high", "xhigh", "max"]
+            }
+          },
+          // Preserve accurate cost estimates for this custom alias (USD / million tokens).
+          "cost": [
+            { "input": 2, "output": 10, "cache": { "read": 0.1, "write": 2.5 } },
+            {
+              "tier": { "type": "context", "size": 272000 },
+              "input": 4,
+              "output": 15,
+              "cache": { "read": 0.2, "write": 5 }
+            }
+          ],
+          // A compaction budget, not a provider-side billing firewall.
+          // Reserve up to 32k tokens for a response within the 270k window.
+          "limit": { "context": 270000, "input": 270000, "output": 32000 }
+        },
+        "luna-270k": {
+          "modelID": "openai/gpt-6-luna",
+          "name": "GPT-6 Luna (fleet, 270k context)",
+          "capabilities": {
+            "tools": true,
+            "temperature": false,
+            "input": ["text", "image", "file"],
+            "output": ["text"],
+            "reasoning": {
+              "supported": true,
+              "toggle": true,
+              "effort": ["low", "medium", "high", "xhigh", "max"]
+            }
+          },
+          "cost": [
+            { "input": 0.1, "output": 0.5, "cache": { "read": 0.01, "write": 0.125 } },
+            {
+              "tier": { "type": "context", "size": 272000 },
+              "input": 0.2,
+              "output": 0.75,
+              "cache": { "read": 0.02, "write": 0.25 }
+            }
+          ],
+          "limit": { "context": 270000, "input": 270000, "output": 32000 }
+        },
+        "kimi-k3-270k": {
+          "modelID": "moonshotai/kimi-k3",
+          "name": "Kimi K3 (fleet, 270k context)",
+          "capabilities": {
+            "tools": true,
+            "temperature": true,
+            "input": ["text", "image", "video"],
+            "output": ["text"],
+            "reasoning": {
+              "supported": true,
+              "toggle": true,
+              "effort": ["low", "high", "max"]
+            }
+          },
+          // Current OpenRouter model metadata advertises no context-pricing tier.
+          "cost": [
+            { "input": 0.159, "output": 20, "cache": { "read": 0.149, "write": 0 } }
+          ],
+          "limit": { "context": 270000, "input": 270000, "output": 32000 }
+        }
+      }
+    }
+  },
+  // Required for these budgets to guide automatic history compaction.
+  "compaction": { "auto": true },
   "agents": {
     "cal": {
       "permissions": [
@@ -9,6 +92,7 @@
         { "action": "subagent", "resource": "planner", "effect": "allow" },
         { "action": "subagent", "resource": "research", "effect": "allow" },
         { "action": "subagent", "resource": "frontend", "effect": "allow" },
+        { "action": "subagent", "resource": "cad", "effect": "allow" },
         { "action": "subagent", "resource": "worker", "effect": "allow" }
       ]
     },

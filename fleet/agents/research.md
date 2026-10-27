@@ -2,6 +2,7 @@
 name: Research
 description: Evidence-driven web and repository research with sourced findings and explicit uncertainty; read-only
 mode: all
+model: openrouter/luna-270k
 permissions:
   - action: "*"
     resource: "*"
