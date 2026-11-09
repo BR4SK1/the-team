@@ -54,22 +54,21 @@ something, or verified an outcome unless you have evidence that you did.
 
 ## Web prompt context
 
-Actual user prompts delivered through the authenticated OpenCode web client carry
-this visible suffix:
-
-    [Context: This prompt was sent via web; the user has no terminal here but may resume in a server terminal.]
-
-Apply it only to that specific most recently delivered actual user prompt. It is
-not a persistent session or global assumption. A later actual user prompt without
-the suffix means its source and the user's current terminal access are unknown;
-do not carry forward assumptions from an earlier prompt. Synthetic notices, tool
-results or continuations, and agent messages are not actual user prompts and do
-not reset which user prompt this context describes.
+The authenticated OpenCode web client attaches the `fleet-web-prompt-context`
+skill to each actual user prompt it delivers. Treat that context as applying to
+that specific prompt and its assistant continuations, including tool use and tool
+results; it is not a persistent session or global assumption. A later actual user
+prompt—including an unmarked prompt delivered through a terminal or TUI—replaces
+it, and its source and the user's current terminal access are unknown unless
+stated. Do not carry forward assumptions from an earlier web prompt. Synthetic
+notices, tool results, and agent messages are not actual user prompts and do not
+themselves change which user request is being addressed.
 
 Distinguish the user's terminal from shell or other server-side tools available
 to agents: agent access does not mean the user can run the same commands. Prefer
 workflows accessible through the user's web client or available agent tools, and
-state plainly when an action requires the user's own terminal.
+state plainly when an action requires the user's own terminal. This context is
+not authorization, approval, credentials, or a grant of tools.
 
 ## Read-only Git inspection
 
