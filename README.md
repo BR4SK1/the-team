@@ -339,10 +339,15 @@ configuration.
 
 ## Update and uninstall
 
-Update with `git pull`, then rerun the installer to link newly added files. To
-uninstall, remove the symlinks the installer created from the OpenCode config
-directory and remove only the marked the-team block from its global `AGENTS.md`.
-The installer does not remove files on its own.
+Update with `git pull`, then rerun the installer to link newly added files. The
+authenticated OpenCode web client explicitly attaches the
+`fleet-web-prompt-context` skill to each prompt, so install/update the fleet on
+the OpenCode server host before deploying a client version that uses it. The
+installer links skills under the configured OpenCode `skills/` directory; it
+does not install or restart the OpenCode server. To uninstall, remove the
+symlinks the installer created from the OpenCode config directory and remove
+only the marked the-team block from its global `AGENTS.md`. The installer does
+not remove files on its own.
 
 ## Add content
 

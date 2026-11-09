@@ -134,6 +134,19 @@ for path in sorted(Path("fleet/agents").glob("*.md")):
         agent_permission_rules(path.read_text(encoding="utf-8"), str(path)),
     )
 
+web_prompt_skill = Path("fleet/skills/fleet-web-prompt-context/SKILL.md")
+skill_text = web_prompt_skill.read_text(encoding="utf-8")
+if not skill_text.startswith("---\n") or "\n---\n" not in skill_text[4:]:
+    raise ValueError(f"{web_prompt_skill}: skill frontmatter must be delimited by ---")
+skill_frontmatter = skill_text[4:].split("\n---\n", 1)[0]
+for required in (
+    "name: fleet-web-prompt-context",
+    "metadata:",
+    "  opencode/autoinvoke: false",
+):
+    if required not in skill_frontmatter.splitlines():
+        raise ValueError(f"{web_prompt_skill}: missing required frontmatter {required!r}")
+
 fleet_config = json.loads(
     strip_jsonc(Path("fleet/opencode.jsonc").read_text(encoding="utf-8"))
 )
