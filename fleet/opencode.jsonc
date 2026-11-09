@@ -1,11 +1,12 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  "default_agent": "cal",
   "providers": {
     "openrouter": {
       "models": {
         // Shared fleet aliases; upstream IDs stay versioned and explicit.
         // Pricing metadata checked 2026-10-26; estimates may vary by route.
-        // GPT Sol and Luna enter their higher context tier at 272k prompt tokens.
+        // GPT-6.1 Sol, Terra, and Luna enter their higher context tier at 272k prompt tokens.
         "sol-270k": {
           "modelID": "openai/gpt-6.1-sol",
           "name": "GPT-6.1 Sol (fleet, 270k context)",
@@ -33,6 +34,31 @@
           // Reserve up to 32k tokens for a response within the 270k window.
           "limit": { "context": 270000, "input": 270000, "output": 32000 }
         },
+        "terra-270k": {
+          "modelID": "openai/gpt-6.1-terra",
+          "name": "GPT-6.1 Terra (fleet, 270k context)",
+          "capabilities": {
+            "tools": true,
+            "temperature": false,
+            "input": ["text", "image", "file"],
+            "output": ["text"],
+            "reasoning": {
+              "supported": true,
+              "effort": ["low", "medium", "high", "xhigh", "max"]
+            }
+          },
+          // OpenRouter catalog pricing checked 2026-10-28; USD per million tokens.
+          "cost": [
+            { "input": 1, "output": 5, "cache": { "read": 0.05, "write": 1.25 } },
+            {
+              "tier": { "type": "context", "size": 272000 },
+              "input": 2,
+              "output": 7.5,
+              "cache": { "read": 0.1, "write": 2.5 }
+            }
+          ],
+          "limit": { "context": 270000, "input": 270000, "output": 32000 }
+        },
         "luna-270k": {
           "modelID": "openai/gpt-6-luna",
           "name": "GPT-6 Luna (fleet, 270k context)",
@@ -58,6 +84,26 @@
           ],
           "limit": { "context": 270000, "input": 270000, "output": 32000 }
         },
+        "glm-5.3-flash-270k": {
+          "modelID": "z-ai/glm-5.3-flash",
+          "name": "GLM 5.3 Flash (fleet, 270k context cap)",
+          "capabilities": {
+            "tools": true,
+            "temperature": true,
+            "input": ["text", "image", "video"],
+            "output": ["text"],
+            "reasoning": {
+              "supported": true,
+              "effort": ["low", "high", "max"]
+            }
+          },
+          // OpenRouter catalog metadata checked 2026-10-30; USD per million tokens.
+          "cost": [
+            { "input": 0.15, "output": 0.5, "cache": { "read": 0.03 } }
+          ],
+          // The model advertises 1,048,576 context; keep the fleet's standard working cap.
+          "limit": { "context": 270000, "input": 270000, "output": 32000 }
+        },
         "kimi-k3-270k": {
           "modelID": "moonshotai/kimi-k3",
           "name": "Kimi K3 (fleet, 270k context)",
@@ -77,6 +123,28 @@
             { "input": 0.159, "output": 20, "cache": { "read": 0.149, "write": 0 } }
           ],
           "limit": { "context": 270000, "input": 270000, "output": 32000 }
+        },
+        // Canonical slug 2026-09-21; reasoning is mandatory with default effort high.
+        "claude-opus-5.5-270k": {
+          "modelID": "anthropic/claude-opus-5.5",
+          "name": "Claude Opus 5.5 (fleet, 270k context)",
+          "capabilities": {
+            "tools": true,
+            "temperature": true,
+            "input": ["text", "image", "file"],
+            "output": ["text"],
+            "reasoning": {
+              "supported": true,
+              "effort": ["low", "medium", "high", "xhigh", "max"]
+            }
+          },
+          // OpenRouter catalog pricing checked 2026-10-30; USD per million tokens.
+          // The catalog lists no context-based pricing tier for this model.
+          "cost": [
+            { "input": 4, "output": 20, "cache": { "read": 0.2, "write": 5 } }
+          ],
+          // The model advertises 1,000,000 context; keep the fleet's standard working cap.
+          "limit": { "context": 270000, "input": 270000, "output": 32000 }
         }
       }
     }
@@ -84,25 +152,45 @@
   // Required for these budgets to guide automatic history compaction.
   "compaction": { "auto": true },
   "agents": {
+    // Cal, Mark, and Reviewer are the fleet's only user-selectable entry points.
+    // Reviewer's permissions live in fleet/agents/reviewer.md, like Mark's.
+    "build": { "disabled": true },
+    "plan": { "disabled": true },
     "cal": {
+      "model": "openrouter/terra-270k#medium",
       "permissions": [
         { "action": "edit", "resource": "*", "effect": "deny" },
         { "action": "shell", "resource": "*", "effect": "deny" },
+        // No Kubernetes access for Cal: deny every tool of the kubernetes MCP
+        // server (MCP permission actions are named <server>_<tool>, so
+        // kubernetes_* covers all of them). Cluster work is delegated to
+        // Planner for investigation and Worker for authorized implementation;
+        // see fleet/agents/cal.md.
+        { "action": "kubernetes_*", "resource": "*", "effect": "deny" },
+        { "action": "opencode_list_mcp_resources", "resource": "kubernetes", "effect": "deny" },
+        { "action": "opencode_read_mcp_resource", "resource": "kubernetes:*", "effect": "deny" },
         { "action": "subagent", "resource": "*", "effect": "deny" },
         { "action": "subagent", "resource": "planner", "effect": "allow" },
         { "action": "subagent", "resource": "research", "effect": "allow" },
         { "action": "subagent", "resource": "frontend", "effect": "allow" },
-        { "action": "subagent", "resource": "cad", "effect": "allow" },
         { "action": "subagent", "resource": "worker", "effect": "allow" }
       ]
     },
     "planner": {
       "permissions": [
         { "action": "edit", "resource": "*", "effect": "deny" },
-        { "action": "shell", "resource": "*", "effect": "ask" },
-        { "action": "shell", "resource": "git status *", "effect": "allow" },
-        { "action": "shell", "resource": "git diff *", "effect": "allow" },
-        { "action": "shell", "resource": "git log *", "effect": "allow" }
+        { "action": "shell", "resource": "*", "effect": "deny" },
+        // Exact hardened Git inspection invocations only, shared with Reviewer
+        // and Frontend; wildcard rules (for example "git diff *") would also
+        // permit mutating options and configured external diff, textconv, and
+        // pager helpers, which execute arbitrary commands. Any other command
+        // is denied, per the shell rule above.
+        { "action": "shell", "resource": "git --no-optional-locks -c core.fsmonitor=false status", "effect": "allow" },
+        { "action": "shell", "resource": "git --no-pager diff --no-ext-diff --no-textconv", "effect": "allow" },
+        { "action": "shell", "resource": "git --no-pager diff --no-ext-diff --no-textconv --stat", "effect": "allow" },
+        { "action": "shell", "resource": "git --no-pager diff --no-ext-diff --no-textconv --cached", "effect": "allow" },
+        { "action": "shell", "resource": "git --no-pager log --no-ext-diff --no-textconv --oneline", "effect": "allow" },
+        { "action": "shell", "resource": "git --no-pager log --no-ext-diff --no-textconv", "effect": "allow" }
       ]
     }
   }

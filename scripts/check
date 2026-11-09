@@ -60,13 +60,108 @@ def strip_jsonc(text: str) -> str:
 for path in sorted(Path("scripts").glob("fleet-install")):
     ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
+# Permission hardening for the fleet agent definitions:
+# - A wildcard shell allow rule (for example "git diff *") also permits mutating
+#   options such as --output=... and configured external diff, textconv, and
+#   pager helpers, which run arbitrary commands. Agent definitions that cannot
+#   edit files (Reviewer, Frontend) and config-fragment agents without edit
+#   access (Planner) must allow only exact, hardened commands.
+# - A read-all grant is appended after the base policy's env-file asks and
+#   overrides them; agents that grant read-all must restore those asks
+#   (Reviewer, Frontend, Research, and Mark). For Mark the read rules do not
+#   sandbox its shell access; they restore the read-tool prompt only.
+SHELL_UNSAFE_CHARS = "*?;&|$`()<>\\"
+
+def agent_permission_rules(text: str, name: str) -> list[dict[str, str]]:
+    lines = text.splitlines()
+    if not lines or lines[0] != "---" or "---" not in lines[1:]:
+        raise ValueError(f"{name}: agent frontmatter must be delimited by ---")
+    frontmatter = lines[1:lines.index("---", 1)]
+    rules: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
+    for line in frontmatter:
+        item = re.match(r"\s*-\s*(\w+):\s*(.+?)\s*$", line)
+        if item:
+            if current:
+                rules.append(current)
+            current = {item.group(1): item.group(2).strip('"')}
+            continue
+        field = re.match(r"\s+(\w+):\s*(.+?)\s*$", line)
+        if field and current:
+            current[field.group(1)] = field.group(2).strip('"')
+    if current:
+        rules.append(current)
+    return rules
+
+def check_agent_rules(name: str, rules: list[dict[str, str]]) -> None:
+    can_edit = any(
+        rule.get("action") == "edit" and rule.get("effect") == "allow"
+        for rule in rules
+    )
+    if not can_edit:
+        for rule in rules:
+            if rule.get("action") != "shell" or rule.get("effect") != "allow":
+                continue
+            resource = rule.get("resource", "")
+            bad = sorted({char for char in SHELL_UNSAFE_CHARS if char in resource})
+            if bad:
+                raise ValueError(
+                    f"{name}: agent shell allow must be an exact "
+                    f"command; found {bad} in {resource!r}"
+                )
+    read_all = any(
+        rule.get("action") == "read" and rule.get("resource") == "*"
+        and rule.get("effect") == "allow" for rule in rules
+    )
+    if read_all:
+        for resource, effect in (
+            ("*.env", "ask"), ("*.env.*", "ask"), ("*.env.example", "allow")
+        ):
+            match = next(
+                (rule for rule in rules
+                 if rule.get("action") == "read" and rule.get("resource") == resource),
+                None,
+            )
+            if not match or match.get("effect") != effect:
+                raise ValueError(
+                    f"{name}: agent read-all grant must restore the base "
+                    f"policy's env-file rules ({resource}: {effect})"
+                )
+
+for path in sorted(Path("fleet/agents").glob("*.md")):
+    check_agent_rules(
+        str(path),
+        agent_permission_rules(path.read_text(encoding="utf-8"), str(path)),
+    )
+
+fleet_config = json.loads(
+    strip_jsonc(Path("fleet/opencode.jsonc").read_text(encoding="utf-8"))
+)
+for agent_name, agent in sorted((fleet_config.get("agents") or {}).items()):
+    if not isinstance(agent, dict):
+        continue
+    permissions = agent.get("permissions") or []
+    check_agent_rules(
+        f"fleet/opencode.jsonc#agents.{agent_name}",
+        [
+            {
+                "action": rule.get("action", ""),
+                "resource": str(rule.get("resource", "")),
+                "effect": rule.get("effect", ""),
+            }
+            for rule in permissions
+            if isinstance(rule, dict)
+        ],
+    )
+
 for path in sorted(Path(".").glob("**/*.json")):
     if ".git" not in path.parts:
         json.loads(path.read_text(encoding="utf-8"))
 
 for path in sorted(Path(".").glob("**/*.jsonc")):
-    if ".git" not in path.parts:
-        json.loads(strip_jsonc(path.read_text(encoding="utf-8")))
+    if ".git" in path.parts:
+        continue
+    json.loads(strip_jsonc(path.read_text(encoding="utf-8")))
 
 print("Python syntax and JSON/JSONC validation passed.")
 PY
