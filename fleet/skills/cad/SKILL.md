@@ -1,6 +1,6 @@
 ---
 name: CAD
-description: Use for CAD and mechanical-model investigation, planning, implementation, or review, especially modular feature changes, geometry removal, parametric source models, assemblies, and FreeCAD/build123d/STEP verification. Required for CAD work by CAD and Worker.
+description: Use for CAD and mechanical-model investigation, planning, implementation, or review, especially modular feature changes, geometry removal, parametric source models, assemblies, and FreeCAD/build123d/STEP verification. Required for CAD work by Mark and Worker.
 ---
 
 # Modular CAD workflow
@@ -103,10 +103,19 @@ or call the result a reconstructed parametric model.
 - Preserve owner documents and vendor originals. Use fresh output directories
   and record the input revision/configuration used. Do not silently heal,
   rescale, move, or replace reference hardware to make a fit check pass.
-- CAD remains read-only; Worker writes code, runs builds, creates inspection
-  evidence, and exports. A skill does not grant additional tool permissions.
-  Read-only diagnostics must actually avoid writes, including import side
-  effects. If inspection cannot be performed safely, state the limit.
+- Mark, as the active primary, may author the authoritative CAD source and
+  supporting project files, including a Python master, and run authorized builds,
+  exports, and verification commands. Cal may delegate CAD implementation
+  to Worker; Worker is subagent-only and does not launch further agents. Mark
+  may delegate evidence gathering to read-only Research. A skill does not grant
+  tool permissions or authorize implementation. Mark's file-edit and shell
+  permissions do not authorize work outside scope or control/save of a live CAD
+  session without explicit authority. Read-only diagnostics must actually avoid
+  writes, including import side effects. If inspection cannot be performed
+  safely, state the limit.
+- Review-only CAD assessment is separate: Reviewer, a primary peer, loads the
+  fleet's `cad-review` skill and assesses recorded source and artifacts; it
+  cannot build, export, or operate a live CAD session.
 
 ## 4. Verify the intended change and its boundaries
 
@@ -144,8 +153,14 @@ assumption does not make a check independent.
 If repeated local corrections are necessary, reassess the construction model.
 Do not weaken assertions, bless unexpected overlaps as intentional, substitute
 another reference pose, or promote a troubleshooting omission to a design
-decision just to release another revision. Bring consequential decisions to Cal
-or the user; Worker owns routine corrections within the agreed scope.
+decision just to release another revision. Mark brings consequential design
+decisions to the user. When implementation is delegated, the implementer stops
+the affected work and returns blocking questions, missing access, and
+consequential deviations to the active primary agent (Cal for delegated work),
+rather than waiting for a separate user conversation inside a child session.
+Worker is subagent-only and may own routine corrections within the
+user-authorized scope when delegated by Cal; a completed plan or a tool-access
+approval alone does not authorize a build.
 
 Return a concise account of the intended result, affected features, preserved
 geometry, checks actually performed, artifacts available for inspection, and
