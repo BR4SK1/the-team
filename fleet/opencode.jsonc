@@ -161,6 +161,14 @@
       "permissions": [
         { "action": "edit", "resource": "*", "effect": "deny" },
         { "action": "shell", "resource": "*", "effect": "deny" },
+        // Exact hardened Git inspection invocations only, as documented in
+        // fleet/agents/cal.md. Any other shell command is denied.
+        { "action": "shell", "resource": "git --no-optional-locks -c core.fsmonitor=false status", "effect": "allow" },
+        { "action": "shell", "resource": "git --no-pager diff --no-ext-diff --no-textconv", "effect": "allow" },
+        { "action": "shell", "resource": "git --no-pager diff --no-ext-diff --no-textconv --stat", "effect": "allow" },
+        { "action": "shell", "resource": "git --no-pager diff --no-ext-diff --no-textconv --cached", "effect": "allow" },
+        { "action": "shell", "resource": "git --no-pager log --no-ext-diff --no-textconv --oneline", "effect": "allow" },
+        { "action": "shell", "resource": "git --no-pager log --no-ext-diff --no-textconv", "effect": "allow" },
         // No Kubernetes access for Cal: deny every tool of the kubernetes MCP
         // server (MCP permission actions are named <server>_<tool>, so
         // kubernetes_* covers all of them). Cluster work is delegated to

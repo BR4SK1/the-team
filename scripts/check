@@ -137,6 +137,47 @@ for path in sorted(Path("fleet/agents").glob("*.md")):
 fleet_config = json.loads(
     strip_jsonc(Path("fleet/opencode.jsonc").read_text(encoding="utf-8"))
 )
+HARDENED_GIT_COMMANDS = (
+    "git --no-optional-locks -c core.fsmonitor=false status",
+    "git --no-pager diff --no-ext-diff --no-textconv",
+    "git --no-pager diff --no-ext-diff --no-textconv --stat",
+    "git --no-pager diff --no-ext-diff --no-textconv --cached",
+    "git --no-pager log --no-ext-diff --no-textconv --oneline",
+    "git --no-pager log --no-ext-diff --no-textconv",
+)
+cal_doc = Path("fleet/agents/cal.md").read_text(encoding="utf-8")
+cal_git_section = cal_doc.split("## Read-only Git inspection", 1)
+if len(cal_git_section) != 2:
+    raise ValueError("fleet/agents/cal.md: missing Read-only Git inspection section")
+cal_git_section = cal_git_section[1].split("\n## ", 1)[0]
+documented_cal_commands = tuple(
+    line.strip() for line in cal_git_section.splitlines()
+    if line.startswith("    git ")
+)
+if documented_cal_commands != HARDENED_GIT_COMMANDS:
+    raise ValueError(
+        "fleet/agents/cal.md: documented Git commands do not match the "
+        "hardened allowlist"
+    )
+cal_shell_rules = [
+    rule for rule in fleet_config["agents"]["cal"]["permissions"]
+    if rule.get("action") == "shell"
+]
+if not any(
+    rule.get("resource") == "*" and rule.get("effect") == "deny"
+    for rule in cal_shell_rules
+):
+    raise ValueError("fleet/opencode.jsonc#agents.cal: missing deny-all shell rule")
+cal_shell_allows = tuple(
+    rule.get("resource") for rule in cal_shell_rules
+    if rule.get("effect") == "allow"
+)
+if cal_shell_allows != HARDENED_GIT_COMMANDS:
+    raise ValueError(
+        "fleet/opencode.jsonc#agents.cal: shell allows must match the "
+        "documented hardened Git commands exactly"
+    )
+
 for agent_name, agent in sorted((fleet_config.get("agents") or {}).items()):
     if not isinstance(agent, dict):
         continue

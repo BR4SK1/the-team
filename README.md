@@ -206,9 +206,10 @@ pass.
 ### Hardened Git inspection permissions
 
 Reviewer's definition denies editing and general shell access and permits only
-these exact hardened Git inspection invocations. Frontend's agent definition
-and Planner's entry in the configuration fragment use the same exact forms and
-deny all other shell access:
+these exact hardened Git inspection invocations. Cal's entry in the
+configuration fragment permits the same exact forms after a deny-all shell rule;
+Frontend's agent definition and Planner's entry use the same forms and deny all
+other shell access:
 
 ```text
 git --no-optional-locks -c core.fsmonitor=false status
@@ -235,8 +236,9 @@ permission rule matches the exact command text and does not verify git's
 behavior, and git still honors other configuration. The exact invocations are
 harmless, but no claim is made that they cannot fail in a hostile repository.
 `scripts/check` enforces this shape for agent definitions that cannot edit
-(Reviewer, Frontend, and Planner's config fragment) and for read-all agents'
-env-file restore rules.
+(Reviewer, Frontend, and Planner's config fragment), checks Cal's configuration
+allowlist against the commands documented in `fleet/agents/cal.md`, and checks
+read-all agents' env-file restore rules.
 
 ### Fleet models and context budgets
 
