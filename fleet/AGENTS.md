@@ -15,23 +15,32 @@
 
 ## Repository and workspace closeout
 
-- Leave repositories and local workspaces clean by default. After task work is
-  merged or explicitly completed, remove worktrees and temporary artifacts
-  created for that task once they are verified safe to remove. Do not retain
-  task workspaces, stashes, or rollback snapshots as routine recovery aids
-  unless the user specifically asks to retain them; prefer Git history and
-  rebuilding or redeploying from source when recovery is needed.
-- This is not permission for blanket cleanup: do not remove unrelated or
-  pre-existing worktrees, stashes, files, or artifacts, and do not use broad
-  destructive cleanup commands against unrelated projects. Preserve unique user
-  work and active runtime files. If ownership, safety, or permissions are
-  uncertain, stop and escalate; do not hide, relocate, or delete the data.
-- Do not force a production deployment as part of cleanup. Deployment remains
-  subject to the task's authorization and the project's operational rules.
-- Report Git status separately from workspace cleanup: state whether the
-  repository is Git-clean and identify any known exclusions or blockers to full
-  workspace cleanup. A clean Git status alone does not establish that temporary
-  or ignored workspace artifacts are gone.
+- Do task work in the authorized repository/workspace. Never create or use Git
+  worktrees or other separate temporary workspaces for task work, and do not
+  hide work in obscure OpenCode temporary folders. Keep necessary temporary
+  files in the repository when feasible, clearly scoped and identifiable. Use
+  external staging only when a higher-priority platform requirement or a real
+  tooling constraint requires it; keep it minimal and report its location and
+  reason. Distinguish repository temporary files from external staging.
+- Before creating a PR, clean up task-created temporary files and artifacts
+  after verifying they are safe to remove, and ensure the repository is Git-clean
+  with only the intended task changes committed. Do not include unrelated
+  changes. If pre-existing work, a blocker, or a valid exception (for example,
+  an emergency) prevents this, explicitly report it to the primary before PR
+  creation; otherwise do not create the PR.
+- Cleanup is not permission for blanket or forced cleanup. Preserve unrelated or
+  pre-existing work, unique user data, and active runtime files; never force a
+  clean status or delete, overwrite, hide, or relocate user data to obtain one.
+  Inspect ownership and status first. If safety, ownership, or access is
+  uncertain, stop and escalate. Cleanup requirements do not override higher-
+  priority platform requirements or authorize deleting user data.
+- Do not retain task stashes or rollback snapshots as routine recovery aids;
+  prefer Git history and rebuilding from source. Do not force a production
+  deployment as part of cleanup; deployment remains subject to task
+  authorization and project operational rules.
+- Report Git status separately from workspace cleanup, including known
+  exclusions or blockers. A clean Git status alone does not establish that
+  temporary or ignored workspace artifacts are gone.
 
 ## Role boundaries
 
