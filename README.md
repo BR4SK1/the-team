@@ -60,11 +60,13 @@ directly with `./scripts/check` when needed. This repository intentionally has
 no test suite, so it has no pre-push test hook.
 
 Shared instructions also define repository/workspace closeout expectations:
-remove task-created worktrees and temporary artifacts after merged/completed
-work when safe, avoid retaining task stashes or rollback snapshots unless
-requested, and preserve unrelated or unique user data. Git-clean status and full
-workspace cleanup are reported separately. These expectations do not authorize
-blanket cleanup or production deployment.
+do task work in the authorized workspace (never a Git worktree or separate
+scratch workspace), keep necessary temporary files in the repository when
+feasible, and clean task-created temporary artifacts before PR creation. A PR
+normally requires a Git-clean repository with only intended changes committed;
+report a valid exception before proceeding. Preserve unrelated or unique user
+data, and report Git status separately from workspace cleanup. These rules do
+not authorize blanket cleanup or production deployment.
 
 Deployments are manual only; no Git hook deploys or installs the fleet. To
 update the OpenCode assets in the user's config directory, explicitly run:
