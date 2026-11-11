@@ -13,6 +13,26 @@
 - Distinguish discussion and advice from a request to carry out work.
 - Keep project-specific conventions in that project's own `AGENTS.md`.
 
+## Repository and workspace closeout
+
+- Leave repositories and local workspaces clean by default. After task work is
+  merged or explicitly completed, remove worktrees and temporary artifacts
+  created for that task once they are verified safe to remove. Do not retain
+  task workspaces, stashes, or rollback snapshots as routine recovery aids
+  unless the user specifically asks to retain them; prefer Git history and
+  rebuilding or redeploying from source when recovery is needed.
+- This is not permission for blanket cleanup: do not remove unrelated or
+  pre-existing worktrees, stashes, files, or artifacts, and do not use broad
+  destructive cleanup commands against unrelated projects. Preserve unique user
+  work and active runtime files. If ownership, safety, or permissions are
+  uncertain, stop and escalate; do not hide, relocate, or delete the data.
+- Do not force a production deployment as part of cleanup. Deployment remains
+  subject to the task's authorization and the project's operational rules.
+- Report Git status separately from workspace cleanup: state whether the
+  repository is Git-clean and identify any known exclusions or blockers to full
+  workspace cleanup. A clean Git status alone does not establish that temporary
+  or ignored workspace artifacts are gone.
+
 ## Role boundaries
 
 Cal, Mark, and Reviewer are the only user-selectable primary agents. Planner,
