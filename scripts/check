@@ -147,6 +147,31 @@ for required in (
     if required not in skill_frontmatter.splitlines():
         raise ValueError(f"{web_prompt_skill}: missing required frontmatter {required!r}")
 
+deploy_skill = Path("fleet/skills/deploy/SKILL.md")
+deploy_text = deploy_skill.read_text(encoding="utf-8")
+if not deploy_text.startswith("---\n") or "\n---\n" not in deploy_text[4:]:
+    raise ValueError(f"{deploy_skill}: skill frontmatter must be delimited by ---")
+deploy_frontmatter = deploy_text[4:].split("\n---\n", 1)[0]
+for required in (
+    "name: Deploy",
+    "description: Deploy tested code to a repository's production environment using its standardized root-level scripts/deploy entry point.",
+):
+    if required not in deploy_frontmatter.splitlines():
+        raise ValueError(f"{deploy_skill}: missing required frontmatter {required!r}")
+for required in (
+    "./scripts/deploy",
+    "scripts/deploy.sh",
+    "nonzero",
+    "placeholder",
+    "stdout",
+    "stderr",
+    "exit status",
+    "permissions",
+    "Redact secrets",
+):
+    if required not in deploy_text:
+        raise ValueError(f"{deploy_skill}: missing required deployment safeguard {required!r}")
+
 fleet_config = json.loads(
     strip_jsonc(Path("fleet/opencode.jsonc").read_text(encoding="utf-8"))
 )

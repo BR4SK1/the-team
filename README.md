@@ -59,6 +59,13 @@ ShellCheck diagnostics, and the repository's JSON/JSONC configuration. Run it
 directly with `./scripts/check` when needed. This repository intentionally has
 no test suite, so it has no pre-push test hook.
 
+Shared instructions also define repository/workspace closeout expectations:
+remove task-created worktrees and temporary artifacts after merged/completed
+work when safe, avoid retaining task stashes or rollback snapshots unless
+requested, and preserve unrelated or unique user data. Git-clean status and full
+workspace cleanup are reported separately. These expectations do not authorize
+blanket cleanup or production deployment.
+
 Deployments are manual only; no Git hook deploys or installs the fleet. To
 update the OpenCode assets in the user's config directory, explicitly run:
 
