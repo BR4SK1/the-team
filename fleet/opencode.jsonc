@@ -1,6 +1,70 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  // This file is the complete, versioned global OpenCode configuration.
+  // It is loaded directly, with no generation or copy step, when the
+  // OpenCode service launch environment sets OPENCODE_CONFIG_DIR to this
+  // fleet/ directory. Host-specific values are native OpenCode
+  // placeholders ({env:NAME}) expanded at load time from the service
+  // environment; they are never replaced by hand and no private values
+  // are materialized here. See README.md ("Native setup").
   "default_agent": "cal",
+  // Root model fallback for sessions that do not select an agent model.
+  // Fleet agents name their own models under `agents` and agent definitions.
+  "model": "openrouter/meta/muse-ember",
+  "agents": {
+    // Cal, Mark, and Reviewer are the fleet's only user-selectable entry points.
+    // Reviewer's permissions live in fleet/agents/reviewer.md, like Mark's.
+    "plan": { "model": "openrouter/openai/gpt-6.1-sol", "disabled": true },
+    "build": { "model": "openrouter/openai/gpt-6-luna", "disabled": true },
+    "chat": { "disabled": true },
+    "cal": {
+      "model": "openrouter/sol-256k#medium",
+      "permissions": [
+        { "action": "edit", "resource": "*", "effect": "deny" },
+        { "action": "shell", "resource": "*", "effect": "deny" },
+        // Exact hardened Git inspection invocations only, as documented in
+        // fleet/agents/cal.md. Any other shell command is denied.
+        { "action": "shell", "resource": "git --no-optional-locks -c core.fsmonitor=false status", "effect": "allow" },
+        { "action": "shell", "resource": "git --no-pager diff --no-ext-diff --no-textconv", "effect": "allow" },
+        { "action": "shell", "resource": "git --no-pager diff --no-ext-diff --no-textconv --stat", "effect": "allow" },
+        { "action": "shell", "resource": "git --no-pager diff --no-ext-diff --no-textconv --cached", "effect": "allow" },
+        { "action": "shell", "resource": "git --no-pager log --no-ext-diff --no-textconv --oneline", "effect": "allow" },
+        { "action": "shell", "resource": "git --no-pager log --no-ext-diff --no-textconv", "effect": "allow" },
+        // No Kubernetes access for Cal: deny every tool of the kubernetes MCP
+        // server (MCP permission actions are named <server>_<tool>, so
+        // kubernetes_* covers all of them). Cluster work is delegated to
+        // Planner for investigation and Worker for authorized implementation;
+        // see fleet/agents/cal.md.
+        { "action": "kubernetes_*", "resource": "*", "effect": "deny" },
+        { "action": "opencode_list_mcp_resources", "resource": "kubernetes", "effect": "deny" },
+        { "action": "opencode_read_mcp_resource", "resource": "kubernetes:*", "effect": "deny" },
+        { "action": "subagent", "resource": "*", "effect": "deny" },
+        { "action": "subagent", "resource": "planner", "effect": "allow" },
+        { "action": "subagent", "resource": "frontend", "effect": "allow" },
+        { "action": "subagent", "resource": "research", "effect": "allow" },
+        { "action": "subagent", "resource": "worker", "effect": "allow" }
+      ]
+    },
+    "planner": {
+      "permissions": [
+        { "action": "edit", "resource": "*", "effect": "deny" },
+        { "action": "shell", "resource": "*", "effect": "deny" },
+        // Exact hardened Git inspection invocations only, shared with Reviewer
+        // and Frontend; wildcard rules (for example "git diff *") would also
+        // permit mutating options and configured external diff, textconv, and
+        // pager helpers, which execute arbitrary commands. Any other command
+        // is denied, per the shell rule above.
+        { "action": "shell", "resource": "git --no-optional-locks -c core.fsmonitor=false status", "effect": "allow" },
+        { "action": "shell", "resource": "git --no-pager diff --no-ext-diff --no-textconv", "effect": "allow" },
+        { "action": "shell", "resource": "git --no-pager diff --no-ext-diff --no-textconv --stat", "effect": "allow" },
+        { "action": "shell", "resource": "git --no-pager diff --no-ext-diff --no-textconv --cached", "effect": "allow" },
+        { "action": "shell", "resource": "git --no-pager log --no-ext-diff --no-textconv --oneline", "effect": "allow" },
+        { "action": "shell", "resource": "git --no-pager log --no-ext-diff --no-textconv", "effect": "allow" }
+      ]
+    }
+  },
+  // Required for these budgets to guide automatic history compaction.
+  "compaction": { "auto": true, "keep": { "tokens": 15000 }, "buffer": 20000 },
   "providers": {
     "openrouter": {
       "models": {
@@ -193,63 +257,205 @@
           ],
           // The model advertises 1,000,000 context; keep the fleet's standard working cap.
           "limit": { "context": 270000, "input": 270000, "output": 32000 }
+        },
+        // Upstream catalog limit overrides for direct upstream model IDs.
+        // These are separate from the fleet aliases above and use the same
+        // provider/model key form as the root `model` and dormant-agent models.
+        "openai/gpt-6-luna": {
+          "limit": { "input": 200000 }
+        },
+        "meta/muse-ember": {
+          "limit": { "input": 200000, "output": 128000 }
+        },
+        "openai/gpt-6.1-sol": {
+          "limit": { "input": 1050000 }
         }
       }
     }
   },
-  // Required for these budgets to guide automatic history compaction.
-  "compaction": { "auto": true },
-  "agents": {
-    // Cal, Mark, and Reviewer are the fleet's only user-selectable entry points.
-    // Reviewer's permissions live in fleet/agents/reviewer.md, like Mark's.
-    "build": { "disabled": true },
-    "plan": { "disabled": true },
-    "cal": {
-      "model": "openrouter/sol-256k#medium",
-      "permissions": [
-        { "action": "edit", "resource": "*", "effect": "deny" },
-        { "action": "shell", "resource": "*", "effect": "deny" },
-        // Exact hardened Git inspection invocations only, as documented in
-        // fleet/agents/cal.md. Any other shell command is denied.
-        { "action": "shell", "resource": "git --no-optional-locks -c core.fsmonitor=false status", "effect": "allow" },
-        { "action": "shell", "resource": "git --no-pager diff --no-ext-diff --no-textconv", "effect": "allow" },
-        { "action": "shell", "resource": "git --no-pager diff --no-ext-diff --no-textconv --stat", "effect": "allow" },
-        { "action": "shell", "resource": "git --no-pager diff --no-ext-diff --no-textconv --cached", "effect": "allow" },
-        { "action": "shell", "resource": "git --no-pager log --no-ext-diff --no-textconv --oneline", "effect": "allow" },
-        { "action": "shell", "resource": "git --no-pager log --no-ext-diff --no-textconv", "effect": "allow" },
-        // No Kubernetes access for Cal: deny every tool of the kubernetes MCP
-        // server (MCP permission actions are named <server>_<tool>, so
-        // kubernetes_* covers all of them). Cluster work is delegated to
-        // Planner for investigation and Worker for authorized implementation;
-        // see fleet/agents/cal.md.
-        { "action": "kubernetes_*", "resource": "*", "effect": "deny" },
-        { "action": "opencode_list_mcp_resources", "resource": "kubernetes", "effect": "deny" },
-        { "action": "opencode_read_mcp_resource", "resource": "kubernetes:*", "effect": "deny" },
-        { "action": "subagent", "resource": "*", "effect": "deny" },
-        { "action": "subagent", "resource": "planner", "effect": "allow" },
-        { "action": "subagent", "resource": "research", "effect": "allow" },
-        { "action": "subagent", "resource": "frontend", "effect": "allow" },
-        { "action": "subagent", "resource": "worker", "effect": "allow" }
-      ]
+  // Ordered host permission rules. Order and scope are preserved; only the
+  // username-bearing rule carries a native host placeholder where the login
+  // name appears, expanded at load time from the service environment
+  // ({env:FLEET_LOGIN_USER}). No rule is added, removed, or broadened here.
+  "permissions": [
+    { "action": "shell", "resource": "pacman -S *", "effect": "allow" },
+    { "action": "shell", "resource": "pacman -S *--noconfirm*", "effect": "deny" },
+    { "action": "shell", "resource": "systemctl enable postgresql", "effect": "allow" },
+    { "action": "shell", "resource": "systemctl enable postgresql.service", "effect": "allow" },
+    { "action": "shell", "resource": "systemctl start postgresql", "effect": "allow" },
+    { "action": "shell", "resource": "systemctl start postgresql.service", "effect": "allow" },
+    { "action": "shell", "resource": "systemctl restart postgresql", "effect": "allow" },
+    { "action": "shell", "resource": "systemctl restart postgresql.service", "effect": "allow" },
+    { "action": "shell", "resource": "sudo -u postgres psql *", "effect": "allow" },
+    { "action": "shell", "resource": "initdb -D /var/lib/postgres/*", "effect": "allow" },
+    { "action": "shell", "resource": "initdb --pgdata=/var/lib/postgres/*", "effect": "allow" },
+    { "action": "shell", "resource": "sudo -u postgres initdb -D /var/lib/postgres/*", "effect": "allow" },
+    { "action": "shell", "resource": "sudo -u postgres initdb --pgdata=/var/lib/postgres/*", "effect": "allow" },
+    { "action": "shell", "resource": "loginctl enable-linger {env:FLEET_LOGIN_USER}", "effect": "allow" },
+    { "action": "shell", "resource": "PGHOST=* psql *", "effect": "allow" },
+    { "action": "shell", "resource": "PGPORT=* psql *", "effect": "allow" },
+    { "action": "shell", "resource": "PGDATABASE=* psql *", "effect": "allow" },
+    { "action": "shell", "resource": "PGUSER=* psql *", "effect": "allow" },
+    { "action": "shell", "resource": "PGPASSWORD=* psql *", "effect": "allow" },
+    { "action": "shell", "resource": "opencode --help", "effect": "allow" },
+    { "action": "shell", "resource": "opencode --version", "effect": "allow" },
+    { "action": "shell", "resource": "opencode debug config", "effect": "allow" },
+    { "action": "shell", "resource": "opencode debug agents", "effect": "allow" },
+    { "action": "shell", "resource": "opencode debug paths *", "effect": "allow" },
+    { "action": "shell", "resource": "opencode mcp list", "effect": "allow" },
+    { "action": "shell", "resource": "opencode service status", "effect": "allow" },
+    { "action": "shell", "resource": "opencode api get *", "effect": "allow" },
+    { "action": "shell", "resource": "opencode models", "effect": "allow" },
+    { "action": "fieldops-journal_*", "resource": "*", "effect": "deny" }
+  ],
+  "lsp": {
+    "typescript": {
+      "command": ["typescript-language-server", "--stdio"],
+      "extensions": [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"]
     },
-    "planner": {
-      "permissions": [
-        { "action": "edit", "resource": "*", "effect": "deny" },
-        { "action": "shell", "resource": "*", "effect": "deny" },
-        // Exact hardened Git inspection invocations only, shared with Reviewer
-        // and Frontend; wildcard rules (for example "git diff *") would also
-        // permit mutating options and configured external diff, textconv, and
-        // pager helpers, which execute arbitrary commands. Any other command
-        // is denied, per the shell rule above.
-        { "action": "shell", "resource": "git --no-optional-locks -c core.fsmonitor=false status", "effect": "allow" },
-        { "action": "shell", "resource": "git --no-pager diff --no-ext-diff --no-textconv", "effect": "allow" },
-        { "action": "shell", "resource": "git --no-pager diff --no-ext-diff --no-textconv --stat", "effect": "allow" },
-        { "action": "shell", "resource": "git --no-pager diff --no-ext-diff --no-textconv --cached", "effect": "allow" },
-        { "action": "shell", "resource": "git --no-pager log --no-ext-diff --no-textconv --oneline", "effect": "allow" },
-        { "action": "shell", "resource": "git --no-pager log --no-ext-diff --no-textconv", "effect": "allow" }
-      ]
+    "python": {
+      "command": ["pyright-langserver", "--stdio"],
+      "extensions": [".py", ".pyi"]
+    },
+    "yaml": {
+      "command": ["yaml-language-server", "--stdio"],
+      "extensions": [".yaml", ".yml"]
+    },
+    "bash": {
+      "command": ["bash-language-server", "start"],
+      "extensions": [".sh", ".bash"]
     }
-  }
-  // Add shared OpenCode settings here. This file is a fragment for review and
-  // merging into each device's OpenCode configuration, not an auto-loaded file.
+  },
+  // MCP servers. Local commands use portable package/binary names except
+  // where a host filesystem path appears: those use native {env:...}
+  // placeholders (home-rooted script paths, the uvx executable, and the
+  // private remote URL), expanded at load time from the service
+  // environment. Credentials are not stored here. The github server reads
+  // its token at launch time via `gh auth token`; the remote server uses
+  // the default OAuth flow with credentials stored outside this config.
+  // A {env:NAME} or {file:...} reference is expanded by OpenCode at load
+  // time, never materialized in this file.
+  "mcp": {
+    "servers": {
+      "kubernetes": {
+        "type": "local",
+        "command": ["npx", "-y", "mcp-server-kubernetes"]
+      },
+      "excalibur-memory": {
+        "type": "local",
+        "command": ["node", "{env:FLEET_HOME}/opt/excalibur-memory/current/mcp-server.mjs"],
+        "environment": {
+          "MEMORY_ACTOR": "agent"
+        }
+      },
+      "fieldops-journal": {
+        "type": "local",
+        "command": ["node", "{env:FLEET_HOME}/Projects/fieldops-journal/mcp-server.mjs"],
+        "environment": {
+          "JOURNAL_ACTOR": "fieldops"
+        }
+      },
+      "github": {
+        "type": "local",
+        "command": [
+          "bash",
+          "-c",
+          "export GITHUB_PERSONAL_ACCESS_TOKEN=\"$(gh auth token)\"; exec docker run -i --rm -e GITHUB_PERSONAL_ACCESS_TOKEN ghcr.io/github/github-mcp-server"
+        ]
+      },
+      "openrouter": {
+        "type": "remote",
+        "url": "{env:FLEET_OPENROUTER_MCP_URL}"
+      },
+      "blender": {
+        "type": "local",
+        "command": ["{env:FLEET_UVX_PATH}", "mcp-for-blender"]
+      }
+    }
+  },
+  // Reference aliases. Every path is home-rooted via {env:FLEET_HOME};
+  // relative suffixes (Projects, .config, project folders) are versioned here.
+  "references": {
+    "home": {
+      "path": "{env:FLEET_HOME}",
+      "description": "The user's home directory. Use to browse or reference files and folders under {env:FLEET_HOME}."
+    },
+    "projects": {
+      "path": "{env:FLEET_HOME}/Projects",
+      "description": "The user's projects directory. Use to browse or reference project folders."
+    },
+    "local-infra": {
+      "path": "{env:FLEET_HOME}/Projects/local-infrastructure",
+      "description": "The local-infrastructure project. Use when working on or referencing local infrastructure code."
+    },
+    "memory": {
+      "path": "{env:FLEET_HOME}/Projects/excalibur-memory",
+      "description": "The excalibur-memory system source code (the memory MCP server). Use when working on or referencing the memory system implementation."
+    },
+    "journal": {
+      "path": "{env:FLEET_HOME}/Projects/fieldops-journal",
+      "description": "The fieldops-journal system source code (the field engagement journal MCP server). Use when working on or referencing the field journal implementation."
+    },
+    "config": {
+      "path": "{env:FLEET_HOME}/.config",
+      "description": "The user's XDG config directory. Use when working on or referencing configuration files."
+    },
+    "opencode-client": {
+      "path": "{env:FLEET_HOME}/Projects/opencode-client",
+      "description": "The opencode-client project. Use when working on or referencing opencode-client code."
+    },
+    "hearthkeeper": {
+      "path": "{env:FLEET_HOME}/Projects/hearthkeeper",
+      "description": "The Hearthkeeper project source code. Use when working on or referencing the collaborative storytelling app implementation."
+    },
+    "sunfade": {
+      "path": "{env:FLEET_HOME}/Projects/sunfade-1971",
+      "description": "The Sunfade 1971 project source code. Use when working on or referencing the Sunfade 1971 color palette playground."
+    },
+    "excalibur-mt": {
+      "path": "{env:FLEET_HOME}/Projects/ExcaliburMT",
+      "description": "The ExcaliburMT project. Use when working on or referencing this project."
+    },
+    "ai-companion": {
+      "path": "{env:FLEET_HOME}/Projects/ai-companion",
+      "description": "The AI Companion project. Use when working on or referencing this project."
+    },
+    "archives": {
+      "path": "{env:FLEET_HOME}/Projects/archives",
+      "description": "The archives directory. Use when working on or referencing archived projects and materials."
+    },
+    "college-git": {
+      "path": "{env:FLEET_HOME}/Projects/college-git",
+      "description": "The college-git project. Use when working on or referencing this project."
+    },
+    "companion": {
+      "path": "{env:FLEET_HOME}/Projects/companion",
+      "description": "The companion project. Use when working on or referencing this project."
+    },
+    "companion-decider-arena": {
+      "path": "{env:FLEET_HOME}/Projects/companion-decider-arena",
+      "description": "The companion-decider-arena project. Use when working on or referencing this project."
+    },
+    "finance": {
+      "path": "{env:FLEET_HOME}/Projects/finance",
+      "description": "The finance project. Use when working on or referencing this project."
+    },
+    "gurdy-pi": {
+      "path": "{env:FLEET_HOME}/Projects/gurdy-pi",
+      "description": "The gurdy-pi project. Use when working on or referencing this project."
+    },
+    "hearthkeeper-archive-20260926": {
+      "path": "{env:FLEET_HOME}/Projects/hearthkeeper-archive-20260926",
+      "description": "The Hearthkeeper archive from 2026-09-26. Use when working on or referencing this archived version."
+    },
+    "hearthkeeper-ezd6": {
+      "path": "{env:FLEET_HOME}/Projects/hearthkeeper-ezd6",
+      "description": "The hearthkeeper-ezd6 project. Use when working on or referencing this project."
+    },
+    "the-team": {
+      "path": "{env:FLEET_HOME}/Projects/the-team",
+      "description": "The shared team instructions and resources. Use when working on or referencing these materials."
+    }
+  },
+  "tool_output": { "max_lines": 3000, "max_bytes": 98304 }
 }

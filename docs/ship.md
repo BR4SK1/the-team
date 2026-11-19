@@ -15,10 +15,14 @@
   diagnostics as not run. It makes no changes.
 - This document — the standard both of the above describe.
 
-The existing fleet installer already links everything under
-`fleet/commands/` into the OpenCode user config, so `/ship` becomes
-available after a normal install with no installer change. Nothing in
-milestone 1 installs, deploys, or alters any live configuration.
+OpenCode discovers everything under `fleet/commands/` directly from
+the fleet config root, so `/ship` is available when the service launch
+environment points `OPENCODE_CONFIG_DIR` at `fleet/` (see README
+Native setup). This was verified in the isolated fake-root check
+described in the README (the fixture command appears after location
+boot and a session; a one-shot query before activation can show only
+the built-ins). Nothing in milestone 1 installs, deploys, or alters
+any live configuration.
 
 ## The one strict opt-in standard
 

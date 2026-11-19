@@ -6,46 +6,200 @@ workflows, including modular CAD modeling and verification.
 
 ## Repository layout
 
+`fleet/` is not a template to copy or link from. It is the OpenCode
+global config directory itself: when the service launch environment sets
+`OPENCODE_CONFIG_DIR` to the absolute `fleet/` path, OpenCode loads
+`fleet/opencode.jsonc` as its global config and discovers
+`fleet/AGENTS.md`, `fleet/agents/`, `fleet/skills/`, and `fleet/commands/`
+directly from there, with no installer, generator, or second config.
+
 ```text
-fleet/
-├── agents/       # Markdown agent definitions
-├── skills/       # Skill folders, each with a SKILL.md
-├── commands/     # Markdown slash commands
-├── AGENTS.md     # Shared fleet-wide instructions
-└── opencode.jsonc # Shared OpenCode configuration fragment
-profiles/         # Shared configuration fragments by device role
-examples/         # Examples for local, uncommitted device settings
-scripts/          # Installation helper
+fleet/              # OpenCode global config root (OPENCODE_CONFIG_DIR)
+├── agents/         # Markdown agent definitions
+├── skills/         # Skill folders, each with a SKILL.md
+├── commands/       # Markdown slash commands
+├── AGENTS.md       # Shared fleet-wide instructions (global file)
+└── opencode.jsonc  # Complete tracked global OpenCode config (only config)
+examples/           # Device-settings example only (fake values)
+scripts/            # Check runner, ship doctor, hook installer
 ```
 
-## Install
+Private runtime siblings (see below) also live on disk under `fleet/`
+but are ignored by Git and must never be committed.
 
-Requirements: Python 3 and OpenCode. Clone this repository at a stable path on
-each device, then run:
+## Native setup (no installer)
 
-```sh
-python3 scripts/fleet-install
+Requirements: OpenCode V2 and Python 3 / Bash / ShellCheck for checks.
+`OPENCODE_CONFIG_DIR` is verified in isolated OpenCode v2.2.6 CLI
+read/write tests, in the tagged v2.2.6 source (the global paths layer
+overrides its config directory from this variable, and the instruction
+plugin resolves `AGENTS.md` as `<config>/AGENTS.md`), and in an
+isolated fake-root discovery check (fleet agents, commands including
+`/ship`, and skills from the fake config root appear after location
+boot and a session; an immediate one-shot query before activation can
+show only built-ins). It is not documented in the V2 docs. Recheck it
+on upgrade: `opencode debug paths config` in the service environment
+must print the absolute `fleet/` path, and `opencode debug agents`
+must list the fleet agents. Do not paste a full `opencode debug
+config` dump to verify this: it prints the expanded config with
+private values; if a config-source check is needed, inspect only the
+redacted `type`/`path` fields, never the full output.
+
+Clone this repository once per device at a stable, writable absolute
+path (the service environment contains that absolute path, so moving
+the checkout breaks it; it must stay writable because the service
+writes private siblings such as `service.json` and `cli.json` under
+`fleet/`). There is no install, link, generate, or copy step.
+
+### Service launch environment (exact example)
+
+Set these in the environment that launches the OpenCode background
+service — not only in an interactive shell or a web frontend. The
+example below uses syntactic placeholders (`<login>`); replace them
+with the device's real values in the service environment only, never
+in Git:
+
+```text
+OPENCODE_CONFIG_DIR=/home/<login>/Projects/the-team/fleet
+FLEET_HOME=/home/<login>
+FLEET_LOGIN_USER=<login>
+FLEET_OPENROUTER_MCP_URL=https://<private-mcp-host>/<private-path>
+FLEET_UVX_PATH=/absolute/path/to/uvx
 ```
 
-The installer links the repository's agents, skills, and commands into the
-OpenCode user config directory (`$XDG_CONFIG_HOME/opencode`, or
-`~/.config/opencode`). It adds the shared instructions to the global
-`AGENTS.md` between managed markers, preserving text outside that block. If an
-existing global asset conflicts with a fleet name, installation stops rather
-than replacing it. Re-run the installer after adding or renaming definitions.
-For a rename, remove an old symlink only after confirming it points to the removed
-fleet-managed source file; the installer never removes unmanaged assets.
+For a systemd user service, the equivalent launch-environment form is
+a drop-in for that service unit:
 
-To install into another OpenCode config directory:
-
-```sh
-python3 scripts/fleet-install --config-dir /path/to/opencode-config
+```ini
+[Service]
+Environment=OPENCODE_CONFIG_DIR=/home/<login>/Projects/the-team/fleet
+Environment=FLEET_HOME=/home/<login>
+Environment=FLEET_LOGIN_USER=<login>
+Environment=FLEET_OPENROUTER_MCP_URL=https://<private-mcp-host>/<private-path>
+Environment=FLEET_UVX_PATH=/absolute/path/to/uvx
 ```
 
-Agent and skill files are symlinks, so pulling a new repository revision updates
-them immediately. Open a new OpenCode session after changing instructions.
+The same values may instead live in a private environment file
+referenced by the unit, which keeps real values out of Git while
+remaining part of the launch environment:
 
-## Local checks and manual deployment
+```ini
+[Service]
+EnvironmentFile=/home/<login>/Projects/the-team/fleet.env
+```
+
+The private file holds the same five `NAME=value` lines as the
+example above, must be owned by the service user with mode `0600`
+(or stricter), and must stay outside the repository so it is never
+committed. An `EnvironmentFile` is still launch environment, not
+service config: the values are supplied to the backend process at
+start via the unit. There is no second bootstrap — the fleet
+environment is documented only as the service launch environment
+(`Environment=` lines or a private `EnvironmentFile`), and the set
+above is what the backend (background service) process must see at
+start.
+
+Private environment names and formats (all four are required, none
+may be blank — an unset or blank value expands to an empty string and
+breaks the paths, permission rule, and remote URL that use it):
+
+| Name | Format |
+| --- | --- |
+| `FLEET_HOME` | Absolute home directory, no trailing slash (for example `/home/<login>`) |
+| `FLEET_LOGIN_USER` | Login username: letters, digits, `.`, `_`, `-` only |
+| `FLEET_OPENROUTER_MCP_URL` | `https` URL with no userinfo, query, or fragment |
+| `FLEET_UVX_PATH` | Absolute path to the `uvx` executable |
+
+These are the only host-specific values in `fleet/opencode.jsonc`;
+they appear there solely as native `{env:FLEET_HOME}`,
+`{env:FLEET_LOGIN_USER}`, `{env:FLEET_OPENROUTER_MCP_URL}`, and
+`{env:FLEET_UVX_PATH}` placeholders. No private value is materialized
+in the tracked file.
+
+### Default path, competing file, and native CLI writes
+
+Without `OPENCODE_CONFIG_DIR`, the global config is
+`$XDG_CONFIG_HOME/opencode/opencode.json(c)`, or
+`~/.config/opencode/opencode.json(c)` when `XDG_CONFIG_HOME` is unset.
+With it set to `fleet/`, `fleet/opencode.jsonc` is that global file.
+
+Native CLI file-writing needs its own matching environment: a command
+such as `opencode mcp add <name> --global --url <url>` writes to the
+global root of the CLI process that runs it, so run it with the same
+`OPENCODE_CONFIG_DIR` as the service (for example
+`OPENCODE_CONFIG_DIR=/home/<login>/Projects/the-team/fleet opencode mcp add ... --global`).
+Without it, `--global` writes to the default `~/.config/opencode/`
+location and does not change the fleet service. Omitting `--global`
+stays project-only and never touches the fleet global config.
+
+If a native write creates `fleet/opencode.json` (without `c`) next to
+the tracked `fleet/opencode.jsonc`, the two compete as the global
+config file. Remove the competing `.json` private sibling (it is
+ignored by Git) and confirm the loaded source with a redacted
+`opencode debug config` field check (inspect only the `type`/`path`
+fields, never the full expanded output) before relying on either
+file. Never commit a competing `.json`.
+
+### Private runtime siblings and Git review
+
+`service.json`, `cli.json`, auth files, logs, and similar runtime
+files live on disk under `fleet/` when it is the config root, but
+`.gitignore` denies everything under `fleet/` by default and allows
+only `opencode.jsonc`, `AGENTS.md`, `agents/*.md`, `commands/*.md`,
+and `skills/*/SKILL.md`. Do not stage, print, or read the contents
+of `service.json`/auth files; inspect only their names via Git
+status. Because `fleet/` is both the checkout and the live config
+root, review the native Git diff and status before every commit and
+run `./scripts/check`; only intended fleet files should appear.
+
+`fleet/opencode.jsonc` is the global OpenCode config (models,
+permissions, MCP servers, references, and the rest). It is distinct
+from `fleet/service.json`, the background service's private config in
+the same directory, which may contain a password and lifecycle
+settings (hostname, port, CORS, remote, disabled) and is managed
+with `opencode service set` / `get` / `unset`, never edited by hand
+as fleet policy. It does not hold the fleet launch environment,
+which lives only in the service launch environment (above).
+`cli.json` in the same directory holds terminal/TUI preferences only.
+The service registration file under the state directory is a separate
+discovery record; do not delete or edit service files or the database
+while troubleshooting.
+
+### Adoption and reload are separate from committing
+
+Committing this repository does not adopt anything: it does not set
+the service launch environment, restart the service, or change a
+running backend. Backend adoption — setting the launch environment
+above, starting/restarting the service so the new environment takes
+effect, and verifying with `opencode debug paths config` (which must
+print the absolute `fleet/` path), `opencode debug agents` (which
+must list the fleet agents), and MCP status — using only redacted
+field checks for any config-source confirmation, never a full
+`opencode debug config` dump — is a separate, explicit step after the
+checkout is in place.
+
+While a service already using `fleet/` as its config root is running,
+the V2 watchers observe the discovered files and trigger a reload
+when they are saved: `AGENTS.md` is watched as a file with a short
+debounce followed by instruction-discovery reload, and agents,
+commands, and skills are watched as `{agents,command,commands,skill,
+skills}` definition directories under each config entry and reloaded
+on change (emitting `agent.updated` / `command.updated` /
+`skill.updated` / `config.updated`). Discovery itself is verified in
+the isolated check above (fleet agents, `/ship`, and skills appear
+after location boot and a session; an immediate one-shot query
+before activation can show only built-ins). Hot reload of MCP
+servers and live verification of every definition type on save were
+not exercised here, so treat a save as a reload trigger, not a
+guarantee that every change is already live. In any case, start a
+new session after changing instructions. Do not promise hot reload
+for launch-environment or config-root changes: changing
+`OPENCODE_CONFIG_DIR` or any `FLEET_*` value requires the service to
+be started/restarted with the new environment. Pulling a new checkout
+revision updates the fleet files in place on the checkout filesystem;
+backend adoption (above) is still separate.
+
+## Local checks
 
 Install the repository-local hooks once per checkout:
 
@@ -55,9 +209,11 @@ Install the repository-local hooks once per checkout:
 
 The check command requires Bash, Python 3, and ShellCheck. The pre-commit hook
 runs `scripts/check`, which validates Python syntax, shell syntax and
-ShellCheck diagnostics, and the repository's JSON/JSONC configuration. Run it
-directly with `./scripts/check` when needed. This repository intentionally has
-no test suite, so it has no pre-push test hook.
+ShellCheck diagnostics, the repository's JSON/JSONC configuration, the
+complete fleet config shape (including native `{env:...}` placeholders
+and the fleet ignore allowlist), and the ship-doctor tests. Run it
+directly with `./scripts/check` when needed. The test suite covers the
+ship doctor (`tests/ship_doctor_test.py`); it has no pre-push test hook.
 
 Shared instructions also define repository/workspace closeout expectations:
 do task work in the authorized workspace (never a Git worktree or separate
@@ -68,15 +224,11 @@ report a valid exception before proceeding. Preserve unrelated or unique user
 data, and report Git status separately from workspace cleanup. These rules do
 not authorize blanket cleanup or production deployment.
 
-Deployments are manual only; no Git hook deploys or installs the fleet. To
-update the OpenCode assets in the user's config directory, explicitly run:
-
-```sh
-./scripts/deploy.sh
-```
-
-That command invokes the existing `fleet-install` helper and may alter
-OpenCode user configuration. The local hook installer configures Git to use
+Deployments are manual only; no Git hook deploys or installs the fleet.
+There is no deploy script for the fleet: updating the fleet means
+pulling the checkout and, separately, ensuring the service launch
+environment above is set and the service is started/restarted with it
+(backend adoption, above). The local hook installer configures Git to use
 `.githooks`; the retained pre-commit hook runs checks only.
 
 ## Ship diagnostics (milestone 1)
@@ -95,13 +247,13 @@ The fleet defines seven agents under `fleet/agents/`:
 
 | Agent | Model | Context / response budget | Role |
 | --- | --- | --- | --- |
-| **Cal** (`cal`) | GPT-6.1 Terra, medium reasoning | 270k / 32k | Conversational companion and coordinator |
-| **Planner** (`planner`) | GPT-6.1 Sol | 270k / 32k | Read-only investigation and concise task plans |
-| **Research** (`research`) | GPT-6 Luna | 270k / 32k | Read-only, evidence-driven web and repository research |
+| **Cal** (`cal`) | GPT-6.2 Sol (`sol-256k`), medium reasoning | 256k / 100k output cap | Conversational companion and coordinator |
+| **Planner** (`planner`) | GPT-6.2 Sol (`sol-256k`), high reasoning | 256k / 100k output cap | Read-only investigation and concise task plans |
+| **Research** (`research`) | Meta Muse Ember (`muse-ember-270k`), max reasoning | 270k / 32k | Read-only, evidence-driven web and repository research |
 | **Frontend** (`frontend`) | Kimi K3, high reasoning | 270k / 32k | Read-only frontend planning and review; no code edits |
-| **Mark** (`mark`) | GPT-6.1 Sol | 270k / 32k | Primary mechanical-design lead; authorized CAD-source and supporting-file edits, builds, and verification |
+| **Mark** (`mark`) | GPT-6.2 Sol (`sol-256k`), high reasoning | 256k / 100k output cap | Primary mechanical-design lead; authorized CAD-source and supporting-file edits, builds, and verification |
 | **Reviewer** (`reviewer`) | Claude Opus 5.5, high reasoning | 270k / 32k | Review-only primary; evidence-backed review of plans and work, CAD via the `cad-review` skill |
-| **Worker** (`worker`) | GPT-6 Luna | 270k / 32k | Implementation, operations, and verification |
+| **Worker** (`worker`) | Meta Muse Ember (`muse-ember-270k`), max reasoning | 270k / 32k | Implementation, operations, and verification |
 
 Cal, Mark, and Reviewer are primary-only peers: select Cal for general tasks,
 Mark for a mechanical-design conversation, or Reviewer for a review-only
@@ -136,11 +288,11 @@ the exact hardened Git inspection invocations listed in
 read/search tools, web evidence tools, the `cad-review` skill, and user
 questions; it cannot implement fixes or run builds and tests. Frontend and
 Planner use the same exact hardened Git inspection invocations and deny all
-other shell access: Frontend by its agent definition, Planner by the shared
-configuration fragment. Merge the
-configuration fragment into each device's OpenCode config as described below. On an existing installation, remove any
+other shell access: Frontend by its agent definition, Planner by the complete
+fleet config. The complete config replaces each device's OpenCode config as
+described below. On an existing installation, remove any
 legacy Cal delegation allowance for the former agent; Mark is primary-only and
-must not be a Cal child. Update the linked agent definitions and shared
+must not be a Cal child. Update the fleet agent definitions and shared
 instructions.
 
 Agents whose definitions grant read-all (Reviewer, Frontend, Research, and
@@ -226,7 +378,7 @@ pass.
 
 Reviewer's definition denies editing and general shell access and permits only
 these exact hardened Git inspection invocations. Cal's entry in the
-configuration fragment permits the same exact forms after a deny-all shell rule;
+complete fleet config permits the same exact forms after a deny-all shell rule;
 Frontend's agent definition and Planner's entry use the same forms and deny all
 other shell access:
 
@@ -255,7 +407,7 @@ permission rule matches the exact command text and does not verify git's
 behavior, and git still honors other configuration. The exact invocations are
 harmless, but no claim is made that they cannot fail in a hostile repository.
 `scripts/check` enforces this shape for agent definitions that cannot edit
-(Reviewer, Frontend, and Planner's config fragment), checks Cal's configuration
+(Reviewer, Frontend, and Planner's config entry), checks Cal's configuration
 allowlist against the commands documented in `fleet/agents/cal.md`, and checks
 read-all agents' env-file restore rules.
 
@@ -266,16 +418,18 @@ Every fleet agent explicitly selects a shared OpenRouter alias defined in
 
 | Local alias | Upstream OpenRouter model | Agents |
 | --- | --- | --- |
-| `openrouter/terra-270k#medium` | `openai/gpt-6.1-terra` with medium reasoning | Cal |
-| `openrouter/luna-270k` | `openai/gpt-6-luna` | Research, Worker |
-| `openrouter/sol-270k` | `openai/gpt-6.1-sol` | Planner, Mark |
+| `openrouter/sol-256k#medium` | `openai/gpt-6.2-sol` with medium reasoning | Cal |
+| `openrouter/sol-256k#high` | `openai/gpt-6.2-sol` with high reasoning | Planner, Mark |
+| `openrouter/muse-ember-270k#max` | `meta/muse-ember` with max reasoning | Research, Worker |
 | `openrouter/kimi-k3-270k#high` | `moonshotai/kimi-k3` with high reasoning | Frontend |
-| `openrouter/glm-5.3-flash-270k` | `z-ai/glm-5.3-flash` | None (alias kept available) |
 | `openrouter/claude-opus-5.5-270k#high` | `anthropic/claude-opus-5.5` with high reasoning | Reviewer |
+| `openrouter/sol-270k` | `openai/gpt-6.1-sol` | None (alias kept available) |
+| `openrouter/terra-270k` | `openai/gpt-6.1-terra` | None (alias kept available) |
+| `openrouter/luna-270k` | `openai/gpt-6-luna` | None (alias kept available) |
+| `openrouter/glm-5.3-flash-270k` | `z-ai/glm-5.3-flash` | None (alias kept available) |
 
-Research's explicit Luna default matches the usual Cal-led delegation instead
-of inheriting a potentially different or unbounded model. Worker also selects
-Luna, reusing the same shared alias rather than defining a second copy. Frontend
+Research and Worker share Muse Ember with max reasoning rather than
+inheriting a potentially different or unbounded caller model. Frontend
 retains Kimi K3 and its existing high-reasoning selection; it is not upgraded to
 K3.1 Pro.
 Reviewer selects Claude Opus 5.5's `high` reasoning variant, which matches the
@@ -285,13 +439,15 @@ alias. The models stay versioned rather than following moving Latest aliases. Sh
 definitions keep limits, capabilities, reasoning variants, and pricing estimates
 in one place for each model instead of duplicating a definition per agent.
 
-Each alias has a 270,000-token context/input budget and a 32,000-token response
-ceiling. The fleet fragment explicitly enables automatic compaction; keep it
+The 270k aliases have a 270,000-token context/input budget and a 32,000-token
+response ceiling; `sol-256k` instead works within a 256,000-token window
+with a 156,000-token maximum prompt and a 100,000-token output cap. The fleet
+config explicitly enables automatic compaction; keep it
 enabled when relying on these budgets. The response allowance is within the
-context window, not an extra 32k on top. Actual input headroom is smaller because
+context window, not extra on top. Actual input headroom is smaller because
 OpenCode reserves space for output and compaction.
 
-The GLM 5.3 Flash alias stays defined in the fragment even though no fleet
+The GLM 5.3 Flash alias stays defined in the fleet config even though no fleet
 agent selects it by default, so devices or sessions that still reference it
 keep working. OpenRouter's GLM 5.3 Flash catalog entry (`z-ai/glm-5.3-flash`),
 checked on 2026-10-30, advertises 1,048,576 context tokens, text/image/video
@@ -325,12 +481,11 @@ $20/M output, $0.20/M cached input, and $5/M cache write; no context-based
 price tier is listed for this model. These are catalog estimates and may vary
 by provider route or change over time.
 
-Merge all six provider alias entries and the compaction setting into each
-device's live config before using the updated agent definitions. Installing
-Markdown/symlinks alone does not define the aliases. The former CAD-only
-`cad-sol-270k` alias has been replaced by shared `sol-270k` in this repository;
-an already-installed device needs the new alias as well as the updated agent.
-No live device configuration or credentials are changed by editing this fragment.
+Point the service at `fleet/` (see Native setup) before using the
+updated agent definitions. The aliases are defined in
+`fleet/opencode.jsonc` itself; there is no separate generation or copy
+step. No live device configuration or credentials are changed by
+editing the tracked fleet config alone — backend adoption is separate.
 
 Selecting a primary agent by ID does not change an existing session's stored
 model; the session's selected model takes precedence over the agent default.
@@ -341,43 +496,75 @@ budgets. No API credentials or live device configuration belong in this reposito
 
 ## Configuration and device-specific settings
 
-`fleet/opencode.jsonc` and files under `profiles/` are configuration fragments,
-not standalone OpenCode config files. Review and merge the settings you want
-into that device's `opencode.jsonc` (normally
-`$XDG_CONFIG_HOME/opencode/opencode.jsonc`). The installer deliberately does
-not rewrite that file, so it cannot erase existing provider, permission, or MCP
-settings.
+`fleet/opencode.jsonc` is the single tracked global OpenCode config,
+reconciling every key of the previous global config: root
+model/catalog, dormant agents, compaction, providers, ordered
+permissions, LSP, all six MCP definitions, all twenty references, and
+tool output. It is loaded directly from `fleet/` when
+`OPENCODE_CONFIG_DIR` points there; there is no template substitution,
+generation, merge, or second config. No plugins, policies, or
+permission conversions were introduced; permission order and scope are
+unchanged, no disabled MCP was enabled, and no deny was removed.
 
-Keep shared, non-secret settings in this repository. Store machine-specific
-values and secrets outside the repository. For MCP credentials, use environment
-variable references such as `{env:MY_MCP_API_KEY}` in OpenCode configuration;
-authenticate OAuth MCPs separately on each device. See
-[`examples/device-settings.example.json`](examples/device-settings.example.json)
-for a local-settings pattern. Do not commit real credentials or private device
-configuration.
+Host-specific values appear only as native OpenCode placeholders
+(`{env:FLEET_HOME}`, `{env:FLEET_LOGIN_USER}`,
+`{env:FLEET_OPENROUTER_MCP_URL}`, `{env:FLEET_UVX_PATH}`, plus the
+`{file:...}` form available for file contents) and are expanded by
+OpenCode at load time from the service environment (see Native setup
+for names, formats, and the no-blank rule). Never replace them by
+hand and never materialize a private value in the tracked file. The
+global `AGENTS.md` at the config root (`fleet/AGENTS.md`) is loaded
+directly; `fleet/opencode.jsonc` therefore sets no `instructions`
+entry, which would duplicate it.
+
+Keep shared, non-secret settings in `fleet/opencode.jsonc`. Store
+machine-specific values and secrets in the service launch environment
+or in private files outside Git (for example `{file:...}` contents),
+never in this repository. No credential is stored in the fleet config:
+the github MCP reads its token at launch time, the remote MCP uses
+OAuth with credentials outside config, and any future header
+credential should use a literal of the form `{env:MY_MCP_API_KEY}`
+without materializing it. Do not commit real credentials or private
+device configuration. `profiles/default.jsonc` stays empty; it is not
+a second config.
 
 ## Update and uninstall
 
-Update with `git pull`, then rerun the installer to link newly added files. The
+Update with `git pull` in the checkout. Because the service loads
+`fleet/` directly, new or renamed definitions, skills, commands, and
+config take effect on the backend's next load/reload with no rerun
+step; start a new session after changing instructions. The
 authenticated OpenCode web client explicitly attaches the
-`fleet-web-prompt-context` skill to each prompt, so install/update the fleet on
-the OpenCode server host before deploying a client version that uses it. The
-installer links skills under the configured OpenCode `skills/` directory; it
-does not install or restart the OpenCode server. To uninstall, remove the
-symlinks the installer created from the OpenCode config directory and remove
-only the marked the-team block from its global `AGENTS.md`. The installer does
-not remove files on its own.
+`fleet-web-prompt-context` skill to each prompt, so update the fleet
+on the OpenCode server host (pull plus backend adoption, above)
+before deploying a client version that uses it. Pulling does not by
+itself set the service environment or restart the service.
+
+To uninstall the fleet as the global root, remove
+`OPENCODE_CONFIG_DIR` and the `FLEET_*` values from the service launch
+environment (including any private `EnvironmentFile` those values
+live in), restart the service so it falls back to the default global
+config under `~/.config/opencode/`, and verify with
+`opencode debug paths config`. Private runtime siblings under
+`fleet/` (for example `fleet/service.json`, `fleet/cli.json`) are
+not part of the tracked fleet; remove or leave them only as the
+device owner directs, and never commit them.
 
 ## Add content
 
 - Add agents as `.md` files under `fleet/agents/` with OpenCode agent
   frontmatter.
-- Add skills as `fleet/skills/<skill-id>/SKILL.md`; put supporting references
-  and scripts alongside it.
+- Add skills as `fleet/skills/<skill-id>/SKILL.md`; supporting files
+  alongside a skill need an explicit `.gitignore` exception (the
+  fleet ignore is deny-by-default).
 - Add slash commands as `.md` files under `fleet/commands/`.
 - Put reusable team conventions in `fleet/AGENTS.md`.
-- Add configuration fragments to `fleet/opencode.jsonc` or a profile in
-  `profiles/`.
+- Add configuration structure and policy to `fleet/opencode.jsonc`;
+  host-only values stay in the private service environment as
+  `{env:...}` placeholders, not in a second config.
+
+For OpenCode itself, use the bundled OpenCode skill; the fleet ships no
+repo-local `fleet/skills/opencode/` copy.
 
 See the [OpenCode V2 documentation](https://opencode.ai/v2/docs/) for supported
 configuration fields and formats.
