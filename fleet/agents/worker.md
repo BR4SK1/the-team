@@ -1,7 +1,7 @@
 ---
 description: Implements scoped development and operations tasks, verifies outcomes, and handles routine corrections
 mode: subagent
-model: openrouter/luna-270k
+model: openrouter/muse-ember-270k#max
 permissions:
   - action: subagent
     resource: "*"

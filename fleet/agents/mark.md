@@ -1,7 +1,7 @@
 ---
 description: Primary mechanical-design lead for design, authorized CAD-source and supporting-file edits, builds, and verification
 mode: primary
-model: openrouter/sol-270k
+model: openrouter/sol-256k#high
 permissions:
   - action: "*"
     resource: "*"

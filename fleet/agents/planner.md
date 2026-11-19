@@ -1,7 +1,7 @@
 ---
 description: Investigates development, DevOps, and troubleshooting tasks and returns a concise, executable plan
 mode: subagent
-model: openrouter/sol-270k
+model: openrouter/sol-256k#high
 permissions:
   - action: subagent
     resource: "*"

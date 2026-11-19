@@ -34,6 +34,54 @@
           // Reserve up to 32k tokens for a response within the 270k window.
           "limit": { "context": 270000, "input": 270000, "output": 32000 }
         },
+        "sol-256k": {
+          "modelID": "openai/gpt-6.2-sol",
+          "name": "GPT-6.2 Sol (fleet, 256k context; 100k output cap)",
+          "capabilities": {
+            "tools": true,
+            "temperature": false,
+            "input": ["text", "image", "file"],
+            "output": ["text"],
+            "reasoning": {
+              "supported": true,
+              "effort": ["low", "medium", "high", "xhigh", "max"]
+            }
+          },
+          // OpenRouter catalog pricing checked 2026-11-17; USD per million tokens.
+          "cost": [
+            { "input": 2, "output": 10, "cache": { "read": 0.1, "write": 2.5 } },
+            {
+              "tier": { "type": "context", "size": 272000 },
+              "input": 4,
+              "output": 15,
+              "cache": { "read": 0.2, "write": 5 }
+            }
+          ],
+          // The 256k total working window reserves 100k for output, leaving a
+          // 156k maximum prompt. Auto compaction remains enabled; this is not a
+          // provider-side billing firewall.
+          "limit": { "context": 256000, "input": 156000, "output": 100000 }
+        },
+        "muse-ember-270k": {
+          "modelID": "meta/muse-ember",
+          "name": "Meta Muse Ember (fleet, 270k context)",
+          "capabilities": {
+            "tools": true,
+            "temperature": true,
+            "input": ["text", "image", "file"],
+            "output": ["text"],
+            "reasoning": {
+              "supported": true,
+              "effort": ["low", "medium", "high", "xhigh", "max"]
+            }
+          },
+          // OpenRouter catalog pricing checked 2026-11-17; USD per million tokens.
+          "cost": [
+            { "input": 0.1, "output": 0.5, "cache": { "read": 0.004, "write": 0.125 } }
+          ],
+          // Keep the existing fleet-agent output budget when switching models.
+          "limit": { "context": 270000, "input": 270000, "output": 32000 }
+        },
         "terra-270k": {
           "modelID": "openai/gpt-6.1-terra",
           "name": "GPT-6.1 Terra (fleet, 270k context)",
@@ -157,7 +205,7 @@
     "build": { "disabled": true },
     "plan": { "disabled": true },
     "cal": {
-      "model": "openrouter/terra-270k#medium",
+      "model": "openrouter/sol-256k#medium",
       "permissions": [
         { "action": "edit", "resource": "*", "effect": "deny" },
         { "action": "shell", "resource": "*", "effect": "deny" },
