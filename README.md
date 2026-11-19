@@ -79,6 +79,16 @@ That command invokes the existing `fleet-install` helper and may alter
 OpenCode user configuration. The local hook installer configures Git to use
 `.githooks`; the retained pre-commit hook runs checks only.
 
+## Ship diagnostics (milestone 1)
+
+Shipping is not implemented yet. The one strict opt-in ship standard,
+the read-only `scripts/ship-doctor` diagnostic (versioned JSON; exit
+`0` local pass, `1` blocked, `2` indeterminate), and the prompt-only
+`/ship` command are documented in [docs/ship.md](docs/ship.md). Run
+the doctor only against an explicit repository path; it inspects
+bounded allowlisted local metadata and never writes, executes target
+code, or uses the network.
+
 ## Starter agents
 
 The fleet defines seven agents under `fleet/agents/`:

@@ -7,6 +7,8 @@ cd "$repo_root"
 shellcheck .githooks/pre-commit scripts/check scripts/deploy.sh scripts/install-hooks
 bash -n .githooks/pre-commit scripts/check scripts/deploy.sh scripts/install-hooks
 
+python3 -m unittest discover -s tests -p "ship_doctor_test.py"
+
 python3 - <<'PY'
 import ast
 import json
@@ -59,6 +61,111 @@ def strip_jsonc(text: str) -> str:
 
 for path in sorted(Path("scripts").glob("fleet-install")):
     ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+for path in (Path("scripts/ship-doctor"), Path("tests/ship_doctor_test.py")):
+    ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+# Ship doctor (milestone 1) must stay read-only and stdlib-only by
+# construction: it may not invoke subprocesses, Git, or the network,
+# use shell execution helpers, follow symlinks, or emit secret/config
+# strings. It traverses with no-follow directory descriptors only.
+ship_doctor = Path("scripts/ship-doctor")
+if not (ship_doctor.stat().st_mode & 0o111):
+    raise ValueError("scripts/ship-doctor: must be executable")
+ship_doctor_source = ship_doctor.read_text(encoding="utf-8")
+for banned in (
+    "subprocess",
+    "socket",
+    "urllib",
+    "requests",
+    "os.system",
+    "os.popen",
+    "os.exec",
+    "os.spawn",
+    "os.fork",
+    "eval(",
+    "exec(",
+    "shutil",
+    "http.client",
+    "read_text",
+    ".resolve(",
+    "lstat",
+    "Path(",
+):
+    if banned in ship_doctor_source:
+        raise ValueError(
+            f"scripts/ship-doctor: forbidden mechanism {banned!r}"
+        )
+for required in ("O_NOFOLLOW", "dir_fd", "O_NONBLOCK", "fstat"):
+    if required not in ship_doctor_source:
+        raise ValueError(
+            f"scripts/ship-doctor: missing no-follow traversal {required!r}"
+        )
+
+# The /ship command is prompt-only: it states shipping is not
+# implemented, runs diagnostics only if execution is permitted,
+# otherwise reports not run, names the trusted absolute fleet doctor
+# location executed through the permitted executor only, and contains
+# no OpenCode shell interpolation marker (exclamation followed by a
+# backtick), no other interpolation, fallback, or mutation mechanism.
+ship_command = Path("fleet/commands/ship.md")
+ship_command_text = ship_command.read_text(encoding="utf-8")
+for required in (
+    "Shipping is not implemented yet",
+    "only if execution is permitted",
+    "not run",
+    "absolute",
+    "trusted",
+    "permitted executor",
+):
+    if required not in ship_command_text:
+        raise ValueError(f"{ship_command}: missing required phrase {required!r}")
+for banned in (
+    "!`",
+    "$(",
+    "${",
+    "fallback",
+    "python3 scripts/ship-doctor",
+    "./scripts/ship-doctor",
+):
+    if banned in ship_command_text:
+        raise ValueError(f"{ship_command}: prompt-only violation {banned!r}")
+
+# The ship standard document must state the one strict opt-in
+# standard, Husky-alone gating, the exact future E2E requirement,
+# and the corrected branch/adoption/dispatch rules.
+ship_doc = Path("docs/ship.md")
+ship_doc_text = ship_doc.read_text(encoding="utf-8")
+for required in (
+    "Shipping is not implemented yet",
+    "strict opt-in",
+    "no per-repo config",
+    "Husky alone",
+    "scripts/ship-doctor",
+    "local_pass",
+    "blocked",
+    "indeterminate",
+    "test:e2e",
+    "the repository’s E2E suite must finish successfully",
+    "no implicit staging",
+    "no rewritten commits",
+    "production deploy skill",
+    "starts on main",
+    "only if starting off main",
+    "local main",
+    "duplicated hooks",
+    "approved mapping",
+    "local structural validation",
+    "Web/native dispatch",
+    "absolute",
+    "trusted",
+):
+    if required not in ship_doc_text:
+        raise ValueError(f"{ship_doc}: missing required phrase {required!r}")
+if "paid" in ship_doc_text.lower():
+    raise ValueError(f"{ship_doc}: shared scaffold must not carry paid policy")
+if "python3 scripts/ship-doctor" in ship_doc_text:
+    raise ValueError(f"{ship_doc}: must not use repository-relative execution")
 
 # Permission hardening for the fleet agent definitions:
 # - A wildcard shell allow rule (for example "git diff *") also permits mutating
