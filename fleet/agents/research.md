@@ -1,7 +1,7 @@
 ---
 description: Evidence-driven web and repository research with sourced findings and explicit uncertainty; read-only
 mode: subagent
-model: openrouter/luna-270k
+model: openrouter/muse-ember-270k#max
 permissions:
   - action: "*"
     resource: "*"
