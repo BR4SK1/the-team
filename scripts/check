@@ -4,8 +4,8 @@ set -euo pipefail
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 
-shellcheck .githooks/pre-commit scripts/check scripts/deploy.sh scripts/install-hooks
-bash -n .githooks/pre-commit scripts/check scripts/deploy.sh scripts/install-hooks
+shellcheck .githooks/pre-commit scripts/check scripts/install-hooks
+bash -n .githooks/pre-commit scripts/check scripts/install-hooks
 
 python3 -m unittest discover -s tests -p "ship_doctor_test.py"
 
@@ -13,6 +13,7 @@ python3 - <<'PY'
 import ast
 import json
 import re
+import subprocess
 from pathlib import Path
 
 
@@ -56,14 +57,70 @@ def strip_jsonc(text: str) -> str:
             output.append(char)
             index += 1
     without_comments = "".join(output)
-    return re.sub(r",\s*([}\]])", r"\1", without_comments)
+    # Trailing commas are removed outside quoted strings only; a comma
+    # inside a string literal is content and must be preserved.
+    result: list[str] = []
+    in_string = False
+    escaped = False
+    index = 0
+    while index < len(without_comments):
+        char = without_comments[index]
+        if in_string:
+            result.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+        elif char == '"':
+            in_string = True
+            result.append(char)
+            index += 1
+        elif char == ",":
+            lookahead = index + 1
+            while (
+                lookahead < len(without_comments)
+                and without_comments[lookahead] in " \t\r\n"
+            ):
+                lookahead += 1
+            if (
+                lookahead < len(without_comments)
+                and without_comments[lookahead] in "}]"
+            ):
+                result.append(" ")
+            else:
+                result.append(char)
+            index += 1
+        else:
+            result.append(char)
+            index += 1
+    return "".join(result)
 
 
-for path in sorted(Path("scripts").glob("fleet-install")):
+for path in (
+    Path("scripts/ship-doctor"),
+    Path("tests/ship_doctor_test.py"),
+):
     ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
-for path in (Path("scripts/ship-doctor"), Path("tests/ship_doctor_test.py")):
-    ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+# Native fleet setup: the installer and config generator are removed.
+# fleet/ itself is the OpenCode config root (OPENCODE_CONFIG_DIR), so no
+# script may reintroduce copying, linking, or generating a second config.
+for removed in (
+    "scripts/fleet-install",
+    "scripts/generate-opencode-config",
+    "scripts/deploy.sh",
+    "fleet/host-inputs.schema.json",
+    "examples/host-inputs.example.json",
+    "tests/generate_config_test.py",
+):
+    if Path(removed).exists():
+        raise ValueError(
+            f"{removed}: removed under native OPENCODE_CONFIG_DIR setup; "
+            "do not reintroduce installer/generator/host-inputs"
+        )
 
 # Ship doctor (milestone 1) must stay read-only and stdlib-only by
 # construction: it may not invoke subprocesses, Git, or the network,
@@ -339,6 +396,392 @@ for agent_name, agent in sorted((fleet_config.get("agents") or {}).items()):
             if isinstance(rule, dict)
         ],
     )
+
+# Complete fleet config (the global opencode.jsonc loaded directly from
+# fleet/ when OPENCODE_CONFIG_DIR points there): every global key is
+# present, fleet aliases/default/restrictions are retained, and
+# host-specific values are native {env:...} placeholders only.
+if fleet_config.get("compaction") != {
+    "auto": True,
+    "keep": {"tokens": 15000},
+    "buffer": 20000,
+}:
+    raise ValueError(
+        "fleet/opencode.jsonc: compaction must be auto with keep.tokens "
+        "15000 and buffer 20000"
+    )
+if fleet_config.get("tool_output") != {
+    "max_lines": 3000,
+    "max_bytes": 98304,
+}:
+    raise ValueError(
+        "fleet/opencode.jsonc: tool_output must be max_lines 3000 and "
+        "max_bytes 98304"
+    )
+if fleet_config.get("default_agent") != "cal":
+    raise ValueError("fleet/opencode.jsonc: default_agent must be cal")
+fleet_models = fleet_config.get("providers", {}).get("openrouter", {}).get(
+    "models", {}
+)
+for alias in (
+    "sol-270k",
+    "sol-256k",
+    "muse-ember-270k",
+    "terra-270k",
+    "luna-270k",
+    "glm-5.3-flash-270k",
+    "kimi-k3-270k",
+    "claude-opus-5.5-270k",
+):
+    if alias not in fleet_models:
+        raise ValueError(
+            f"fleet/opencode.jsonc: missing fleet alias {alias!r}"
+        )
+for agent_name in ("build", "plan"):
+    if fleet_config.get("agents", {}).get(agent_name, {}).get("disabled") is not True:
+        raise ValueError(
+            f"fleet/opencode.jsonc: agents.{agent_name} must stay disabled"
+        )
+if set(fleet_config) != {
+    "$schema",
+    "default_agent",
+    "model",
+    "agents",
+    "compaction",
+    "providers",
+    "permissions",
+    "lsp",
+    "mcp",
+    "references",
+    "tool_output",
+}:
+    raise ValueError(
+        "fleet/opencode.jsonc: top-level keys must be the complete set "
+        "reconciled from the global config"
+    )
+if fleet_config.get("model") != "openrouter/meta/muse-ember":
+    raise ValueError(
+        "fleet/opencode.jsonc: root model fallback must be "
+        "openrouter/meta/muse-ember"
+    )
+if fleet_config.get("agents", {}).get("plan") != {
+    "model": "openrouter/openai/gpt-6.1-sol",
+    "disabled": True,
+}:
+    raise ValueError(
+        "fleet/opencode.jsonc: agents.plan must carry its dormant model "
+        "and stay disabled"
+    )
+if fleet_config.get("agents", {}).get("build") != {
+    "model": "openrouter/openai/gpt-6-luna",
+    "disabled": True,
+}:
+    raise ValueError(
+        "fleet/opencode.jsonc: agents.build must carry its dormant model "
+        "and stay disabled"
+    )
+if fleet_config.get("agents", {}).get("chat") != {"disabled": True}:
+    raise ValueError(
+        "fleet/opencode.jsonc: agents.chat must stay disabled"
+    )
+cal_subagents = [
+    rule.get("resource")
+    for rule in fleet_config["agents"]["cal"]["permissions"]
+    if rule.get("action") == "subagent" and rule.get("resource") != "*"
+]
+if cal_subagents != ["planner", "frontend", "research", "worker"]:
+    raise ValueError(
+        "fleet/opencode.jsonc: cal subagent order must match the host "
+        "order (planner, frontend, research, worker)"
+    )
+for alias, expected in (
+    ("openai/gpt-6-luna", {"limit": {"input": 200000}}),
+    ("meta/muse-ember", {"limit": {"input": 200000, "output": 128000}}),
+    ("openai/gpt-6.1-sol", {"limit": {"input": 1050000}}),
+):
+    if fleet_models.get(alias) != expected:
+        raise ValueError(
+            f"fleet/opencode.jsonc: upstream override {alias!r} must match "
+            "the reconciled catalog limits"
+        )
+fleet_text = Path("fleet/opencode.jsonc").read_text(encoding="utf-8")
+for placeholder in (
+    "{env:FLEET_HOME}",
+    "{env:FLEET_LOGIN_USER}",
+    "{env:FLEET_OPENROUTER_MCP_URL}",
+    "{env:FLEET_UVX_PATH}",
+):
+    if placeholder not in fleet_text:
+        raise ValueError(
+            f"fleet/opencode.jsonc: missing native placeholder {placeholder!r}"
+        )
+if "__FLEET_HOST_" in fleet_text:
+    raise ValueError(
+        "fleet/opencode.jsonc: must not contain generator host tokens"
+    )
+# No `instructions` key: the global AGENTS.md at the config root
+# (fleet/AGENTS.md) is discovered directly; adding it again would
+# duplicate it, and a relative entry would resolve against the
+# workspace/project root instead of the config root.
+if "instructions" in fleet_config:
+    raise ValueError(
+        "fleet/opencode.jsonc: must not set instructions; global "
+        "AGENTS.md at the config root is loaded directly"
+    )
+if "/home/" in fleet_text:
+    raise ValueError("fleet/opencode.jsonc: must not contain private home paths")
+fleet_servers = fleet_config.get("mcp", {}).get("servers", {})
+if sorted(fleet_servers) != [
+    "blender",
+    "excalibur-memory",
+    "fieldops-journal",
+    "github",
+    "kubernetes",
+    "openrouter",
+]:
+    raise ValueError(
+        "fleet/opencode.jsonc: mcp servers must be the six reconciled IDs"
+    )
+for server_id, server in fleet_servers.items():
+    if server.get("disabled"):
+        raise ValueError(
+            f"fleet/opencode.jsonc: {server_id} must not be disabled; "
+            "no server was disabled in the global config"
+        )
+if fleet_servers["kubernetes"] != {
+    "type": "local",
+    "command": ["npx", "-y", "mcp-server-kubernetes"],
+}:
+    raise ValueError("fleet/opencode.jsonc: kubernetes server shape mismatch")
+if fleet_servers["excalibur-memory"] != {
+    "type": "local",
+    "command": [
+        "node",
+        "{env:FLEET_HOME}/opt/excalibur-memory/current/mcp-server.mjs",
+    ],
+    "environment": {"MEMORY_ACTOR": "agent"},
+}:
+    raise ValueError(
+        "fleet/opencode.jsonc: excalibur-memory server shape mismatch"
+    )
+if fleet_servers["fieldops-journal"] != {
+    "type": "local",
+    "command": [
+        "node",
+        "{env:FLEET_HOME}/Projects/fieldops-journal/mcp-server.mjs",
+    ],
+    "environment": {"JOURNAL_ACTOR": "fieldops"},
+}:
+    raise ValueError(
+        "fleet/opencode.jsonc: fieldops-journal server shape mismatch"
+    )
+if fleet_servers["github"]["command"][:2] != ["bash", "-c"]:
+    raise ValueError("fleet/opencode.jsonc: github server must use bash -c launch")
+if "gh auth token" not in fleet_servers["github"]["command"][2]:
+    raise ValueError(
+        "fleet/opencode.jsonc: github server must read its token via gh"
+    )
+if fleet_servers["openrouter"] != {
+    "type": "remote",
+    "url": "{env:FLEET_OPENROUTER_MCP_URL}",
+}:
+    raise ValueError("fleet/opencode.jsonc: openrouter server shape mismatch")
+if fleet_servers["blender"] != {
+    "type": "local",
+    "command": ["{env:FLEET_UVX_PATH}", "mcp-for-blender"],
+}:
+    raise ValueError("fleet/opencode.jsonc: blender server shape mismatch")
+if set(fleet_config.get("lsp", {})) != {"typescript", "python", "yaml", "bash"}:
+    raise ValueError("fleet/opencode.jsonc: lsp must be the four reconciled servers")
+if fleet_config["lsp"]["typescript"] != {
+    "command": ["typescript-language-server", "--stdio"],
+    "extensions": [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"],
+}:
+    raise ValueError("fleet/opencode.jsonc: lsp.typescript shape mismatch")
+if fleet_config["lsp"]["python"] != {
+    "command": ["pyright-langserver", "--stdio"],
+    "extensions": [".py", ".pyi"],
+}:
+    raise ValueError("fleet/opencode.jsonc: lsp.python shape mismatch")
+if fleet_config["lsp"]["yaml"] != {
+    "command": ["yaml-language-server", "--stdio"],
+    "extensions": [".yaml", ".yml"],
+}:
+    raise ValueError("fleet/opencode.jsonc: lsp.yaml shape mismatch")
+if fleet_config["lsp"]["bash"] != {
+    "command": ["bash-language-server", "start"],
+    "extensions": [".sh", ".bash"],
+}:
+    raise ValueError("fleet/opencode.jsonc: lsp.bash shape mismatch")
+if sorted(fleet_config.get("references", {})) != [
+    "ai-companion",
+    "archives",
+    "college-git",
+    "companion",
+    "companion-decider-arena",
+    "config",
+    "excalibur-mt",
+    "finance",
+    "gurdy-pi",
+    "hearthkeeper",
+    "hearthkeeper-archive-20260926",
+    "hearthkeeper-ezd6",
+    "home",
+    "journal",
+    "local-infra",
+    "memory",
+    "opencode-client",
+    "projects",
+    "sunfade",
+    "the-team",
+]:
+    raise ValueError(
+        "fleet/opencode.jsonc: references must be the twenty reconciled aliases"
+    )
+for alias, ref in fleet_config["references"].items():
+    if not ref.get("path", "").startswith("{env:FLEET_HOME}"):
+        raise ValueError(
+            f"fleet/opencode.jsonc: references.{alias} path must be "
+            "home-rooted via {env:FLEET_HOME}"
+        )
+
+# Native fleet setup: fleet/opencode.jsonc is the single tracked global
+# config, loaded directly from fleet/. No private values, no generated
+# copy, and no second mergeable config may remain.
+if Path("profiles/workstation.jsonc").exists():
+    raise ValueError(
+        "profiles/workstation.jsonc: superseded by fleet/opencode.jsonc; "
+        "remove the manual profile"
+    )
+if Path("fleet/opencode.json").exists():
+    raise ValueError(
+        "fleet/opencode.json: competing .json config; the single tracked "
+        "config is fleet/opencode.jsonc (a .json file here is a private "
+        "runtime sibling and must stay out of Git)"
+    )
+expected_permissions = (
+    ("shell", "pacman -S *", "allow"),
+    ("shell", "pacman -S *--noconfirm*", "deny"),
+    ("shell", "systemctl enable postgresql", "allow"),
+    ("shell", "systemctl enable postgresql.service", "allow"),
+    ("shell", "systemctl start postgresql", "allow"),
+    ("shell", "systemctl start postgresql.service", "allow"),
+    ("shell", "systemctl restart postgresql", "allow"),
+    ("shell", "systemctl restart postgresql.service", "allow"),
+    ("shell", "sudo -u postgres psql *", "allow"),
+    ("shell", "initdb -D /var/lib/postgres/*", "allow"),
+    ("shell", "initdb --pgdata=/var/lib/postgres/*", "allow"),
+    ("shell", "sudo -u postgres initdb -D /var/lib/postgres/*", "allow"),
+    ("shell", "sudo -u postgres initdb --pgdata=/var/lib/postgres/*", "allow"),
+    ("shell", "loginctl enable-linger {env:FLEET_LOGIN_USER}", "allow"),
+    ("shell", "PGHOST=* psql *", "allow"),
+    ("shell", "PGPORT=* psql *", "allow"),
+    ("shell", "PGDATABASE=* psql *", "allow"),
+    ("shell", "PGUSER=* psql *", "allow"),
+    ("shell", "PGPASSWORD=* psql *", "allow"),
+    ("shell", "opencode --help", "allow"),
+    ("shell", "opencode --version", "allow"),
+    ("shell", "opencode debug config", "allow"),
+    ("shell", "opencode debug agents", "allow"),
+    ("shell", "opencode debug paths *", "allow"),
+    ("shell", "opencode mcp list", "allow"),
+    ("shell", "opencode service status", "allow"),
+    ("shell", "opencode api get *", "allow"),
+    ("shell", "opencode models", "allow"),
+    ("fieldops-journal_*", "*", "deny"),
+)
+actual_permissions = tuple(
+    (rule.get("action"), rule.get("resource"), rule.get("effect"))
+    for rule in fleet_config.get("permissions", [])
+)
+if actual_permissions != expected_permissions:
+    raise ValueError(
+        "fleet/opencode.jsonc: permissions must preserve the reconciled "
+        "order/scope exactly"
+    )
+for url in re.findall(r"https?://[^\s\"']+", fleet_text):
+    # The remote MCP URL is a native placeholder, not a materialized URL;
+    # the only literal URL in the tracked config is the schema.
+    if url != "https://opencode.ai/config.json":
+        raise ValueError(
+            f"fleet/opencode.jsonc: disallowed URL {url!r}"
+        )
+default_profile = json.loads(
+    strip_jsonc(Path("profiles/default.jsonc").read_text(encoding="utf-8"))
+)
+if default_profile != {}:
+    raise ValueError(
+        "profiles/default.jsonc: default profile must stay empty; "
+        "configuration lives in fleet/opencode.jsonc"
+    )
+readme_text = Path("README.md").read_text(encoding="utf-8")
+for marker in (
+    "OPENCODE_CONFIG_DIR",
+    "fleet/opencode.jsonc",
+    "FLEET_HOME",
+    "FLEET_LOGIN_USER",
+    "FLEET_OPENROUTER_MCP_URL",
+    "FLEET_UVX_PATH",
+    "service.json",
+    "EnvironmentFile",
+):
+    if marker not in readme_text:
+        raise ValueError(f"README.md: missing configuration marker {marker!r}")
+for banned in (
+    "scripts/fleet-install",
+    "scripts/generate-opencode-config",
+    "host-inputs",
+    "opencode service set env",
+    "opencode service unset env",
+    "__FLEET_HOST_",
+):
+    if banned in readme_text:
+        raise ValueError(
+            f"README.md: must not document removed installer/generator {banned!r}"
+        )
+
+# Fleet ignore allowlist (deny-by-default): intended tracked assets are
+# not ignored; private runtime siblings under fleet/ are ignored.
+# git-only check on path names; no runtime file is read or created.
+def is_ignored(path: str) -> bool:
+    result = subprocess.run(
+        ["git", "check-ignore", "--no-index", "-q", "--", path],
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+for allowed in (
+    "fleet/opencode.jsonc",
+    "fleet/AGENTS.md",
+    "fleet/agents/cal.md",
+    "fleet/agents/new-agent.md",
+    "fleet/commands/ship.md",
+    "fleet/commands/new-command.md",
+    "fleet/skills/cad/SKILL.md",
+    "fleet/skills/new-skill/SKILL.md",
+):
+    if is_ignored(allowed):
+        raise ValueError(
+            f".gitignore: intended fleet asset {allowed!r} must not be ignored"
+        )
+for denied in (
+    "fleet/service.json",
+    "fleet/cli.json",
+    "fleet/opencode.json",
+    "fleet/auth.json",
+    "fleet/foo.env",
+    "fleet/dump.log",
+    "fleet/random.txt",
+    "fleet/agents/private.json",
+    "fleet/commands/private.json",
+    "fleet/skills/cad/extra.json",
+    "fleet/skills/cad/notes.md",
+    "fleet/plugin/file.js",
+):
+    if not is_ignored(denied):
+        raise ValueError(
+            f".gitignore: runtime file {denied!r} under fleet/ must be ignored"
+        )
 
 for path in sorted(Path(".").glob("**/*.json")):
     if ".git" not in path.parts:

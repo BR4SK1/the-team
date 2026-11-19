@@ -5,5 +5,32 @@
 .env
 .env.*
 !.env.example
+# Fleet is the live OpenCode config root when OPENCODE_CONFIG_DIR points
+# at fleet/ (see README). Private runtime siblings (service.json,
+# cli.json, auth files, a competing opencode.json, logs, dumps) live on
+# disk under fleet/ but must stay out of Git. Deny by default; allow
+# only the intended tracked config/agents/skills/commands/instructions.
+# A skill's supporting files need an explicit exception here if added.
+fleet/*
+!fleet/opencode.jsonc
+!fleet/AGENTS.md
+!fleet/agents/
+fleet/agents/*
+!fleet/agents/*.md
+!fleet/commands/
+fleet/commands/*
+!fleet/commands/*.md
+!fleet/skills/
+!fleet/skills/*/
+fleet/skills/*/*
+!fleet/skills/*/SKILL.md
+# Explicit runtime names (also covered by fleet/* above; listed so the
+# intent is visible and never weakened by a later whitelist edit).
+fleet/service.json
+fleet/cli.json
+fleet/opencode.json
+fleet/auth.json
+fleet/*.env
+fleet/*.log
 __pycache__/
 *.py[cod]
