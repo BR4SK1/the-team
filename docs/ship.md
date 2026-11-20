@@ -1,28 +1,60 @@
-# Ship standard (milestone 1: diagnostics only)
+# Ship standard
 
-> **Shipping is not implemented yet.** This document describes the one
-> strict opt-in standard, the read-only doctor that can diagnose it,
-> and the future pipeline that is intentionally *not* built yet. No
-> part of the future pipeline below is available today.
+Ship a staged change through Husky commit and push gates, a nested
+non-prod deploy and E2E run, then an open GitHub PR for review. Cal
+owns authority and user decisions; Worker runs only the fleet scripts
+below. The skill is `fleet/skills/ship/SKILL.md` (ID `ship`, frontmatter
+name `Ship`, `opencode/autoinvoke: false`), the `/ship` slash command
+is registered by the server plugin `fleet/plugins/ship.ts`, and the PR
+body template is `fleet/skills/ship/resources/PR_TEMPLATE.md`. Keep
+`scripts/ship/` together.
 
-## What exists in milestone 1
+## What exists
 
-- `scripts/ship-doctor` — a read-only, standalone Python (stdlib only)
-  diagnostic. It takes one explicit repository path, inspects only
-  bounded allowlisted local metadata, and prints versioned JSON.
-- `fleet/commands/ship.md` — the prompt-only `/ship` command. It runs
-  diagnostics only if execution is permitted; otherwise it reports the
-  diagnostics as not run. It makes no changes.
-- This document — the standard both of the above describe.
+- `scripts/ship/ship-doctor` — read-only diagnostics (Step 1). It
+  takes one explicit repository path, inspects only bounded
+  allowlisted local metadata, and prints versioned JSON.
+- `scripts/ship/ship-build` — validates opt-in and wiring, then
+  commits the reviewed staged set and pushes to an explicit remote
+  and ref (Steps 2–3).
+- `scripts/ship/ship-deploy` — fleet pre-push wrapper that runs the
+  non-prod rollout and the full E2E suite for the exact outgoing SHA
+  before upload (Step 4, nested in the push).
+- `scripts/ship/check` — relocated check runner (former
+  `scripts/check`), wired from the still-active `.githooks/pre-commit`
+  hook. Run it with `./scripts/ship/check`.
+- `/ship` via `fleet/plugins/ship.ts` — registers a fixed prompt to
+  Cal that loads the skill by ID. V2 skill frontmatter cannot
+  register a slash command. The plugin performs no shell or
+  repository operations, rejects trailing arguments before admission
+  (no prompt is admitted), and does not switch agents: on a non-Cal
+  session it reports the wrong agent instead. It replaces the deleted
+  Markdown command because trailing input in a Markdown or JSON
+  command template would be expanded by shell interpolation outside
+  the agent permission flow. Title matching and ID `ship` guard the
+  registration; a pre-existing `ship` command is left in place.
+- This document and `tests/ship_doctor_test.py`,
+  `tests/ship_workflow_test.py` — the one strict opt-in standard and
+  the realistic Git fixtures that prove the boundary.
 
-OpenCode discovers everything under `fleet/commands/` directly from
-the fleet config root, so `/ship` is available when the service launch
-environment points `OPENCODE_CONFIG_DIR` at `fleet/` (see README
-Native setup). This was verified in the isolated fake-root check
-described in the README (the fixture command appears after location
-boot and a session; a one-shot query before activation can show only
-the built-ins). Nothing in milestone 1 installs, deploys, or alters
-any live configuration.
+When the service launch environment points `OPENCODE_CONFIG_DIR` at
+`fleet/` (see README Native setup), the skill and the plugin are
+discovered from the fleet root. The web client does not perform
+native command dispatch for this fleet; a web user loads the skill
+explicitly as `@ship` with no arguments, under the same rules.
+
+## Five steps
+
+Keep the user draft steps in the skill (`fleet/skills/ship/SKILL.md`):
+
+- Step 1 - Run the ship-doctor script
+- Step 2 - Validate the state of the current environment
+- Step 3 - Run the ship-build script
+- Step 4 - Run the ship-deploy script
+- Step 5 - Create a PR
+
+Step 4's deploy is nested in the Step 3 push (see Ship-deploy below);
+there is no second, separate deploy run.
 
 ## The one strict opt-in standard
 
@@ -32,6 +64,11 @@ adapters, and no fallbacks: a repository either conforms to this
 standard exactly or it does not ship. The shared ship layer never
 invents a second way to pass, and a repository that cannot meet the
 standard is reported as blocked or indeterminate, not accommodated.
+
+The smallest explicit opt-in contract is: the repository passes
+`scripts/ship/ship-doctor <repo>` locally, contains an executable
+`scripts/ship-deploy`, and the wiring below delegates its push to the
+fleet wrapper. The full conformance table is:
 
 A conforming repository has, at its root:
 
@@ -44,7 +81,7 @@ A conforming repository has, at its root:
 | Declared hooks path | Git config `core.hooksPath` declares `.husky/_` exactly. Directory presence alone never passes this check |
 | Pre-commit hook | `.husky/pre-commit`, a regular file (not required to be executable: Husky v9 runs user hooks via `sh`) |
 | Commit-msg hook | `.husky/commit-msg`, a regular file |
-| Pre-push hook | `.husky/pre-push`, a regular file |
+| Pre-push hook | `.husky/pre-push`, a regular file delegating to `scripts/ship/ship-deploy` |
 | Generated shims | `.husky/_/pre-commit`, `.husky/_/commit-msg`, `.husky/_/pre-push`, each a regular executable file |
 | Husky helper | `.husky/_/h`, a regular file (sourced by the shims; not required to be executable) |
 | `prepare` script | Exactly `husky` |
@@ -52,12 +89,21 @@ A conforming repository has, at its root:
 | `lint` script | Present, a non-empty string |
 | `test:unit` script | Present, a non-empty string |
 | `test:e2e` script | Present, a non-empty string — the standard E2E entry point |
+| Non-prod entry | `scripts/ship-deploy`, an executable regular file taking exactly one SHA argument |
 
 Visible disable or override indicators in allowlisted files are a
 known mismatch: `--no-verify`, `HUSKY=0`, `core.hooksPath` in
 `package.json` or a hook body, and legacy `husky.hooks` declarations.
 A repository that disables or overrides the gates is blocked, never
 silently accepted.
+
+Adoption must not silently drop existing gates, including Companion
+checks. Adoption preserves each existing gate in an approved mapping:
+every current gate is explicitly mapped to the retained check that
+replaces it, and that mapping is approved by the repository owner
+before adoption. Adoption also creates no unintended duplicated
+hooks: the resulting hook set contains each gate exactly once, with
+no duplicated hooks left behind by the adoption step.
 
 ## Husky is the only gate
 
@@ -68,10 +114,11 @@ Husky — no CI-only gate, no server-side substitute, no second hook
 system — and there will not be one. If Husky does not run, the gate
 did not run.
 
-This has a direct corollary for the future pipeline: evidence that a
-pre-push transport actually completed (for example a real timeout
-proof from the push itself) must come from that pre-push hook path.
-Shipping must not invent a separate transport gate to stand in for it.
+`ship-build` therefore validates the effective Husky wiring —
+declared `core.hooksPath`, executable generated shims, and the
+standard pre-push delegation — *before* any mutation, never
+executing the hook bodies to prove it. The doctor's shape check alone
+does not prove the runtime ran.
 
 ## The doctor
 
@@ -86,7 +133,7 @@ resolve relative to the target's working directory and could run
 target code. The invocation shape is:
 
 ```sh
-<absolute-fleet-checkout>/scripts/ship-doctor <repo-path>
+<absolute-fleet-checkout>/scripts/ship/ship-doctor <repo-path>
 ```
 
 - Exactly one argument: the explicit path to the repository root.
@@ -157,94 +204,196 @@ branches, commits, or remotes. A `local_pass` means only that the
 static, allowlisted shape matches the standard. The doctor is
 local structural validation only, and it is not Web/native dispatch
 readiness. Web or native dispatch (including any browser work) is a
-separate future capability with its own authorization and
-permissions; a local pass establishes nothing about it.
+separate capability with its own authorization and permissions; a
+local pass establishes nothing about it.
 
 Fixture-only tests in `tests/ship_doctor_test.py` cover each outcome,
 missing and bypassed hooks, unsafe and symlinked paths, FIFO and
 capped reads, malformed or untrusted metadata, unchanged fixtures,
-and secret redaction. They run locally via `scripts/check`; there
-are no live endpoint tests.
+and secret redaction. They run locally via `./scripts/ship/check`;
+there are no live endpoint tests.
 
-## Future pipeline (not implemented)
+## Ship-build (Steps 2–3)
 
-Everything in this section is a design constraint for later
-milestones, not available behaviour. No command today stages,
-commits, pushes, or deploys anything.
+Worker runs:
 
-### Before-upload guards and exact-candidate evidence
+```sh
+<fleet-checkout>/scripts/ship/ship-build <repo-path> \
+  --remote <remote> --ref refs/heads/<topic> \
+  [--branch <topic>] --message <message>
+```
 
-Before anything is uploaded, guards must run against the exact
-candidate being shipped, and the evidence recorded must name that
-exact candidate (its commit), not a nearby or earlier state. Evidence
-from one commit must never stand in for evidence about another.
+All of remote, ref, and message are required and explicit; there are
+no defaults. The script, in order:
 
-### Push deploys to non-production, then E2E must finish
+1. Requires the doctor's `local_pass` (Step 1) and the executable
+   opt-in (`scripts/ship-deploy`, a regular file, not a symlink).
+2. Validates the effective wiring before any mutation: `core.hooksPath`
+   is exactly `.husky/_`, the three shims are regular executables,
+   `.husky/_/h` is present, and `.husky/pre-push` contains a delegation
+   to `scripts/ship/ship-deploy`. Hook bodies are checked by substring
+   only; they are never executed here. Bypass indicators and a
+   `HUSKY=0` environment block before mutation.
+3. Reviews the staged set and prints it with the outgoing commits
+   (base to `HEAD`). There is no implicit staging: the staged set
+   must be non-empty, the script never runs `git add`, and unstaged
+   tracked changes make the candidate unclean. Untracked files are
+   reported and never swept in.
+4. Handles the branch. On `main` it requires `--branch <topic>` equal
+   to the ref branch and creates that safe branch. Off `main`, `--branch`
+   if given must equal the current branch and the ref must name the
+   same branch. Work starts on main normally (ask the user only if starting off main); the starting branch is never assumed silently.
+5. Checks local main synchronization: ahead or diverged from the
+   explicit remote blocks. Only-behind automatic sync applies to
+   local main, and only with no rewritten commits — a fast-forward
+   that preserves the staged work (verified by staged names before and
+   after). Any need to rewrite history is a block.
+6. Commits the staged set with a plain `git commit -m` (never with
+   bypass flags) and records `.ship/evidence/<SHA>-commit.json` for
+   the exact candidate SHA. A failed commit gate blocks the push.
+7. Pushes `HEAD:<ref>` to the explicit remote (this runs the real
+   pre-push gate). No automatic retry follows a failed push.
+8. Verifies the post-push remote SHA with `git ls-remote` against the
+   candidate and requires both evidence files for that SHA. A missing
+   post-push receipt cannot prevent the upload that already happened;
+   the script says so and fails closed on the verification, never
+   claiming prevention. Tests prove this boundary with real Git
+   fixtures (`tests/ship_workflow_test.py`).
 
-When shipping exists, a push deploys the exact outgoing commit to a
-non-production (staging) environment first, and only then requires
-that **the repository’s E2E suite must finish successfully** against
-that deployment. That sentence is the requirement, verbatim. The
-contract is owner-controlled and plain: the E2E suite is whatever the
-repository owner's `test:e2e` entry point runs, the shared ship layer
-does **not** classify individual tests, does not ask which tests to
-run, and does not skip any test. It observes only whether the suite
-finished successfully.
+The script performs no destructive cleanup and deletes nothing.
 
-### Adoption must not silently drop existing gates
+## Ship-deploy (Step 4, nested in the push)
 
-Adopting this standard must not silently drop existing gates,
-including Companion checks. Adoption preserves each existing gate in
-an approved mapping: every current gate is explicitly mapped to the
-retained check that replaces it, and that mapping is approved by the
-repository owner before adoption. Adoption also creates no unintended
-duplicated hooks: the resulting hook set contains each gate exactly
-once, with no duplicated hooks left behind by the adoption step.
+Deployment is nested in the Step 3 push, not a second deploy. The
+real `.husky/pre-push` invokes the fleet wrapper; the wrapper reads
+exactly one pre-push record line on standard input, requires a single
+branch push of a single full SHA, requires that SHA's commit evidence
+to exist, then runs the two fixed inputs in order:
 
-### Staging, branches, and synchronization
+1. Non-production rollout: `<repo>/scripts/ship-deploy <SHA>` with
+   the exact outgoing SHA as the sole argument. The script must be a
+   regular executable, not a symlink. A non-zero exit, or output
+   reporting a placeholder, dry run, or skipped work, means not
+   deployed and blocks the push even under a zero exit. The wrapper
+   never infers a staging endpoint and never runs arbitrary user
+   shell snippets; there are no Companion-specific adapters.
+2. Full test run: `<manager> run test:e2e` derived from the pinned
+   `packageManager`. The suite always runs in full with no
+   arguments, no filtering, and no skipping. The requirement is
+   **the repository’s E2E suite must finish successfully** against the deployment of the exact outgoing SHA.
 
-- Work starts on main normally; ask the user only if starting off main.
-  The starting branch is never assumed silently.
+On success the wrapper writes `.ship/evidence/<SHA>-deploy.json` and
+exits zero, allowing upload. On any failure it exits non-zero and
+Git uploads nothing. `.ship/` is a run artifact: owners ignore it
+(`.ship/` in the target `.gitignore`) and never commit it.
+
+## Standardized hook wiring fixture
+
+The standardized small wiring a conforming repository commits is:
+
+```sh
+#!/bin/sh
+# .husky/pre-push — delegate the real pre-push to the fleet wrapper.
+exec "<fleet-checkout>/scripts/ship/ship-deploy"
+```
+
+`.husky/pre-commit` and `.husky/commit-msg` remain the repository
+owner's gate commands (for example `npm run format:check`). The
+generated shims and `.husky/_/h` are Husky's. `tests/ship_workflow_test.py`
+builds this wiring as a realistic fixture: `git config
+core.hooksPath .husky/_`, regular user hooks, executable shims, and
+the delegation line above using an absolute fleet path known to the
+fixture. The check script validates the delegation substring only;
+no fixture hook is ever executed outside its own Git push boundary.
+
+## Before-upload guards and exact-candidate evidence
+
+Before anything is uploaded, guards run against the exact candidate
+being shipped, and the evidence recorded names that exact candidate
+(its commit), not a nearby or earlier state. Evidence from one
+commit never stands in for evidence about another.
+
+## PR (Step 5)
+
+Create or reuse a matching open GitHub PR for the topic branch and
+ref with the permitted GitHub MCP tools. Fill the PR body from
+`fleet/skills/ship/resources/PR_TEMPLATE.md` (the only intended
+tracked resource) and narrowly track it. Independently verify the
+PR is open and that the remote ref points at the exact tested
+candidate SHA (commit evidence, deploy evidence, and `git ls-remote`
+all agree). When a PR result is ambiguous, query again before any
+retry. Then return clean to local `main`, leaving the topic branch
+intact. There is no merge here. Before opening the PR,
+distinguish Git-clean state from run artifacts (`.ship/evidence/`
+files) and delete nothing broad or owned by others.
+
+## Staging, branches, and synchronization
+
+- Work starts on main normally (ask the user only if starting off main). The starting branch is never assumed silently.
 - Staged scope only: shipping acts on the staged, intended change
-  set. There is **no implicit staging** — unstaged or untracked work
-  is never swept in.
+  set. There is no implicit staging — unstaged or untracked work is
+  never swept in.
+- Explicit remotes and refs: `ship-build` takes them explicitly.
+  There is no destructive cleanup.
 - Ahead or diverged policy applies to local main, not to all feature
   branches: a local main that is ahead of or diverged from its
   upstream blocks. A feature branch being ahead of its base is
   normal (it carries its own commits) and is not by itself a block.
-- Behind-only automatic sync applies to local main: a local main that
-  is only behind may be synced automatically, and only with
-  no rewritten commits — fast-forward style updates that preserve every
-  existing commit. Any need to rewrite history is a block, not an
-  action.
+- Behind-only automatic sync applies to local main: a local main
+  that is only behind may be synced automatically, and only with no
+  rewritten commits — fast-forward style updates that preserve every
+  existing commit and the staged work. Any need to rewrite history
+  is a block, not an action.
 - No merge: shipping opens or reuses a pull request for the branch
   and then returns clean to local main, leaving the topic branch
   intact (the topic branch is not deleted). Closeout never deletes
   unrelated or pre-existing work.
+- Fail closed: bypass, missing, or failed evidence stops the ship.
+  There are no auto retries of external mutations.
 
-### Future browser dispatch and permissions
+## Companion adoption checklist (do not adopt or run)
+
+Companion was found dirty off-main and missing the standard
+`scripts/ship-deploy`, hook wiring, and deploy adapter. It is not
+adopted or run by this workflow. To become ship-ready, the owner, in
+order: makes the tree clean on a named branch (off-main requires an
+explicit user ask); meets the strict standard so
+`scripts/ship/ship-doctor <repo>` reports `local_pass`; adds
+executable `scripts/ship-deploy` with the one-SHA contract; wires
+`.husky/pre-push` to the fleet `scripts/ship/ship-deploy` wrapper
+above; ignores `.ship/` evidence; and runs the realistic fixtures in
+`tests/ship_workflow_test.py` until a real push of an exact candidate
+succeeds. Production deployment stays separate (see below).
+
+## Web/native dispatch and permissions
 
 Dispatching work to a browser or a native client (Web/native
-dispatch), and the permissions that allow it, are future work. They
-require their own explicit authorization and permission review;
-milestone 1 grants neither, and the doctor neither uses nor checks
-any dispatch path. Local structural validation must never be
-reported as dispatch readiness.
+dispatch), and the permissions that allow it, are a separate
+capability with its own explicit authorization and permission review.
+A local pass is never reported as dispatch readiness. For `/ship`
+itself, a web user types `@ship` with no arguments to load the skill
+when the custom client does not dispatch the native command; the
+agent then follows the fixed Cal-owned workflow above.
 
-### Production deployment stays separate
+## Production deployment stays separate
 
-Production deployment is governed by the separate production deploy skill
-(`fleet/skills/deploy/SKILL.md`), with its own explicit user
-authorization, its own standardized `scripts/deploy` entry point, and
-its own reporting. This ship standard never deploys to production,
-never substitutes for that skill, and never implies its authorization.
+Production deployment stays separate. This ship standard never
+deploys to production and never substitutes for the former
+production deploy skill workflow (`fleet/skills/deploy/SKILL.md`,
+intentionally deleted) or its `scripts/deploy` entry point
+(intentionally deleted), neither of which may be reintroduced.
 
 ## Verification
 
-`scripts/check` validates the doctor's Python syntax, enforces its
-no-forbidden-mechanisms shape, runs the fixture-only test suite, and
-checks this document and the `/ship` command against the standard
-described here. The `/ship` command is prompt-only: it must contain
-no OpenCode shell interpolation marker (the exclamation-and-backtick
-marker), no other interpolation, and no repository-relative doctor
-execution. Run it with `./scripts/check`.
+`./scripts/ship/check` validates the scripts' shell syntax and
+ShellCheck diagnostics, the doctor's Python syntax and
+no-forbidden-mechanisms shape, runs the fixture-only test suite
+(`tests/ship_doctor_test.py`, `tests/ship_workflow_test.py`),
+validates the fleet JSON/JSONC configuration and ignore allowlist,
+and checks this document, the skill
+(`fleet/skills/ship/SKILL.md`), the plugin (`fleet/plugins/ship.ts`),
+and the PR template against the standard described here. The skill
+contains no OpenCode shell interpolation marker (the
+exclamation-and-backtick marker), no other interpolation, and no
+repository-relative doctor execution. Run it with
+`./scripts/ship/check`.

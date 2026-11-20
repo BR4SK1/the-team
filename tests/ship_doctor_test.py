@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fixture-only tests for scripts/ship-doctor and the /ship scaffold.
+"""Fixture-only tests for scripts/ship/ship-doctor and the /ship workflow.
 
 Stdlib only. Fixtures are built in a temporary directory and are never
 executed; the doctor is only ever pointed at them as data.
@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DOCTOR = REPO_ROOT / "scripts" / "ship-doctor"
+DOCTOR = REPO_ROOT / "scripts" / "ship" / "ship-doctor"
 
 EXPECTED_CHECK_IDS = [
     "path.safety",
@@ -565,36 +565,67 @@ class ShipDoctorTest(unittest.TestCase):
         ):
             self.assertNotIn(banned, source)
 
-    # --- scaffold: prompt-only /ship command ---
+    # --- scaffold: ship skill and server plugin ---
 
-    def test_ship_command_is_prompt_only(self) -> None:
-        text = (REPO_ROOT / "fleet" / "commands" / "ship.md").read_text(
+    def test_ship_skill_frontmatter_and_steps(self) -> None:
+        text = (
+            REPO_ROOT / "fleet" / "skills" / "ship" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("---\n"))
+        frontmatter = text[4:].split("\n---\n", 1)[0]
+        self.assertIn("name: Ship", frontmatter)
+        self.assertIn("opencode/autoinvoke: false", frontmatter)
+        for required in (
+            "Step 1 - Run the ship-doctor script",
+            "Step 2 - Validate the state of the current environment",
+            "Step 3 - Run the ship-build script",
+            "Step 4 - Run the ship-deploy script",
+            "Step 5 - Create a PR",
+            "scripts/ship/ship-build",
+            "scripts/ship/ship-deploy",
+            "test:e2e",
+            "no implicit staging",
+            "nested in the Step 3 push",
+            "@ship",
+        ):
+            self.assertIn(required, text)
+        for banned in ("!`", "$(", "${"):
+            self.assertNotIn(banned, text)
+
+    def test_ship_plugin_registers_command_without_shell(self) -> None:
+        text = (REPO_ROOT / "fleet" / "plugins" / "ship.ts").read_text(
             encoding="utf-8"
         )
-        self.assertIn("Shipping is not implemented yet", text)
-        self.assertIn("only if execution is permitted", text)
-        self.assertIn("not run", text)
-        self.assertIn("absolute", text)
-        self.assertIn("trusted", text)
-        self.assertIn("permitted executor", text)
+        for required in (
+            'name: "ship"',
+            "ctx.command.transform",
+            "ctx.session.prompt",
+            "ctx.session.synthetic",
+            "session.agent",
+            "fleet.ship",
+        ):
+            self.assertIn(required, text)
         for banned in (
-            "!`",
-            "$(",
-            "${",
-            "fallback",
-            "python3 scripts/ship-doctor",
-            "./scripts/ship-doctor",
+            "child_process",
+            "execSync",
+            "shell",
+            "subprocess",
+            "git push",
+            "git commit",
         ):
             self.assertNotIn(banned, text)
+        # Fixed prompt to Cal, rejects trailing args, wrong agent.
+        self.assertIn("ship", text.lower())
 
     def test_ship_docs_describe_standard(self) -> None:
         text = (REPO_ROOT / "docs" / "ship.md").read_text(encoding="utf-8")
         for required in (
-            "Shipping is not implemented yet",
             "strict opt-in",
             "Husky alone",
             "the repository’s E2E suite must finish successfully",
-            "scripts/ship-doctor",
+            "scripts/ship/ship-doctor",
+            "scripts/ship/ship-build",
+            "scripts/ship/ship-deploy",
             "local_pass",
             "blocked",
             "indeterminate",
@@ -611,10 +642,36 @@ class ShipDoctorTest(unittest.TestCase):
             "Web/native dispatch",
             "absolute",
             "trusted",
+            "/ship",
+            "Step 1 - Run the ship-doctor script",
+            "Step 5 - Create a PR",
+            "nested in",
+            "fleet/skills/ship/SKILL.md",
+            "fleet/plugins/ship.ts",
+            "fleet/skills/ship/resources/PR_TEMPLATE.md",
+            "scripts/ship-deploy",
+            "post-push",
+            "cannot prevent",
+            "Companion",
+            "@ship",
         ):
             self.assertIn(required, text)
         self.assertNotIn("paid", text.lower())
         self.assertNotIn("python3 scripts/ship-doctor", text)
+        self.assertNotIn("Shipping is not implemented yet", text)
+
+    def test_pr_template_filled(self) -> None:
+        text = (
+            REPO_ROOT
+            / "fleet"
+            / "skills"
+            / "ship"
+            / "resources"
+            / "PR_TEMPLATE.md"
+        ).read_text(encoding="utf-8")
+        self.assertTrue(len(text.strip()) > 100)
+        for required in ("Candidate SHA", "test:e2e", "git ls-remote"):
+            self.assertIn(required, text)
 
 
 if __name__ == "__main__":

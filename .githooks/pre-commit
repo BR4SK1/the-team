@@ -1,4 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Scoped verification entry for this checkout: the former
+# scripts/check now lives under scripts/ship/check so scripts/ship/
+# stays together. This hook remains the active commit gate; it is
+# wired once per checkout via the core.hooksPath setting below.
+#
+#   git config --local core.hooksPath .githooks
 repo_root=$(git rev-parse --show-toplevel)
-exec "$repo_root/scripts/check"
+exec "$repo_root/scripts/ship/check"

@@ -10,18 +10,19 @@ workflows, including modular CAD modeling and verification.
 global config directory itself: when the service launch environment sets
 `OPENCODE_CONFIG_DIR` to the absolute `fleet/` path, OpenCode loads
 `fleet/opencode.jsonc` as its global config and discovers
-`fleet/AGENTS.md`, `fleet/agents/`, `fleet/skills/`, and `fleet/commands/`
-directly from there, with no installer, generator, or second config.
+`fleet/AGENTS.md`, `fleet/agents/`, `fleet/skills/`, and
+`fleet/plugins/` directly from there, with no installer, generator, or
+second config.
 
 ```text
 fleet/              # OpenCode global config root (OPENCODE_CONFIG_DIR)
 ├── agents/         # Markdown agent definitions
 ├── skills/         # Skill folders, each with a SKILL.md
-├── commands/       # Markdown slash commands
+├── plugins/        # Server plugins (registers /ship)
 ├── AGENTS.md       # Shared fleet-wide instructions (global file)
 └── opencode.jsonc  # Complete tracked global OpenCode config (only config)
 examples/           # Device-settings example only (fake values)
-scripts/            # Check runner, ship doctor, hook installer
+scripts/ship/       # Check runner, ship doctor, ship-build, ship-deploy
 ```
 
 Private runtime siblings (see below) also live on disk under `fleet/`
@@ -145,12 +146,13 @@ file. Never commit a competing `.json`.
 `service.json`, `cli.json`, auth files, logs, and similar runtime
 files live on disk under `fleet/` when it is the config root, but
 `.gitignore` denies everything under `fleet/` by default and allows
-only `opencode.jsonc`, `AGENTS.md`, `agents/*.md`, `commands/*.md`,
-and `skills/*/SKILL.md`. Do not stage, print, or read the contents
+only `opencode.jsonc`, `AGENTS.md`, `agents/*.md`,
+`skills/*/SKILL.md`, `skills/ship/resources/PR_TEMPLATE.md`, and
+`plugins/ship.ts`. Do not stage, print, or read the contents
 of `service.json`/auth files; inspect only their names via Git
 status. Because `fleet/` is both the checkout and the live config
 root, review the native Git diff and status before every commit and
-run `./scripts/check`; only intended fleet files should appear.
+run `./scripts/ship/check`; only intended fleet files should appear.
 
 `fleet/opencode.jsonc` is the global OpenCode config (models,
 permissions, MCP servers, references, and the rest). It is distinct
@@ -201,19 +203,24 @@ backend adoption (above) is still separate.
 
 ## Local checks
 
-Install the repository-local hooks once per checkout:
+Wire the repository-local hooks once per checkout (scoped
+verification entry; the commit hook remains the active gate):
 
 ```sh
-./scripts/install-hooks
+git config --local core.hooksPath .githooks
 ```
 
-The check command requires Bash, Python 3, and ShellCheck. The pre-commit hook
-runs `scripts/check`, which validates Python syntax, shell syntax and
+The check command requires Bash, Python 3, and ShellCheck. The active
+`.githooks/pre-commit` hook delegates to `scripts/ship/check`, which
+validates Python syntax, shell syntax and
 ShellCheck diagnostics, the repository's JSON/JSONC configuration, the
 complete fleet config shape (including native `{env:...}` placeholders
-and the fleet ignore allowlist), and the ship-doctor tests. Run it
-directly with `./scripts/check` when needed. The test suite covers the
-ship doctor (`tests/ship_doctor_test.py`); it has no pre-push test hook.
+and the fleet ignore allowlist), and the ship test suite. Run it
+directly with `./scripts/ship/check` when needed. The test suite
+covers the ship doctor (`tests/ship_doctor_test.py`) and the
+ship-build / ship-deploy Git fixtures
+(`tests/ship_workflow_test.py`); the fleet itself has no pre-push test
+hook.
 
 Shared instructions also define repository/workspace closeout expectations:
 do task work in the authorized workspace (never a Git worktree or separate
@@ -228,18 +235,24 @@ Deployments are manual only; no Git hook deploys or installs the fleet.
 There is no deploy script for the fleet: updating the fleet means
 pulling the checkout and, separately, ensuring the service launch
 environment above is set and the service is started/restarted with it
-(backend adoption, above). The local hook installer configures Git to use
-`.githooks`; the retained pre-commit hook runs checks only.
+(backend adoption, above). The scoped hook entry above configures Git
+to use `.githooks`; the retained pre-commit hook runs checks only via
+`scripts/ship/check`.
 
-## Ship diagnostics (milestone 1)
+## Ship workflow
 
-Shipping is not implemented yet. The one strict opt-in ship standard,
-the read-only `scripts/ship-doctor` diagnostic (versioned JSON; exit
-`0` local pass, `1` blocked, `2` indeterminate), and the prompt-only
-`/ship` command are documented in [docs/ship.md](docs/ship.md). Run
-the doctor only against an explicit repository path; it inspects
-bounded allowlisted local metadata and never writes, executes target
-code, or uses the network.
+The one strict opt-in ship standard, the read-only
+`scripts/ship/ship-doctor` diagnostic (versioned JSON; exit `0` local
+pass, `1` blocked, `2` indeterminate), the fleet skill
+`fleet/skills/ship/SKILL.md`, the `/ship` server plugin
+(`fleet/plugins/ship.ts`), and the workflow scripts
+(`scripts/ship/ship-build`, `scripts/ship/ship-deploy`) are documented
+in [docs/ship.md](docs/ship.md). Run the doctor only against an
+explicit repository path; it inspects bounded allowlisted local
+metadata and never writes, executes target code, or uses the network.
+The plugin registers `/ship` with a fixed prompt to Cal that loads
+the ship skill by ID; a web user without native command dispatch
+loads it explicitly as `@ship` with no arguments.
 
 ## Starter agents
 
@@ -406,7 +419,7 @@ This is a constraint on the allowlist, not a complete security sandbox: the
 permission rule matches the exact command text and does not verify git's
 behavior, and git still honors other configuration. The exact invocations are
 harmless, but no claim is made that they cannot fail in a hostile repository.
-`scripts/check` enforces this shape for agent definitions that cannot edit
+`scripts/ship/check` enforces this shape for agent definitions that cannot edit
 (Reviewer, Frontend, and Planner's config entry), checks Cal's configuration
 allowlist against the commands documented in `fleet/agents/cal.md`, and checks
 read-all agents' env-file restore rules.
@@ -557,7 +570,9 @@ device owner directs, and never commit them.
 - Add skills as `fleet/skills/<skill-id>/SKILL.md`; supporting files
   alongside a skill need an explicit `.gitignore` exception (the
   fleet ignore is deny-by-default).
-- Add slash commands as `.md` files under `fleet/commands/`.
+- Add slash commands via a server plugin under `fleet/plugins/`
+  (see `fleet/plugins/ship.ts`); the Markdown `fleet/commands/`
+  directory is intentionally removed.
 - Put reusable team conventions in `fleet/AGENTS.md`.
 - Add configuration structure and policy to `fleet/opencode.jsonc`;
   host-only values stay in the private service environment as

@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Fleet ship-build: validates opt-in and effective Husky wiring, then
+# performs a plain git commit of the staged set and a push to an
+# explicit remote/ref. The real pre-push hook (fleet ship-deploy)
+# performs the nested non-prod rollout and full test:e2e before upload.
+# Usage:
+#   ship-build <repo> --remote <name> --ref refs/heads/<topic>
+#              [--branch <topic>] --message <message>
+# No implicit staging, no bypass flags, no automatic retries.
+
+err() { printf 'ship-build: %s\n' "$*" >&2; }
+fail() { err "$*"; exit 1; }
+
+ME="${BASH_SOURCE[0]}"
+# Fleet checkout root: two levels above scripts/ship/.
+FLEET_ROOT="$(cd -- "$(dirname -- "$ME")/../.." && pwd)"
+DOCTOR="$FLEET_ROOT/scripts/ship/ship-doctor"
+SHIP_DEPLOY_WRAPPER="$FLEET_ROOT/scripts/ship/ship-deploy"
+
+[[ $# -ge 1 ]] || fail "usage: ship-build <repo> --remote <name> --ref <ref> [--branch <topic>] --message <msg>"
+REPO="$1"; shift
+REMOTE=""; REF=""; BRANCH=""; MESSAGE=""; BRANCH_GIVEN=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --remote) [[ $# -ge 2 ]] || fail "--remote requires a value"; REMOTE="$2"; shift 2 ;;
+    --ref) [[ $# -ge 2 ]] || fail "--ref requires a value"; REF="$2"; shift 2 ;;
+    --branch) [[ $# -ge 2 ]] || fail "--branch requires a value"; BRANCH="$2"; BRANCH_GIVEN=1; shift 2 ;;
+    --message) [[ $# -ge 2 ]] || fail "--message requires a value"; MESSAGE="$2"; shift 2 ;;
+    *) fail "unknown argument: $1" ;;
+  esac
+done
+[[ -n "$REMOTE" ]] || fail "--remote is required (explicit remote name)"
+[[ -n "$REF" ]] || fail "--ref is required (explicit refs/heads/<topic>)"
+[[ -n "$MESSAGE" ]] || fail "--message is required (non-empty commit message)"
+[[ "$REF" == refs/heads/* ]] || fail "--ref must be a branch ref (refs/heads/<topic>)"
+REF_BRANCH="${REF#refs/heads/}"
+[[ -n "$REF_BRANCH" && "$REF_BRANCH" != "$REF" ]] || fail "--ref must name a branch"
+[[ -d "$REPO" ]] || fail "repository path does not exist or is not a directory"
+REPO_ABS="$(cd -- "$REPO" && pwd)"
+[[ -x "$DOCTOR" ]] || fail "fleet doctor missing or not executable: $DOCTOR"
+[[ -x "$SHIP_DEPLOY_WRAPPER" ]] || fail "fleet ship-deploy wrapper missing or not executable: $SHIP_DEPLOY_WRAPPER"
+if [[ -n "${HUSKY:-}" && "$HUSKY" == "0" ]]; then
+  fail "bypass disabled: HUSKY=0 would disable the Husky gates"
+fi
+
+# --- Step 1 gate: doctor must report local_pass before any mutation.
+DOCTOR_OUT="$("$DOCTOR" "$REPO_ABS")" || fail "doctor did not report local_pass (blocked or indeterminate)"
+printf '%s\n' "$DOCTOR_OUT" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("result")=="local_pass" else 1)' \
+  || fail "doctor did not report local_pass"
+
+# --- Effective Husky wiring (shape + delegation), before mutation.
+git -C "$REPO_ABS" rev-parse --git-dir >/dev/null 2>&1 || fail "not a Git repository"
+hooks_path="$(git -C "$REPO_ABS" config --get core.hooksPath 2>/dev/null || true)"
+[[ "$hooks_path" == ".husky/_" ]] || fail "wrong wiring: core.hooksPath must be .husky/_ (effective Husky runtime missing)"
+for f in .husky/pre-commit .husky/commit-msg .husky/pre-push; do
+  [[ -f "$REPO_ABS/$f" && ! -L "$REPO_ABS/$f" ]] || fail "wrong wiring: $f must be a regular file"
+done
+for f in .husky/_/pre-commit .husky/_/commit-msg .husky/_/pre-push; do
+  [[ -f "$REPO_ABS/$f" && -x "$REPO_ABS/$f" ]] || fail "wrong wiring: $f must be a regular executable shim"
+done
+[[ -f "$REPO_ABS/.husky/_/h" ]] || fail "wrong wiring: .husky/_/h missing"
+# The standard wiring delegates the real pre-push to the fleet
+# ship-deploy wrapper. Only the reference is checked; the hook body is
+# never executed here.
+grep -Fq "scripts/ship/ship-deploy" "$REPO_ABS/.husky/pre-push" \
+  || fail "wrong wiring: .husky/pre-push must delegate to scripts/ship/ship-deploy"
+# Bypass indicators (substring scan only, matching doctor
+# disable-indicator policy). Refuse rather than accommodate them.
+if grep -Fq -- "--no-verify" "$REPO_ABS/.husky/pre-push" "$REPO_ABS/.husky/pre-commit" "$REPO_ABS/.husky/commit-msg" \
+  || grep -Fq "HUSKY=0" "$REPO_ABS/.husky/pre-push" "$REPO_ABS/.husky/pre-commit" "$REPO_ABS/.husky/commit-msg"; then
+  fail "wrong wiring: hook disables the gates (bypass indicators present)"
+fi
+[[ -f "$REPO_ABS/scripts/ship-deploy" && -x "$REPO_ABS/scripts/ship-deploy" ]] || fail "opt-in missing: executable scripts/ship-deploy is required"
+[[ ! -L "$REPO_ABS/scripts/ship-deploy" ]] || fail "opt-in invalid: scripts/ship-deploy must not be a symlink"
+
+# --- Branch and remote validation.
+git -C "$REPO_ABS" remote get-url "$REMOTE" >/dev/null 2>&1 || fail "remote not configured: $REMOTE"
+current_branch="$(git -C "$REPO_ABS" branch --show-current)" || true
+if [[ -z "$current_branch" ]]; then
+  fail "detached HEAD is not shippable; check out an explicit branch"
+fi
+main_branch=""
+for cand in main master; do
+  if git -C "$REPO_ABS" show-ref --verify -q "refs/heads/$cand"; then main_branch="$cand"; break; fi
+done
+# Staged / unstaged facts for the review (no implicit staging).
+staged_files="$(git -C "$REPO_ABS" diff --cached --name-only)"
+unstaged_files="$(git -C "$REPO_ABS" diff --name-only)"
+if [[ -z "$staged_files" ]]; then
+  fail "no staged scope; stage the intended set explicitly (no implicit staging)"
+fi
+if [[ -n "$unstaged_files" ]]; then
+  fail "unstaged tracked changes present; the candidate must be clean (no sweep-in)"
+fi
+printf 'staged files:\n%s\n' "$staged_files"
+untracked="$(git -C "$REPO_ABS" ls-files --others --exclude-standard || true)"
+if [[ -n "$untracked" ]]; then err "untracked files not in candidate (reported, not committed):"; printf '%s\n' "$untracked" >&2; fi
+
+if [[ "$current_branch" == "$main_branch" && -n "$main_branch" ]]; then
+  # On main: require explicit new topic branch.
+  [[ "$BRANCH_GIVEN" == 1 && -n "$BRANCH" ]] || fail "starting on main requires --branch <topic> (safe topic branch)"
+  [[ "$BRANCH" == "$REF_BRANCH" ]] || fail "--branch must equal --ref branch ($BRANCH vs $REF_BRANCH)"
+  [[ "$BRANCH" != "$main_branch" ]] || fail "topic branch must not be main"
+  [[ "$BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9/_-]*$ ]] || fail "unsafe branch name: $BRANCH"
+  [[ "$BRANCH" != *".."* ]] || fail "unsafe branch name: $BRANCH"
+  if git -C "$REPO_ABS" show-ref --verify -q "refs/heads/$BRANCH"; then
+    fail "topic branch already exists: $BRANCH"
+  fi
+  # Main sync: ahead/diverged blocks; behind-only FF only when safe
+  # and staged work is preserved.
+  if git -C "$REPO_ABS" show-ref --verify -q "refs/remotes/$REMOTE/$main_branch"; then
+    ahead_behind="$(git -C "$REPO_ABS" rev-list --left-right --count "refs/remotes/$REMOTE/$main_branch...HEAD" || true)"
+    ahead="$(printf '%s' "$ahead_behind" | cut -f1)"
+    behind="$(printf '%s' "$ahead_behind" | cut -f2)"
+    if [[ "$ahead" != "0" && "$behind" != "0" ]]; then
+      fail "local main is diverged from $REMOTE/$main_branch; deny"
+    fi
+    if [[ "$ahead" != "0" ]]; then
+      fail "local main is ahead of $REMOTE/$main_branch; deny"
+    fi
+    if [[ "$behind" != "0" ]]; then
+      # Only-behind automatic sync: fast-forward, preserving staged work.
+      before_staged="$(git -C "$REPO_ABS" diff --cached --name-only)"
+      git -C "$REPO_ABS" fetch "$REMOTE" "$main_branch" >/dev/null 2>&1 || fail "fetch failed while syncing behind-only main"
+      git -C "$REPO_ABS" merge --ff-only "refs/remotes/$REMOTE/$main_branch" >/dev/null 2>&1 \
+        || fail "behind-only main could not fast-forward safely; deny"
+      after_staged="$(git -C "$REPO_ABS" diff --cached --name-only)"
+      [[ "$before_staged" == "$after_staged" ]] || fail "fast-forward did not preserve the staged work; deny"
+      printf 'local main was only behind; fast-forwarded, staged work preserved\n'
+      # Re-verify clean candidate after the fast-forward.
+      staged_files="$(git -C "$REPO_ABS" diff --cached --name-only)"
+      unstaged_files="$(git -C "$REPO_ABS" diff --name-only)"
+      [[ -n "$staged_files" ]] || fail "staged scope lost after fast-forward; deny"
+      [[ -z "$unstaged_files" ]] || fail "unstaged tracked changes after fast-forward; deny"
+    fi
+  fi
+  git -C "$REPO_ABS" switch -c "$BRANCH" >/dev/null 2>&1 || fail "could not create topic branch $BRANCH"
+  printf 'created topic branch: %s\n' "$BRANCH"
+else
+  # Off-main: use current branch; --branch if given must match current.
+  if [[ "$BRANCH_GIVEN" == 1 && "$BRANCH" != "$current_branch" ]]; then
+    fail "off-main: --branch must equal the current branch ($current_branch)"
+  fi
+  [[ "$REF_BRANCH" == "$current_branch" ]] || fail "off-main: --ref branch must equal the current branch ($current_branch)"
+fi
+printf 'branch: %s  remote: %s  ref: %s\n' "$(git -C "$REPO_ABS" branch --show-current)" "$REMOTE" "$REF"
+
+# Review outgoing commits (base..HEAD excluding the new commit).
+base_ref="HEAD"
+if [[ -n "$main_branch" ]]; then base_ref="$main_branch"; fi
+printf 'outgoing commits (before new commit):\n'
+git -C "$REPO_ABS" log --oneline "${base_ref}..HEAD" | sed 's/^/  /' || true
+
+# --- Commit the reviewed staged set with a plain git commit.
+# Never add flags that bypass Husky.
+git -C "$REPO_ABS" commit -m "$MESSAGE" >/dev/null 2>&1 \
+  || fail "commit failed (Husky commit gates did not pass); push blocked, no upload"
+candidate="$(git -C "$REPO_ABS" rev-parse HEAD)"
+printf 'candidate SHA: %s\n' "$candidate"
+printf 'outgoing commits (including candidate):\n'
+git -C "$REPO_ABS" log --oneline "${base_ref}..HEAD" | sed 's/^/  /' || true
+
+# Record commit evidence for the exact candidate SHA. This is a run
+# artifact under .ship/ (ignored); it does not prove hooks ran, it
+# records that a plain commit succeeded for this SHA after wiring was
+# validated. The pre-push wrapper requires it.
+mkdir -p "$REPO_ABS/.ship/evidence"
+tmp_evidence="$(mktemp "$REPO_ABS/.ship/evidence/.tmp.XXXXXX")"
+printf '{\n  "sha": "%s",\n  "remote": "%s",\n  "ref": "%s",\n  "branch": "%s",\n  "type": "commit"\n}\n' \
+  "$candidate" "$REMOTE" "$REF" "$(git -C "$REPO_ABS" branch --show-current)" > "$tmp_evidence"
+mv "$tmp_evidence" "$REPO_ABS/.ship/evidence/${candidate}-commit.json"
+
+# --- Push to the explicit remote/ref. The real pre-push hook runs the
+# nested deploy + E2E and blocks upload on failure.
+git -C "$REPO_ABS" push "$REMOTE" "HEAD:$REF" >/dev/null 2>&1 \
+  || fail "push failed (pre-push deploy/E2E gate did not pass); upload blocked, no remote change expected"
+remote_sha="$(git -C "$REPO_ABS" ls-remote "$REMOTE" "$REF" | cut -f1)"
+[[ "$remote_sha" == "$candidate" ]] \
+  || fail "post-push verification failed: remote SHA $remote_sha does not equal candidate $candidate (upload already happened; not prevented)"
+[[ -f "$REPO_ABS/.ship/evidence/${candidate}-commit.json" ]] \
+  || fail "post-push verification failed: commit evidence missing for $candidate (upload already happened; not prevented)"
+[[ -f "$REPO_ABS/.ship/evidence/${candidate}-deploy.json" ]] \
+  || fail "post-push verification failed: deploy evidence missing for $candidate (upload already happened; not prevented)"
+printf 'pushed: %s -> %s:%s\n' "$candidate" "$REMOTE" "$REF"
+printf 'verified: remote SHA matches candidate; commit and deploy evidence present\n'

@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Fleet ship-deploy wrapper: invoked by the real .husky/pre-push hook
+# with the Git pre-push record on standard input. Extracts the single
+# exact outgoing SHA, runs <repo>/scripts/ship-deploy <SHA>, then runs
+# the full owner test:e2e suite. Both must succeed before upload.
+# Usage (via pre-push only):
+#   ship-deploy   # reads refs from stdin
+# No arguments; no staging-endpoint inference; no retries.
+
+err() { printf 'ship-deploy: %s\n' "$*" >&2; }
+fail() { err "$*"; exit 1; }
+
+[[ $# -eq 0 ]] || fail "takes no arguments (refs arrive on stdin via pre-push)"
+REPO_ROOT="$(git -C . rev-parse --show-toplevel 2>/dev/null)" \
+  || fail "must run inside a Git repository (pre-push hook)"
+cd -- "$REPO_ROOT" || fail "cannot enter repository root"
+
+# --- Parse the pre-push record.
+# Each line: <local ref> SP <local SHA> SP <remote ref> SP <remote SHA> LF.
+# Require exactly one outgoing branch push of a single SHA.
+LINES=()
+while IFS= read -r line || [[ -n "$line" ]]; do
+  # Skip empty lines.
+  [[ -z "$line" ]] && continue
+  LINES+=("$line")
+done
+[[ ${#LINES[@]} -eq 1 ]] || fail "pre-push must carry exactly one ref line (got ${#LINES[@]})"
+read -r LOCAL_REF LOCAL_SHA REMOTE_REF REMOTE_SHA <<< "${LINES[0]}"
+# ship-build pushes HEAD:<branch>, which Git records with local ref
+# HEAD. The outgoing candidate is governed by the remote branch ref;
+# the local ref must be that ref or HEAD, never another branch/tag.
+[[ "$REMOTE_REF" == refs/heads/* ]] || fail "pre-push remote ref must be a branch ref"
+if [[ "$LOCAL_REF" != "$REMOTE_REF" && "$LOCAL_REF" != "HEAD" ]]; then
+  fail "pre-push refs must match or be HEAD (local $LOCAL_REF vs remote $REMOTE_REF)"
+fi
+[[ "$LOCAL_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "outgoing SHA is not a full SHA"
+[[ "$REMOTE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "remote SHA is not a full SHA"
+[[ "$LOCAL_SHA" != "0000000000000000000000000000000000000000" ]] || fail "deletion push is not shippable"
+# The outgoing SHA must be present in the local repository and must
+# equal the commit evidence recorded by ship-build for that SHA.
+git cat-file -e "$LOCAL_SHA" >/dev/null 2>&1 || fail "outgoing SHA not present locally: $LOCAL_SHA"
+[[ -f ".ship/evidence/${LOCAL_SHA}-commit.json" ]] \
+  || fail "commit evidence missing for $LOCAL_SHA; refusing to deploy an unverified candidate"
+candidate="$LOCAL_SHA"
+
+[[ -f "scripts/ship-deploy" && -x "scripts/ship-deploy" ]] \
+  || fail "opt-in missing: executable scripts/ship-deploy is required"
+[[ ! -L "scripts/ship-deploy" ]] || fail "opt-in invalid: scripts/ship-deploy must not be a symlink"
+
+DEPLOY_OUT="$(mktemp)"
+trap 'rm -f "$DEPLOY_OUT"' EXIT
+# --- Non-prod rollout for the exact candidate SHA (one argument).
+# Capture output: a placeholder, dry-run, or skipped indication means
+# not deployed even when the exit status is zero.
+if ! ./scripts/ship-deploy "$candidate" >"$DEPLOY_OUT" 2>&1; then
+  err "non-prod rollout failed for $candidate:"
+  cat "$DEPLOY_OUT" >&2
+  exit 1
+fi
+if grep -Eiq 'deployment is not configured|dry[- ]run|placeholder|not deployed|skipped' "$DEPLOY_OUT"; then
+  err "scripts/ship-deploy reported it did not deploy (placeholder, dry run, or skipped):"
+  cat "$DEPLOY_OUT" >&2
+  exit 1
+fi
+cat "$DEPLOY_OUT"
+
+# --- Full owner test:e2e suite against that deployment.
+# The manager comes from the pinned packageManager field; the script
+# name is fixed and always runs in full (no filtering, no skipping).
+MANAGER="$(python3 -c 'import json; d=json.load(open("package.json")); pm=str(d.get("packageManager","")); print(pm.split("@",1)[0])' 2>/dev/null || true)"
+[[ -n "$MANAGER" ]] \
+  || fail "packageManager pin missing; cannot derive the test runner"
+case "$MANAGER" in
+  npm|pnpm|yarn|bun) ;;
+  *) fail "unsupported package manager: $MANAGER" ;;
+esac
+# test:e2e must be a non-empty string (owner command); run it in full.
+if ! "$MANAGER" run test:e2e; then
+  exit 1
+fi
+
+# --- Record deploy evidence for the exact SHA, then allow upload.
+mkdir -p .ship/evidence
+tmp_evidence="$(mktemp .ship/evidence/.tmp.XXXXXX)"
+printf '{\n  "sha": "%s",\n  "deploy": "scripts/ship-deploy",\n  "e2e": "test:e2e",\n  "manager": "%s",\n  "type": "deploy"\n}\n' \
+  "$candidate" "$MANAGER" > "$tmp_evidence"
+mv "$tmp_evidence" ".ship/evidence/${candidate}-deploy.json"
+printf 'ship-deploy: non-prod rollout and full test:e2e succeeded for %s\n' "$candidate"
+exit 0
