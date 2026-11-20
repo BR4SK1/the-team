@@ -262,6 +262,12 @@ for required in (
     "unverifiable required reservation",
     "ordinary",
     "needs no confirmation",
+    "single reviewed auto-staging",
+    "exact reviewed paths",
+    "reruns the same destination",
+    "never broadened",
+    "without needing a terminal",
+    "explicit include",
 ):
     if required not in ship_skill_text:
         raise ValueError(f"{ship_skill}: missing required phrase {required!r}")
@@ -296,6 +302,8 @@ for required in (
     "ship-destination",
     "no routine approval stops",
     "busy or unverifiable required lease",
+    "staged_empty on an eligible topic branch",
+    "never broadened",
 ):
     if required not in ship_plugin_text:
         raise ValueError(f"{ship_plugin}: missing required phrase {required!r}")
@@ -313,7 +321,8 @@ for banned in (
         raise ValueError(f"{ship_plugin}: plugin must contain no shell/operations {banned!r}")
 
 # Fleet ship scripts must stay small, explicit, and fail-closed:
-# ship-build commits staged only and pushes to an explicit remote/ref;
+# ship-build commits staged only (the single reviewed Worker staging
+# in Step 2 precedes it) and pushes to an explicit remote/ref;
 # ship-deploy reads the pre-push record and blocks upload on failure.
 # ship-build greps for the bypass strings to refuse them; that scan
 # must not become a bypass invocation. The commit invocation itself is
@@ -389,6 +398,8 @@ for required in (
     "cannot prevent",
     "Companion",
     "@ship",
+    "single reviewed Worker staging",
+    "never broadened",
 ):
     if required not in ship_doc_text:
         raise ValueError(f"{ship_doc}: missing required phrase {required!r}")

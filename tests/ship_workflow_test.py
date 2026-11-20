@@ -606,6 +606,11 @@ class ShipWorkflowTest(unittest.TestCase):
         # as the skill, including autonomous destination selection.
         self.assertIn("no routine approval stops", outcome["accepted"][0][1])
         self.assertIn("ship-destination", outcome["accepted"][0][1])
+        # The prompt carries the single reviewed auto-staging: empty
+        # index on a topic branch stages reviewed paths, then reruns.
+        self.assertIn("staged_empty on an eligible topic branch",
+                      outcome["accepted"][0][1])
+        self.assertIn("never broadened", outcome["accepted"][0][1])
         # An unset session agent is not Cal (Session.Info.agent is
         # optional and may be absent on a fresh session).
         self.assertEqual(outcome["unset"][0][0], "synthetic")

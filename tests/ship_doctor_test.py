@@ -591,6 +591,11 @@ class ShipDoctorTest(unittest.TestCase):
             "no routine approval stops",
             "staged_empty",
             "busy lease",
+            "single reviewed auto-staging",
+            "exact reviewed paths",
+            "reruns the same destination",
+            "never broadened",
+            "without needing a terminal",
         ):
             self.assertIn(required, text)
         for banned in ("!`", "$(", "${", "Cal asks the user first",
@@ -611,6 +616,8 @@ class ShipDoctorTest(unittest.TestCase):
             "fleet.ship",
             "ship-destination",
             "no routine approval stops",
+            "staged_empty on an eligible topic branch",
+            "never broadened",
         ):
             self.assertIn(required, text)
         for banned in (
@@ -665,6 +672,8 @@ class ShipDoctorTest(unittest.TestCase):
             "cannot prevent",
             "Companion",
             "@ship",
+            "single reviewed Worker staging",
+            "never broadened",
         ):
             self.assertIn(required, text)
         self.assertNotIn("paid", text.lower())

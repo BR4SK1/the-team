@@ -53,8 +53,9 @@ discovered from the fleet root. The web client does not perform
 native command dispatch for this fleet; a web user loads the skill
 explicitly as `@ship` with no arguments, under the same rules and the
 same authorization contract: the invocation authorizes the routine
-staged-only workflow through deploy, E2E, push, and PR creation, with
-no routine approval stops.
+workflow (staged-only, plus the single reviewed auto-staging in Step
+2 that fills an empty index on a topic branch) through deploy, E2E,
+push, and PR creation, with no routine approval stops.
 
 ## Five steps
 
@@ -254,8 +255,25 @@ no routine approval stops: an ordinary eligible off-main topic branch
 needs no confirmation, and no routine git-derived value is demanded
 from the user. Staged scope and
 outgoing commits are surfaced from the helper decision and do not
-require reconfirmation in routine cases; an empty index is a scope
-blocker, never a reason to sweep the working tree.
+require reconfirmation in routine cases.
+
+An empty index (`staged_empty`) on an eligible topic branch with
+unstaged or untracked work is the one exception to blocking: Worker
+read-only inspects the full tracked diffs and the non-ignored
+untracked contents, and when the whole set reads as one coherent,
+safe change, stages the exact reviewed paths (never a blanket add,
+never an ignored file or a symlink) through the normal permission
+flow, then reruns the destination helper once and continues to
+Step 3 on `selected`, with no terminal step and no routine
+confirmation. Mixed or ambiguous work and likely secret or unsafe
+files stage nothing and block. On `main` an empty index stays a
+scope blocker unless an explicit include authorization already names
+the exact paths to include. A pre-existing non-empty index is
+preserved exactly and never broadened: unstaged or untracked work
+alongside it stays `scope_unclean`, never hidden, stashed, deleted,
+or swept into the candidate. A clean empty index with no work to
+ship still blocks: there is nothing to ship. The rerun is single
+and terminal: a second block stops without re-staging.
 
 ## Ship-build (Steps 2–3)
 
@@ -289,10 +307,13 @@ script boundary; there are no defaults. The script, in order:
 3. Reserves an owned per-run evidence directory under `.git`
    (`ship-runs/<run-id>/`), refusing symlinks and pre-existing paths,
    then reviews the staged set and prints it with the outgoing commits
-   (base to `HEAD`). There is no implicit staging: the staged set
-   must be non-empty, the script never runs `git add`, and unstaged
-   tracked changes or untracked payload make the candidate unclean
-   (rejected before publish, never reported-only).
+   (base to `HEAD`). The scripts perform no implicit staging: the
+   staged set must be non-empty, the script never runs `git add`, and
+   unstaged tracked changes or untracked payload make the candidate
+   unclean (rejected before publish, never reported-only). The single
+   reviewed Worker staging in Step 2 happens before `ship-build` is
+   invoked, so `ship-build` validates the resulting staged set as it
+   would any pre-existing staged set.
 4. Compares current remote `main` on and off `main`: it fetches the
    explicit remote first (never trusting a possibly stale tracking
    ref), then counts with `refs/heads/main...remote/main` (left is
@@ -448,9 +469,15 @@ operations. Never push by an alternate path.
 - Work may start on `main` or off `main`. The starting branch and
   destination come from the Step 2 helper decision; an ordinary
   eligible off-main topic branch needs no confirmation.
-- Staged scope only: shipping acts on the staged, intended change
-  set. There is no implicit staging — unstaged or untracked work is
-  never swept in, and an empty index is a scope blocker.
+- Staged scope, never blanket staging: shipping acts on the staged,
+  intended change set. The scripts perform no implicit staging —
+  unstaged or untracked work is never swept in by the scripts. The
+  single reviewed Worker staging in Step 2 covers the empty-index
+  case on a topic branch only (coherent, safe, exact reviewed paths,
+  then one rerun); a clean empty index and an empty index on `main`
+  (without an explicit include authorization) remain scope blockers,
+  and a pre-existing non-empty index is preserved exactly and never
+  broadened.
 - Selected remotes and refs: `ship-build` takes the Step 2 helper
   values explicitly. There is no destructive cleanup.
 - Ahead or diverged policy applies to local main, not to all feature
@@ -474,8 +501,10 @@ operations. Never push by an alternate path.
 
 A repository becomes ship-ready when it meets the opt-in contract
 above. Readiness is current and verified per attempt by Cal. To
-become ship-ready, the owner, in order: makes the tree clean on a named
-branch (on `main` or off `main`, resolved by the Step 2 helper); meets the strict
+become ship-ready, the owner, in order: is on a named topic branch
+with the change to ship (on `main` only staged work ships; off
+`main` unstaged work is reviewed and auto-staged once in Step 2,
+resolved by the Step 2 helper); meets the strict
 standard so `scripts/ship/ship-doctor <repo>` reports `local_pass`;
 installs the pinned Husky v9 runtime and verifies the helper, shims,
 and the single-line pre-push delegation; adds executable
@@ -495,8 +524,8 @@ A local pass is never reported as dispatch readiness. For `/ship`
 itself, a web user types `@ship` with no arguments to load the skill
 when the custom client does not dispatch the native command; the
 agent then follows the fixed Cal-owned workflow above under the same
-authorization contract as `/ship` (routine staged-only ship with no
-routine approval stops).
+authorization contract as `/ship` (routine staged scope, including the
+single reviewed auto-staging, with no routine approval stops).
 
 ## Production deployment stays separate
 

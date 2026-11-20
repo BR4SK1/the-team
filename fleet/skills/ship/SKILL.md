@@ -28,21 +28,31 @@ below then apply on that path too. No web client code is changed by this
 skill.
 
 A normal `/ship` invocation (or explicit `@ship` with no arguments)
-itself authorizes the routine staged-only workflow through non-production
-deploy, the full E2E suite, push, and opening a pull request. There are
-no routine approval stops: neither Cal nor Worker pauses to ask the user
-for a routine git-derived value (remote, branch, ref, commit message)
-or to reconfirm a routine staged scope. Work stops and returns to the
-user only on a real blocker: a blocked or indeterminate destination,
-an empty or unclean staged scope, a scope surprise, a repository policy
+itself authorizes the routine workflow through non-production
+deploy, the full E2E suite, push, and opening a pull request: the
+staged-only workflow, plus the single reviewed auto-staging in Step 2
+that fills an empty index on an eligible topic branch so the user
+never stages by hand or in a terminal. There are
+no routine approval stops: neither Cal nor Worker pauses to ask the
+user for a routine git-derived value (remote, branch, ref, commit
+message) or to reconfirm a routine staged scope, including the scope
+created by that single reviewed auto-staging. Staging itself runs
+through Worker's normal permission flow for the exact reviewed paths;
+that permission flow is not a separate conversational reconfirmation.
+Work stops and returns to the user only on a real blocker: a blocked
+or indeterminate destination (other than the handled `staged_empty`
+case below), an unclean staged scope, mixed or ambiguous work, a
+likely secret or unsafe file, a scope surprise, a repository policy
 or authority limit, a busy or unverifiable required lease, a failed
 gate, or a tool denial. Those stops are blockers, never prompts to
 guess a value or to proceed anyway.
 
 Cal owns authority and user decisions. Cal delegates operational steps
-to Worker and never runs the scripts directly. Worker runs only the fleet
-scripts named below and returns their actual output, exit status, and the
-evidence SHAs. Worker autonomously inspects the configured GitHub remote
+to Worker and never runs the scripts directly. Worker runs the fleet
+scripts named below, plus only the exact reviewed-path staging
+invocation in Step 2 when the empty-index case applies, and returns
+their actual output, exit status, and the evidence SHAs. Worker
+autonomously inspects the configured GitHub remote
 identity and current branch (Step 2) and derives the destination; Cal
 does not demand those values from the user and does not pause for them
 in routine cases. Cal must not route around a denial, bypass a failed
@@ -118,12 +128,14 @@ and the helper derives the destination. The helper inspects the
 configured GitHub remote identity and current branch with read-only Git
 invocations only (`git --no-optional-locks`), never writes, never
 fetches, and prints versioned JSON (`selected` or `blocked`, exit `0`
-or `1`; exit `2` is indeterminate). On `blocked` or `indeterminate`,
-stop before any mutation and report the specific reason code. On
-`selected`, Worker returns the full decision to Cal: remote, topic,
-ref, GitHub owner and repository, staged files, outgoing commits,
-suggested commit message, and selection path. The destination is used
-only when it is verified and unambiguous, by this order:
+or `1`; exit `2` is indeterminate). On `blocked` or `indeterminate`
+the workflow stops before any mutation and reports the specific
+reason code, except for the single handled `staged_empty` case
+below. On `selected`, Worker returns the full decision to Cal:
+remote, topic, ref, GitHub owner and repository, staged files,
+outgoing commits, suggested commit message, and selection path.
+The destination is used only when it is verified and unambiguous,
+by this order:
 
 - Explicit prior instructions first. An explicit remote and branch
   from the user win when the helper verifies them (the remote exists
@@ -149,21 +161,104 @@ only when it is verified and unambiguous, by this order:
   unverified default, and conflicting or ambiguous destinations stop
   rather than guess.
 
+### Empty index (`staged_empty`): inspect and stage once, then rerun
+
+An empty index is handled once, without a routine confirmation and
+without needing a terminal. The helper output already carries the
+branch, `on_main`, and `scope` (`staged_empty`, unstaged tracked
+paths, and non-ignored untracked paths); the helper has already
+verified the branch is not detached and that local `main` exists.
+If `staged_empty` is reported, the branch is an eligible topic (not
+`main`), and the scope shows work to ship (unstaged or untracked is
+non-empty), Worker inspects and stages that work as follows, then
+automatically reruns the destination helper once and continues to
+Step 3 on `selected`. This is the only auto-staging in the
+workflow; it never runs in a loop and it never re-stages after the
+rerun. A clean empty scope (no unstaged and no untracked work) is
+still a scope blocker: there is nothing to ship.
+
+1. Read-only inspection with no staging yet. Worker reads the full
+   tracked diffs for every unstaged path, the contents of every
+   untracked path, and the outgoing commits needed to judge the set.
+   Ignored files are out of scope on every path: the helper lists
+   only non-ignored untracked paths, and Worker never stages an
+   ignored file.
+2. Coherence decision. The whole unstaged plus untracked set must
+   read as one coherent change. If the work is genuinely mixed
+   (unrelated changes) or ambiguous (the set cannot be judged as one
+   change), Worker stages nothing and returns that mixed-work
+   blocker to the user. Worker also stages nothing and returns a
+   blocker when any reviewed path looks like a likely secret or
+   otherwise unsafe to commit (for example a credential, key, token,
+   or private data file, or an unreadable file) or is not a regular
+   file (a symlink or other non-regular path).
+3. Exact-path staging only. On a coherent, safe set Worker stages
+   each reviewed path exactly as listed, one path at a time or in a
+   single invocation naming exactly those paths, through Worker's
+   normal permission flow (for example `git add -- <path>` repeated
+   per reviewed path). Never `git add -A`, `--all`, `.`, a directory
+   path, a wildcard, or any blanket add; never `git reset`,
+   `git restore`, `git stash`, `git clean`, or a delete to tidy the
+   tree; and never stage an ignored file or a symlink. No force is
+   used and nothing deploys at staging time; staging alone never
+   deploys to production either. A deleted tracked path staged this
+   way records its deletion, and a rename needs both the old deleted
+   path and the new path staged, so deletes and renames carry
+   through. Worker first re-verifies the index is still empty
+   immediately before staging; if the index is no longer empty,
+   Worker stops and preserves that pre-existing index rather than
+   broadening it.
+4. One rerun, then Step 3. Worker reruns the same destination
+   invocation once (same repo path and same explicit `--remote` /
+   `--branch` values, if any) and continues to Step 3 on `selected`,
+   surfacing the now-staged files and outgoing commits without a
+   routine reconfirmation. If the rerun still blocks (`staged_empty`,
+   `scope_unclean`, an ambiguous remote, or any other reason), Worker
+   stops and reports it with the staged set left as staged; Worker
+   never stages a second time, never broadens scope to force a
+   selection, and never asks the user to run a terminal staging
+   command instead.
+
+On `main` the workflow stays staged-only. A `staged_empty` result on
+`main` remains a scope blocker and never triggers the auto-staging
+above, unless the user already gave a clear explicit include
+authorization naming the exact worktree paths to include; only then
+may Worker inspect and exact-path stage just those named paths
+through the same steps, followed by one rerun. No standing
+auto-staging on `main` is inferred from `/ship` alone.
+
+When the index is already non-empty, Worker preserves that staged
+scope exactly and never broadens it: Worker stages no additional
+paths, even if unstaged or untracked work is present. Unstaged
+tracked changes or untracked files alongside a non-empty index stay
+`scope_unclean` and are rejected before publish, never hidden,
+stashed, deleted, or swept into the candidate. Partially staged
+changes (staged and unstaged content in the same file) are
+therefore still a blocker, never silently completed.
+
 Validation also requires:
 
-- Staged scope only. There is no implicit staging. The candidate is
-  the staged set as reviewed. An empty index with no explicit include
-  list is a scope blocker (`staged_empty`); Worker never stages the
-  working tree to fill it. Unstaged tracked changes or untracked files
-  make the candidate unclean (`scope_unclean`); they are rejected
-  before publish and are never swept into the candidate.
+- Staged scope, never blanket staging. The fleet scripts perform
+  no implicit staging: `ship-build` still requires a non-empty
+  staged set with no unstaged or untracked remainder and never runs
+  `git add`. The candidate is the staged set as reviewed, including
+  the single reviewed auto-staging above (empty index on a topic
+  branch only) and a pre-existing staged set, which is preserved
+  exactly and never broadened. An empty index on `main`, or a clean
+  empty index with no work to ship, is a scope blocker
+  (`staged_empty`). Unstaged tracked changes or untracked files
+  alongside a non-empty index make the candidate unclean
+  (`scope_unclean`); they are rejected before publish and are never
+  swept into the candidate, hidden, stashed, or deleted.
 - Scope is surfaced, not reconfirmed. Worker surfaces the staged
   files and outgoing commits from the helper decision and from
-  `ship-build` output. In routine cases (non-empty staged scope, no
-  unclean files) Cal does not ask the user to reconfirm them. Cal
-  stops and asks only on a real scope surprise (the staged set
-  contradicts explicit prior instructions), a repository policy or
-  authority limit, a failed gate, or a tool denial.
+  `ship-build` output. In routine cases (non-empty staged scope,
+  including a scope newly created by the single reviewed
+  auto-staging, with no unclean files) Cal does not ask the user to
+  reconfirm them. Cal stops and asks only on a real scope surprise
+  (the staged set contradicts explicit prior instructions), a
+  repository policy or authority limit, a failed gate, or a tool
+  denial.
 - `main` synchronization state. A local `main` that is ahead of or
   diverged from the current remote `main` blocks. A local `main` that
   is only behind may be fast-forwarded only when the fast-forward is
@@ -180,7 +275,9 @@ Validation also requires:
 
 Worker runs with the Step 2 helper values (remote, ref, branch when
 on `main`, and the helper's suggested commit message), so no routine
-git-derived value is demanded from the user:
+git-derived value is demanded from the user. On the auto-staging
+path these are the rerun helper values (the reviewed newly staged
+set), not the first `staged_empty` output:
 
 ```sh
 <fleet-checkout>/scripts/ship/ship-build <repo-path> \
@@ -306,9 +403,10 @@ operations named below. There is no merge in this step.
 A repository becomes ship-ready when it meets the opt-in contract
 above. Readiness is current and is verified per attempt by Cal; a past
 state does not prohibit ship after adoption. To become ship-ready, in
-order: make the tree clean on a named branch (on `main` or off `main`;
-the Step 2 destination helper resolves the topic, no separate ask);
-meet the strict standard so
+order: be on a named topic branch with the change to ship (on `main`
+only staged work ships; off `main` unstaged work is reviewed and
+auto-staged once in Step 2, and the Step 2 destination helper
+resolves the topic, no separate ask); meet the strict standard so
 `scripts/ship-doctor <repo>` reports `local_pass`; install the pinned
 Husky v9 runtime and verify the helper, shims, and the single-line
 pre-push delegation; add executable `scripts/ship-deploy` with the
