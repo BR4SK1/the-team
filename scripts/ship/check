@@ -266,9 +266,9 @@ for line in ship_build_text.splitlines():
             "scripts/ship/ship-build: must never pass --no-verify to git commit"
         )
 for line in ship_build_text.splitlines():
-    if "git -C" in line and " push " in line and "HEAD:" not in line:
+    if "git -C" in line and " push " in line and "$candidate:$REF" not in line:
         raise ValueError(
-            "scripts/ship/ship-build: push must be HEAD:<ref>, never a bare ref"
+            "scripts/ship/ship-build: push must be $candidate:$REF, never a bare ref or HEAD:<ref>"
         )
 
 # The ship standard document must state the one strict opt-in

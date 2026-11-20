@@ -12,10 +12,14 @@
 
 - Candidate SHA:
 - Doctor: `local_pass` (exit `0`)
-- Commit evidence: `.ship/evidence/<SHA>-commit.json`
-- Deploy evidence: `.ship/evidence/<SHA>-deploy.json`
-  (`scripts/ship-deploy <SHA>` plus full `test:e2e` against that SHA)
+- Run evidence: `.git/ship-runs/<run-id>/commit.json` and `deploy.json`
+  (content-bound to run, candidate SHA, remote, and ref)
+- Deploy: `scripts/ship-deploy <SHA>` printing exactly one deterministic
+  `SHIP_DEPLOYED_SHA=<SHA>` line, plus full `test:e2e` run with
+  `SHIP_TARGET_SHA=<SHA>` and `SHIP_DEPLOYED_SHA=<SHA>` in the environment
+  against that SHA
 - Remote ref verified: `git ls-remote <remote> <ref>` = candidate SHA
+- PR head verified: the PR object's head SHA equals the candidate SHA
 
 ## Tests
 

@@ -118,7 +118,10 @@ did not run.
 declared `core.hooksPath`, executable generated shims, and the
 standard pre-push delegation — *before* any mutation, never
 executing the hook bodies to prove it. The doctor's shape check alone
-does not prove the runtime ran.
+does not prove the runtime ran. Effective validation is stronger than
+shape: `ship-build` requires the genuine installed v9 runtime (helper
+bytes and shim bytes, see Ship-build below), not a no-op shim or a
+comment-only hook that merely mentions the wrapper.
 
 ## The doctor
 
@@ -228,33 +231,56 @@ no defaults. The script, in order:
 
 1. Requires the doctor's `local_pass` (Step 1) and the executable
    opt-in (`scripts/ship-deploy`, a regular file, not a symlink).
+   An inherited `HUSKY=0` blocks, `HUSKY=1` is then set explicitly,
+   and a Husky init shard (`husky/init.sh` under the XDG config home)
+   that sets `HUSKY=0` also blocks, because the helper sources that
+   shard before its own check.
 2. Validates the effective wiring before any mutation: `core.hooksPath`
-   is exactly `.husky/_`, the three shims are regular executables,
-   `.husky/_/h` is present, and `.husky/pre-push` contains a delegation
-   to `scripts/ship/ship-deploy`. Hook bodies are checked by substring
-   only; they are never executed here. Bypass indicators and a
-   `HUSKY=0` environment block before mutation.
-3. Reviews the staged set and prints it with the outgoing commits
+   is exactly `.husky/_`, the declared and installed Husky versions
+   both pin v9, `.husky/_/h` exactly matches the installed helper
+   file, each shim exactly matches the runtime's generated shim, and
+   `.husky/pre-push` delegates with exactly one effective line. Hook
+   bodies are never executed here. A no-op shim, a stub helper, or a
+   comment-only pre-push is refused. Bypass indicators block. Push
+   configuration that would add refs (`remote.<name>.mirror`,
+   `remote.<name>.tagOpt` of `--tags`) or divert the destination
+   (`remote.<name>.pushurl`) also blocks.
+3. Reserves an owned per-run evidence directory under `.git`
+   (`ship-runs/<run-id>/`), refusing symlinks and pre-existing paths,
+   then reviews the staged set and prints it with the outgoing commits
    (base to `HEAD`). There is no implicit staging: the staged set
    must be non-empty, the script never runs `git add`, and unstaged
-   tracked changes make the candidate unclean. Untracked files are
-   reported and never swept in.
-4. Handles the branch. On `main` it requires `--branch <topic>` equal
+   tracked changes or untracked payload make the candidate unclean
+   (rejected before publish, never reported-only).
+4. Compares current remote `main` on and off `main`: it fetches the
+   explicit remote first (never trusting a possibly stale tracking
+   ref), then counts with `refs/heads/main...remote/main` (left is
+   local-only, ahead; right is remote-only, behind). Ahead or diverged
+   blocks. Behind-only fast-forwards only with no rewritten commits —
+   on `main` by merging the remote tip, off `main` by advancing the
+   `main` ref without moving `HEAD` — and only when the staged tree
+   cannot be overwritten upstream and is verified unchanged after the
+   fast-forward (by staged tree, not file names alone).
+5. Handles the branch. On `main` it requires `--branch <topic>` equal
    to the ref branch and creates that safe branch. Off `main`, `--branch`
    if given must equal the current branch and the ref must name the
    same branch. Work starts on main normally (ask the user only if starting off main); the starting branch is never assumed silently.
-5. Checks local main synchronization: ahead or diverged from the
-   explicit remote blocks. Only-behind automatic sync applies to
-   local main, and only with no rewritten commits — a fast-forward
-   that preserves the staged work (verified by staged names before and
-   after). Any need to rewrite history is a block.
 6. Commits the staged set with a plain `git commit -m` (never with
-   bypass flags) and records `.ship/evidence/<SHA>-commit.json` for
-   the exact candidate SHA. A failed commit gate blocks the push.
-7. Pushes `HEAD:<ref>` to the explicit remote (this runs the real
-   pre-push gate). No automatic retry follows a failed push.
+   bypass flags) and records `.git/ship-runs/<run-id>/commit.json` for
+   the exact candidate SHA, bound by content (run, candidate, remote,
+   ref, parent, and tree). The candidate's parent must equal the
+   reviewed parent and its tree must equal the reviewed staged tree.
+   A failed commit gate blocks the push with gate output preserved.
+7. Pushes the pinned candidate SHA (`<SHA>:<ref>`) to the explicit
+   remote (this runs the real pre-push gate). The pinned form removes
+   the moving-HEAD race that `HEAD:<ref>` would carry. No automatic
+   retry follows a failed push. On push failure the script reconciles
+   by reading the remote ref and reports what that read shows, without
+   replaying or deploying again; a failure alone does not prove that
+   nothing was uploaded.
 8. Verifies the post-push remote SHA with `git ls-remote` against the
-   candidate and requires both evidence files for that SHA. A missing
+   candidate and requires both evidence files in the run directory
+   with content matching the run, candidate, remote, and ref. A missing
    post-push receipt cannot prevent the upload that already happened;
    the script says so and fails closed on the verification, never
    claiming prevention. Tests prove this boundary with real Git
@@ -267,25 +293,42 @@ The script performs no destructive cleanup and deletes nothing.
 Deployment is nested in the Step 3 push, not a second deploy. The
 real `.husky/pre-push` invokes the fleet wrapper; the wrapper reads
 exactly one pre-push record line on standard input, requires a single
-branch push of a single full SHA, requires that SHA's commit evidence
-to exist, then runs the two fixed inputs in order:
+branch push of a single full SHA (as a branch ref, `HEAD`, or the
+pinned candidate SHA itself, which Git records in both local fields),
+requires that SHA's fresh commit receipt to exist with content matching
+the candidate, remote ref, parent, and tree, requires the candidate to
+equal the current `HEAD` with a clean checkout whose tree tracks the
+deploy entry and package manifest, then runs the two fixed inputs in
+order:
 
 1. Non-production rollout: `<repo>/scripts/ship-deploy <SHA>` with
    the exact outgoing SHA as the sole argument. The script must be a
-   regular executable, not a symlink. A non-zero exit, or output
-   reporting a placeholder, dry run, or skipped work, means not
-   deployed and blocks the push even under a zero exit. The wrapper
-   never infers a staging endpoint and never runs arbitrary user
-   shell snippets; there are no Companion-specific adapters.
+   regular executable, not a symlink. Success is the single
+   deterministic stdout line `SHIP_DEPLOYED_SHA=<SHA>` naming that
+   SHA; any other output, no such line, a duplicate line, or a
+   mismatched value blocks the push. The wrapper never infers a
+   staging endpoint, never guesses from log keywords, and never runs
+   arbitrary user shell snippets; there are no Companion-specific adapters.
 2. Full test run: `<manager> run test:e2e` derived from the pinned
-   `packageManager`. The suite always runs in full with no
-   arguments, no filtering, and no skipping. The requirement is
-   **the repository’s E2E suite must finish successfully** against the deployment of the exact outgoing SHA.
+   `packageManager`, with `SHIP_TARGET_SHA` and `SHIP_DEPLOYED_SHA`
+   set to the exact candidate in the environment. The suite always
+   runs in full with no arguments, no filtering, and no skipping. The
+   requirement is **the repository’s E2E suite must finish successfully**
+   against the deployment of the exact outgoing SHA.
 
-On success the wrapper writes `.ship/evidence/<SHA>-deploy.json` and
-exits zero, allowing upload. On any failure it exits non-zero and
-Git uploads nothing. `.ship/` is a run artifact: owners ignore it
-(`.ship/` in the target `.gitignore`) and never commit it.
+The wrapper also re-validates `HEAD` and the clean checkout after
+deployment and test, and writes `.git/ship-runs/<run-id>/deploy.json`
+(with the run, candidate, deployed SHA, remote, ref, and manager) on
+success, then exits zero, allowing upload. On any failure it exits
+non-zero and Git uploads nothing. Run evidence is owned and per-run
+under `.git`; owners never commit it.
+
+Race limit stated honestly: the wrapper holds no distributed lock. If
+`HEAD` moves during the rollout, upload is still blocked (and the
+re-check catches the move), but the rollout for that SHA may already
+have happened; a concurrent push from another clone can still race the
+remote. The reconcile read after transport failure reports the
+observed remote ref, not a guarantee of never having uploaded.
 
 ## Standardized hook wiring fixture
 
@@ -299,33 +342,51 @@ exec "<fleet-checkout>/scripts/ship/ship-deploy"
 
 `.husky/pre-commit` and `.husky/commit-msg` remain the repository
 owner's gate commands (for example `npm run format:check`). The
-generated shims and `.husky/_/h` are Husky's. `tests/ship_workflow_test.py`
-builds this wiring as a realistic fixture: `git config
-core.hooksPath .husky/_`, regular user hooks, executable shims, and
-the delegation line above using an absolute fleet path known to the
-fixture. The check script validates the delegation substring only;
-no fixture hook is ever executed outside its own Git push boundary.
+generated shims and `.husky/_/h` are Husky's: each shim is exactly
+`#!/usr/bin/env sh` plus sourcing of the helper, and the helper is
+exactly the installed `husky` package's `husky` file (copied by install).
+`tests/ship_workflow_test.py` builds this wiring as a realistic
+fixture: `git config core.hooksPath .husky/_`, regular user hooks,
+exact installed shims and helper with an installed v9 stub, and the
+delegation line above using an absolute fleet path known to the
+fixture. `ship-build` validates the effective delegation line, not a
+substring inside a comment; no fixture hook is ever executed outside
+its own Git push boundary.
 
 ## Before-upload guards and exact-candidate evidence
 
 Before anything is uploaded, guards run against the exact candidate
 being shipped, and the evidence recorded names that exact candidate
 (its commit), not a nearby or earlier state. Evidence from one
-commit never stands in for evidence about another.
+commit never stands in for evidence about another. Fingerprint checks
+at the mutation boundaries compare the parent, branch, and staged or
+candidate tree rather than file names alone, and the push names the
+pinned candidate SHA so a later `HEAD` move cannot change the upload.
 
 ## PR (Step 5)
 
 Create or reuse a matching open GitHub PR for the topic branch and
-ref with the permitted GitHub MCP tools. Fill the PR body from
-`fleet/skills/ship/resources/PR_TEMPLATE.md` (the only intended
-tracked resource) and narrowly track it. Independently verify the
-PR is open and that the remote ref points at the exact tested
-candidate SHA (commit evidence, deploy evidence, and `git ls-remote`
-all agree). When a PR result is ambiguous, query again before any
-retry. Then return clean to local `main`, leaving the topic branch
-intact. There is no merge here. Before opening the PR,
-distinguish Git-clean state from run artifacts (`.ship/evidence/`
-files) and delete nothing broad or owned by others.
+ref with the permitted GitHub MCP tools. First look for the
+repository pull request template (under `.github/`, top-level, or
+`docs/`), keeping its wording where it exists. Cal calls `get_me`
+first and fixes the exact owner, repository, base (`main`), and head
+before any find or create. Cleanup is a separate step before the PR:
+Worker removes only the single owned per-run directory under `.git`
+for this run, after the candidate and remote ref have been copied into
+the draft, verifying the path is the expected run directory and not a
+symlink. Duplicate-safe find, create, and requery follows: list open
+pull requests for the exact head and base, reuse exactly one match,
+create exactly one when none matches, stop on more than one, then
+requery the detail. Verify the actual pull request: open state, its
+own head SHA equal to the candidate, and URL present — the pull
+request's own head SHA and the remote ref SHA from `git ls-remote`
+are verified separately and must agree. When a PR result is ambiguous,
+query again before any retry. Then return clean to local `main`,
+leaving the topic branch intact, via Worker's guarded checks of a
+clean status, the switch itself, and the branch confirmation. There
+is no merge here. Cal uses only the permitted hardened inspection
+invocations; Worker runs only the named switch and cleanup
+operations. Never push by an alternate path.
 
 ## Staging, branches, and synchronization
 
@@ -339,10 +400,11 @@ files) and delete nothing broad or owned by others.
   branches: a local main that is ahead of or diverged from its
   upstream blocks. A feature branch being ahead of its base is
   normal (it carries its own commits) and is not by itself a block.
-- Behind-only automatic sync applies to local main: a local main
-  that is only behind may be synced automatically, and only with no
-  rewritten commits — fast-forward style updates that preserve every
-  existing commit and the staged work. Any need to rewrite history
+- Behind-only automatic sync applies to local main on and off the
+  starting branch: a local main that is only behind may be synced
+  automatically, and only with no rewritten commits — fast-forward
+  style updates that preserve every existing commit and the staged
+  work (verified by staged tree). Any need to rewrite history
   is a block, not an action.
 - No merge: shipping opens or reuses a pull request for the branch
   and then returns clean to local main, leaving the topic branch
@@ -351,17 +413,19 @@ files) and delete nothing broad or owned by others.
 - Fail closed: bypass, missing, or failed evidence stops the ship.
   There are no auto retries of external mutations.
 
-## Companion adoption checklist (do not adopt or run)
+## Companion adoption checklist
 
-Companion was found dirty off-main and missing the standard
-`scripts/ship-deploy`, hook wiring, and deploy adapter. It is not
-adopted or run by this workflow. To become ship-ready, the owner, in
-order: makes the tree clean on a named branch (off-main requires an
-explicit user ask); meets the strict standard so
-`scripts/ship/ship-doctor <repo>` reports `local_pass`; adds
-executable `scripts/ship-deploy` with the one-SHA contract; wires
-`.husky/pre-push` to the fleet `scripts/ship/ship-deploy` wrapper
-above; ignores `.ship/` evidence; and runs the realistic fixtures in
+A repository becomes ship-ready when it meets the opt-in contract
+above. Readiness is current and verified per attempt by Cal. To
+become ship-ready, the owner, in order: makes the tree clean on a named
+branch (off-main requires an explicit user ask); meets the strict
+standard so `scripts/ship/ship-doctor <repo>` reports `local_pass`;
+installs the pinned Husky v9 runtime and verifies the helper, shims,
+and the single-line pre-push delegation; adds executable
+`scripts/ship-deploy` with the one-SHA contract and the single
+`SHIP_DEPLOYED_SHA` line; wires `.husky/pre-push` to the fleet
+`scripts/ship/ship-deploy` wrapper above; keeps run evidence under
+`.git` and never commits it; and runs the realistic fixtures in
 `tests/ship_workflow_test.py` until a real push of an exact candidate
 succeeds. Production deployment stays separate (see below).
 
@@ -397,3 +461,13 @@ contains no OpenCode shell interpolation marker (the
 exclamation-and-backtick marker), no other interpolation, and no
 repository-relative doctor execution. Run it with
 `./scripts/ship/check`.
+
+Untested areas stated honestly: the ambiguous-transport reconcile
+(a push that fails after the remote has accepted the ref) has no
+local-bare reproduction and is covered by code path only, not by a
+fixture upload; and the live Step 5 orchestration that creates a real
+GitHub pull request against a live remote is not covered by a fixture
+(a faked pull request object is never substituted for that live
+claim), while the duplicate-safe identity checks and the pull request
+head versus remote-ref distinction are exercised by the debilled
+plugin dispatch tests and the Git fixtures.
