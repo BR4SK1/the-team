@@ -583,13 +583,19 @@ class ShipDoctorTest(unittest.TestCase):
             "Step 5 - Create a PR",
             "scripts/ship/ship-build",
             "scripts/ship/ship-deploy",
+            "scripts/ship/ship-destination",
             "test:e2e",
             "no implicit staging",
             "nested in the Step 3 push",
             "@ship",
+            "no routine approval stops",
+            "staged_empty",
+            "busy lease",
         ):
             self.assertIn(required, text)
-        for banned in ("!`", "$(", "${"):
+        for banned in ("!`", "$(", "${", "Cal asks the user first",
+                       "off-main requires an explicit",
+                       "only if starting off main"):
             self.assertNotIn(banned, text)
 
     def test_ship_plugin_registers_command_without_shell(self) -> None:
@@ -603,6 +609,8 @@ class ShipDoctorTest(unittest.TestCase):
             "ctx.session.synthetic",
             "session.agent",
             "fleet.ship",
+            "ship-destination",
+            "no routine approval stops",
         ):
             self.assertIn(required, text)
         for banned in (
@@ -632,8 +640,11 @@ class ShipDoctorTest(unittest.TestCase):
             "test:e2e",
             "no per-repo config",
             "production deploy skill",
-            "starts on main",
-            "only if starting off main",
+            "scripts/ship/ship-destination",
+            "no routine approval stops",
+            "single configured remote",
+            "busy lease",
+            "needs no confirmation",
             "local main",
             "no rewritten commits",
             "duplicated hooks",

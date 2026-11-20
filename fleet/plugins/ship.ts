@@ -1,7 +1,7 @@
 import { Plugin } from "@opencode/plugin"
 
 const SHIP_PROMPT =
-  "Load the ship skill by ID ship (frontmatter name Ship) via the skill tool and follow it. You are Cal. Delegate the operational script steps to Worker in the background and return the evidence SHAs. Do not run the scripts directly. Do not merge."
+  "Load the ship skill by ID ship (frontmatter name Ship) via the skill tool and follow it. You are Cal. A normal /ship authorizes the routine staged-only workflow through non-prod deploy, full E2E, push and opening a PR, with no routine approval stops. Delegate the operational script steps to Worker in the background: Worker inspects the GitHub remote identity and current branch and derives the verified destination via ship-destination (explicit prior instructions, upstream, main tracking, or single remote; stop on ambiguous or conflicting destinations), surfaces staged scope and outgoing commits without reconfirming routine cases, and uses the repository's configured non-prod target and lease mechanism (busy or unverifiable required lease is a specific blocker). Stop only on a blocker, scope surprise, repo policy, authority limit, failed gate, or tool denial. Return the evidence SHAs. Do not run the scripts directly. Do not merge."
 
 export default Plugin.define({
   id: "fleet.ship",

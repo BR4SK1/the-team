@@ -23,15 +23,31 @@ is not used, because its trailing input would be expanded by shell
 interpolation outside the agent permission flow. If a custom web client
 does not perform native command dispatch, the user loads this skill
 explicitly by naming it in the prompt text (for example `@ship` with no
-arguments); the same no-argument rule then applies. No web client code
-is changed by this skill.
+arguments); the same no-argument rule and the same authorization contract
+below then apply on that path too. No web client code is changed by this
+skill.
+
+A normal `/ship` invocation (or explicit `@ship` with no arguments)
+itself authorizes the routine staged-only workflow through non-production
+deploy, the full E2E suite, push, and opening a pull request. There are
+no routine approval stops: neither Cal nor Worker pauses to ask the user
+for a routine git-derived value (remote, branch, ref, commit message)
+or to reconfirm a routine staged scope. Work stops and returns to the
+user only on a real blocker: a blocked or indeterminate destination,
+an empty or unclean staged scope, a scope surprise, a repository policy
+or authority limit, a busy or unverifiable required lease, a failed
+gate, or a tool denial. Those stops are blockers, never prompts to
+guess a value or to proceed anyway.
 
 Cal owns authority and user decisions. Cal delegates operational steps
 to Worker and never runs the scripts directly. Worker runs only the fleet
 scripts named below and returns their actual output, exit status, and the
-evidence SHAs. Cal must not route around a denial, bypass a failed gate,
-or retry a failed external mutation. Where this skill names a Cal check
-with Git, Cal uses only the exact hardened inspection invocations
+evidence SHAs. Worker autonomously inspects the configured GitHub remote
+identity and current branch (Step 2) and derives the destination; Cal
+does not demand those values from the user and does not pause for them
+in routine cases. Cal must not route around a denial, bypass a failed
+gate, or retry a failed external mutation. Where this skill names a Cal
+check with Git, Cal uses only the exact hardened inspection invocations
 documented in `fleet/agents/cal.md`; any other form is denied and is
 reported. Where this skill names a Worker shell invocation, Worker runs
 exactly that invocation and no broader form.
@@ -88,19 +104,66 @@ hook execution, test execution, or deployment.
 
 ## Step 2 - Validate the state of the current environment
 
-Cal reviews the actual staged changes and any outgoing commits
-before authorizing Worker. Worker collects the current environment;
-Cal decides. Validation requires:
+Worker collects the current environment and resolves the destination;
+Cal decides only on a blocker. Worker runs the read-only destination
+helper, the trusted absolute fleet installation only:
+
+```sh
+<fleet-checkout>/scripts/ship/ship-destination <repo-path> [--remote <remote>] [--branch <topic>]
+```
+
+Cal passes `--remote` or `--branch` only when the user already named
+that value in explicit prior instructions; otherwise Worker omits both
+and the helper derives the destination. The helper inspects the
+configured GitHub remote identity and current branch with read-only Git
+invocations only (`git --no-optional-locks`), never writes, never
+fetches, and prints versioned JSON (`selected` or `blocked`, exit `0`
+or `1`; exit `2` is indeterminate). On `blocked` or `indeterminate`,
+stop before any mutation and report the specific reason code. On
+`selected`, Worker returns the full decision to Cal: remote, topic,
+ref, GitHub owner and repository, staged files, outgoing commits,
+suggested commit message, and selection path. The destination is used
+only when it is verified and unambiguous, by this order:
+
+- Explicit prior instructions first. An explicit remote and branch
+  from the user win when the helper verifies them (the remote exists
+  and is eligible, and the branch is safe and consistent with the
+  current branch). An explicit value that conflicts with repository
+  state is a blocker, never a fallback to a guessed value.
+- Off `main`, the current branch is the topic. This is an ordinary
+  eligible case and needs no confirmation. Its remote is the current
+  branch's configured upstream remote when that upstream is
+  appropriate (the upstream merge ref names the same branch),
+  otherwise the single configured remote. A multiple-remote repository
+  with no upstream resolution is ambiguous and blocks.
+- On `main`, the helper derives a safe unique topic branch from the
+  staged change (`ship/<staged-path slug>`, suffixed `-2`, `-3`, and
+  so on until free locally and in the selected remote's tracking
+  refs). Its remote is `main`'s configured tracking remote when set,
+  otherwise the single configured remote. A multiple-remote repository
+  with no main-tracking resolution is ambiguous and blocks.
+- A selected remote that would divert or add refs (`pushurl`,
+  `mirror`, `tagOpt --tags`), a missing remote, an upstream that
+  names a different branch, or a remote URL that does not parse to
+  one GitHub owner and repository blocks. Nothing is inferred from an
+  unverified default, and conflicting or ambiguous destinations stop
+  rather than guess.
+
+Validation also requires:
 
 - Staged scope only. There is no implicit staging. The candidate is
-  the staged set as reviewed. Unstaged tracked changes make the
-  candidate unclean; untracked files are rejected before publish and
-  are never swept into the candidate.
-- Starting branch, named explicitly. On `main`, shipping creates a
-  safe topic branch (Step 3 requires the branch name explicitly). Off
-  `main`, Cal asks the user first and never assumes the starting
-  branch silently. An inappropriately named or wrong branch stops
-  here, before any mutation.
+  the staged set as reviewed. An empty index with no explicit include
+  list is a scope blocker (`staged_empty`); Worker never stages the
+  working tree to fill it. Unstaged tracked changes or untracked files
+  make the candidate unclean (`scope_unclean`); they are rejected
+  before publish and are never swept into the candidate.
+- Scope is surfaced, not reconfirmed. Worker surfaces the staged
+  files and outgoing commits from the helper decision and from
+  `ship-build` output. In routine cases (non-empty staged scope, no
+  unclean files) Cal does not ask the user to reconfirm them. Cal
+  stops and asks only on a real scope surprise (the staged set
+  contradicts explicit prior instructions), a repository policy or
+  authority limit, a failed gate, or a tool denial.
 - `main` synchronization state. A local `main` that is ahead of or
   diverged from the current remote `main` blocks. A local `main` that
   is only behind may be fast-forwarded only when the fast-forward is
@@ -108,9 +171,6 @@ Cal decides. Validation requires:
   runs on and off `main` against a freshly fetched remote `main`, with
   correct ahead and behind counts. A feature branch being ahead of its
   base is normal and is not by itself a block.
-- Explicit remote and ref. The remote name and `refs/heads/<topic>`
-  ref are named explicitly by the user decision; they are never
-  inferred from configuration defaults.
 - Effective local readiness. Worker confirms `git status`, staged
   stat, and the branch list reflect the Step 2 decision. If any
   decision is ambiguous, consequential, or denied by permissions,
@@ -118,7 +178,9 @@ Cal decides. Validation requires:
 
 ## Step 3 - Run the ship-build script
 
-Worker runs:
+Worker runs with the Step 2 helper values (remote, ref, branch when
+on `main`, and the helper's suggested commit message), so no routine
+git-derived value is demanded from the user:
 
 ```sh
 <fleet-checkout>/scripts/ship/ship-build <repo-path> \
@@ -162,6 +224,21 @@ not classify tests and does not ask which tests to run: the whole
 `test:e2e` suite runs every time. Receipt content, not a filename, binds
 the run to the candidate, remote, and ref.
 
+Deployment goes to the repository's existing configured non-production
+target only: the repository's own `scripts/ship-deploy` entry. If that
+repository configures a lease or reservation mechanism for its
+non-production target, that mechanism runs inside the repository entry
+itself and the fleet wrapper lets it run; the fleet layer invents no
+global reservation system and holds no lock of its own. A deploy that
+reports a busy lease or an unverifiable required reservation is a
+specific blocker: `ship-deploy` preserves its output, the push is
+blocked, and Cal reports that specific lease reason to the user. The
+workflow never asks whether someone is using the target, never polls
+for the lease to free up, never retries by an alternate deploy path,
+and never proceeds without the rollout and the full E2E run. When the
+repository configures no lease, no lease check is invented; the known
+race limit in `docs/ship.md` still applies.
+
 A post-push check that evidence is missing cannot prevent an upload
 that already happened. `ship-build` reports a post-push verification
 failure as such and never claims prevention after the fact.
@@ -184,7 +261,7 @@ operations named below. There is no merge in this step.
 2. Cal first calls `get_me` (GitHub MCP) to establish the authenticated
    identity, respecting the permission flow, and stops on any denial.
    Cal then fixes the exact identity to use for every later call: the
-   owner and repository parsed from the explicit remote URL, the base
+   owner and repository from the selected Step 2 destination, the base
    branch `main`, and the head branch and ref for the topic branch
    pushed in Step 3. No other owner, repository, base, or head is
    substituted.
@@ -229,8 +306,9 @@ operations named below. There is no merge in this step.
 A repository becomes ship-ready when it meets the opt-in contract
 above. Readiness is current and is verified per attempt by Cal; a past
 state does not prohibit ship after adoption. To become ship-ready, in
-order: make the tree clean on a named branch (off-main requires an
-explicit user ask); meet the strict standard so
+order: make the tree clean on a named branch (on `main` or off `main`;
+the Step 2 destination helper resolves the topic, no separate ask);
+meet the strict standard so
 `scripts/ship-doctor <repo>` reports `local_pass`; install the pinned
 Husky v9 runtime and verify the helper, shims, and the single-line
 pre-push delegation; add executable `scripts/ship-deploy` with the

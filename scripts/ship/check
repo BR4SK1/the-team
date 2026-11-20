@@ -104,12 +104,14 @@ def strip_jsonc(text: str) -> str:
 
 for path in (
     Path("scripts/ship/ship-doctor"),
+    Path("scripts/ship/ship-destination"),
     Path("scripts/ship/ship-build"),
     Path("scripts/ship/ship-deploy"),
     Path("tests/ship_doctor_test.py"),
     Path("tests/ship_workflow_test.py"),
+    Path("tests/ship_destination_test.py"),
 ):
-    if path.suffix == ".py":
+    if path.suffix == ".py" or path.name == "ship-destination":
         ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
 # Native fleet setup: the installer and config generator are removed.
@@ -175,6 +177,55 @@ for required in ("O_NOFOLLOW", "dir_fd", "O_NONBLOCK", "fstat"):
             f"scripts/ship/ship-doctor: missing no-follow traversal {required!r}"
         )
 
+# Ship destination helper must stay read-only by construction: it may
+# run only allowlisted read-only Git invocations with
+# --no-optional-locks, never fetch, push, or write, and never emit a
+# raw remote URL. Mutating subcommands are checked at their git() call
+# sites, not in prose.
+ship_destination = Path("scripts/ship/ship-destination")
+if not (ship_destination.stat().st_mode & 0o111):
+    raise ValueError("scripts/ship/ship-destination: must be executable")
+ship_destination_source = ship_destination.read_text(encoding="utf-8")
+for banned in (
+    "os.system",
+    "os.popen",
+    "os.exec",
+    "os.spawn",
+    "os.fork",
+    "urllib",
+    "socket",
+    "requests",
+):
+    if banned in ship_destination_source:
+        raise ValueError(
+            f"scripts/ship/ship-destination: forbidden mechanism {banned!r}"
+        )
+for line in ship_destination_source.splitlines():
+    stripped = line.strip()
+    if stripped.startswith('git(repo, "'):
+        for mutating in ('"push"', '"fetch"', '"commit"', '"switch"',
+                         '"update-ref"', '"merge"'):
+            if mutating in stripped:
+                raise ValueError(
+                    "scripts/ship/ship-destination: mutating Git invocation "
+                    f"{mutating!r} in {stripped!r}"
+                )
+for required in (
+    "--no-optional-locks",
+    '"branch", "--show-current"',
+    '"remote", "get-url"',
+    '"diff", "--cached", "--name-only"',
+    "branch.{branch}.remote",
+    "github_identity_unverified",
+    "ambiguous_remote",
+    "staged_empty",
+    "never emits a raw remote URL",
+):
+    if required not in ship_destination_source:
+        raise ValueError(
+            f"scripts/ship/ship-destination: missing required snippet {required!r}"
+        )
+
 # The /ship skill and server plugin replace the former prompt-only
 # Markdown command. V2 skill frontmatter cannot register a slash
 # command, so /ship is registered by the server plugin with a fixed
@@ -196,10 +247,21 @@ for required in (
     "Step 5 - Create a PR",
     "scripts/ship/ship-build",
     "scripts/ship/ship-deploy",
+    "scripts/ship/ship-destination",
     "test:e2e",
     "no implicit staging",
     "nested in the Step 3 push",
     "@ship",
+    "no routine approval stops",
+    "staged_empty",
+    "scope_unclean",
+    "single configured remote",
+    "configured upstream",
+    "main-tracking",
+    "busy lease",
+    "unverifiable required reservation",
+    "ordinary",
+    "needs no confirmation",
 ):
     if required not in ship_skill_text:
         raise ValueError(f"{ship_skill}: missing required phrase {required!r}")
@@ -211,6 +273,11 @@ for banned in (
     "${",
     "python3 scripts/ship-doctor",
     "./scripts/ship-doctor",
+    "Cal asks the user first",
+    "off-main requires an explicit",
+    "only if starting off main",
+    "asks the user only if starting off main",
+    "never inferred from configuration defaults",
 ):
     if banned in ship_skill_text:
         raise ValueError(f"{ship_skill}: prompt-only violation {banned!r}")
@@ -226,6 +293,9 @@ for required in (
     "SHIP_PROMPT",
     "no arguments",
     "fleet.ship",
+    "ship-destination",
+    "no routine approval stops",
+    "busy or unverifiable required lease",
 ):
     if required not in ship_plugin_text:
         raise ValueError(f"{ship_plugin}: missing required phrase {required!r}")
@@ -292,8 +362,14 @@ for required in (
     "no implicit staging",
     "no rewritten commits",
     "production deploy skill",
-    "starts on main",
-    "only if starting off main",
+    "scripts/ship/ship-destination",
+    "no routine approval stops",
+    "single configured remote",
+    "configured upstream",
+    "busy lease",
+    "unverifiable required reservation",
+    "needs no confirmation",
+    "empty index",
     "local main",
     "duplicated hooks",
     "approved mapping",
@@ -322,6 +398,14 @@ if "python3 scripts/ship-doctor" in ship_doc_text:
     raise ValueError(f"{ship_doc}: must not use repository-relative execution")
 if "Shipping is not implemented yet" in ship_doc_text:
     raise ValueError(f"{ship_doc}: milestone-1 stub must not remain after implementation")
+for banned in (
+    "starts on main",
+    "only if starting off main",
+    "off-main requires an explicit user ask",
+    "asks the user only if starting off main",
+):
+    if banned in ship_doc_text:
+        raise ValueError(f"{ship_doc}: removed confirmation requirement {banned!r}")
 
 # Permission hardening for the fleet agent definitions:
 # - A wildcard shell allow rule (for example "git diff *") also permits mutating

@@ -14,8 +14,17 @@ body template is `fleet/skills/ship/resources/PR_TEMPLATE.md`. Keep
 - `scripts/ship/ship-doctor` — read-only diagnostics (Step 1). It
   takes one explicit repository path, inspects only bounded
   allowlisted local metadata, and prints versioned JSON.
+- `scripts/ship/ship-destination` — read-only destination selection
+  (Step 2). Worker runs it with the repository path and, only when the
+  user already named them in explicit prior instructions, an explicit
+  remote and branch. It inspects the configured GitHub remote identity
+  and current branch and prints versioned JSON (`selected` or
+  `blocked`); a small deterministic helper is justified here because
+  remote, upstream, and main-tracking resolution is easy to misread by
+  hand and must be identical every run. It never writes, fetches, or
+  emits a raw remote URL.
 - `scripts/ship/ship-build` — validates opt-in and wiring, then
-  commits the reviewed staged set and pushes to an explicit remote
+  commits the reviewed staged set and pushes to the selected remote
   and ref (Steps 2–3).
 - `scripts/ship/ship-deploy` — fleet pre-push wrapper that runs the
   non-prod rollout and the full E2E suite for the exact outgoing SHA
@@ -34,14 +43,18 @@ body template is `fleet/skills/ship/resources/PR_TEMPLATE.md`. Keep
   the agent permission flow. Title matching and ID `ship` guard the
   registration; a pre-existing `ship` command is left in place.
 - This document and `tests/ship_doctor_test.py`,
-  `tests/ship_workflow_test.py` — the one strict opt-in standard and
-  the realistic Git fixtures that prove the boundary.
+  `tests/ship_workflow_test.py`,
+  `tests/ship_destination_test.py` — the one strict opt-in standard
+  and the realistic Git fixtures that prove the boundary.
 
 When the service launch environment points `OPENCODE_CONFIG_DIR` at
 `fleet/` (see README Native setup), the skill and the plugin are
 discovered from the fleet root. The web client does not perform
 native command dispatch for this fleet; a web user loads the skill
-explicitly as `@ship` with no arguments, under the same rules.
+explicitly as `@ship` with no arguments, under the same rules and the
+same authorization contract: the invocation authorizes the routine
+staged-only workflow through deploy, E2E, push, and PR creation, with
+no routine approval stops.
 
 ## Five steps
 
@@ -216,9 +229,37 @@ capped reads, malformed or untrusted metadata, unchanged fixtures,
 and secret redaction. They run locally via `./scripts/ship/check`;
 there are no live endpoint tests.
 
+## Destination selection (Step 2)
+
+Worker first runs the read-only destination helper:
+
+```sh
+<fleet-checkout>/scripts/ship/ship-destination <repo-path> [--remote <remote>] [--branch <topic>]
+```
+
+Cal passes `--remote` or `--branch` only for values the user already
+named in explicit prior instructions. Otherwise the helper derives the
+destination from verified repository state, in this order: explicit
+prior instructions; off `main`, the current branch as topic with its
+configured upstream remote when appropriate (merge ref names the same
+branch), otherwise the single configured remote; on `main`, a safe
+unique topic derived from the staged change (`ship/<staged-path slug>`,
+suffixed until free locally and in tracking refs) with `main`'s
+configured tracking remote when set, otherwise the single configured
+remote. Multiple remotes with no such resolution, a mismatched
+upstream, a diverting or ref-adding remote, or a remote URL that does
+not parse to one GitHub owner and repository blocks with a specific
+reason code. A normal `/ship` authorizes this routine derivation with
+no routine approval stops: an ordinary eligible off-main topic branch
+needs no confirmation, and no routine git-derived value is demanded
+from the user. Staged scope and
+outgoing commits are surfaced from the helper decision and do not
+require reconfirmation in routine cases; an empty index is a scope
+blocker, never a reason to sweep the working tree.
+
 ## Ship-build (Steps 2–3)
 
-Worker runs:
+Worker runs with the Step 2 helper values:
 
 ```sh
 <fleet-checkout>/scripts/ship/ship-build <repo-path> \
@@ -226,8 +267,8 @@ Worker runs:
   [--branch <topic>] --message <message>
 ```
 
-All of remote, ref, and message are required and explicit; there are
-no defaults. The script, in order:
+All of remote, ref, and message are required and explicit at the
+script boundary; there are no defaults. The script, in order:
 
 1. Requires the doctor's `local_pass` (Step 1) and the executable
    opt-in (`scripts/ship-deploy`, a regular file, not a symlink).
@@ -264,7 +305,9 @@ no defaults. The script, in order:
 5. Handles the branch. On `main` it requires `--branch <topic>` equal
    to the ref branch and creates that safe branch. Off `main`, `--branch`
    if given must equal the current branch and the ref must name the
-   same branch. Work starts on main normally (ask the user only if starting off main); the starting branch is never assumed silently.
+   same branch. Work may start on `main` or off `main`; the starting
+   branch and destination come from the Step 2 helper decision, never
+   from a user prompt for a routine value.
 6. Commits the staged set with a plain `git commit -m` (never with
    bypass flags) and records `.git/ship-runs/<run-id>/commit.json` for
    the exact candidate SHA, bound by content (run, candidate, remote,
@@ -330,6 +373,18 @@ have happened; a concurrent push from another clone can still race the
 remote. The reconcile read after transport failure reports the
 observed remote ref, not a guarantee of never having uploaded.
 
+Lease and reservation: deployment targets the repository's existing
+configured non-production target only, through its own
+`scripts/ship-deploy` entry. If that repository configures a lease or
+reservation mechanism for the target, it runs inside the repository
+entry; the fleet wrapper lets it run and invents no global reservation
+system. A busy lease or an unverifiable required reservation is a
+specific blocker: the wrapper preserves the repository entry's output,
+the push is blocked, and the workflow reports that specific lease
+reason. It never asks whether the target is in use, never polls for
+the lease, and never retries by an alternate path. With no configured
+lease, no lease check is invented.
+
 ## Standardized hook wiring fixture
 
 The standardized small wiring a conforming repository commits is:
@@ -370,7 +425,7 @@ ref with the permitted GitHub MCP tools. First look for the
 repository pull request template (under `.github/`, top-level, or
 `docs/`), keeping its wording where it exists. Cal calls `get_me`
 first and fixes the exact owner, repository, base (`main`), and head
-before any find or create. Cleanup is a separate step before the PR:
+from the selected Step 2 destination before any find or create. Cleanup is a separate step before the PR:
 Worker removes only the single owned per-run directory under `.git`
 for this run, after the candidate and remote ref have been copied into
 the draft, verifying the path is the expected run directory and not a
@@ -390,12 +445,14 @@ operations. Never push by an alternate path.
 
 ## Staging, branches, and synchronization
 
-- Work starts on main normally (ask the user only if starting off main). The starting branch is never assumed silently.
+- Work may start on `main` or off `main`. The starting branch and
+  destination come from the Step 2 helper decision; an ordinary
+  eligible off-main topic branch needs no confirmation.
 - Staged scope only: shipping acts on the staged, intended change
   set. There is no implicit staging — unstaged or untracked work is
-  never swept in.
-- Explicit remotes and refs: `ship-build` takes them explicitly.
-  There is no destructive cleanup.
+  never swept in, and an empty index is a scope blocker.
+- Selected remotes and refs: `ship-build` takes the Step 2 helper
+  values explicitly. There is no destructive cleanup.
 - Ahead or diverged policy applies to local main, not to all feature
   branches: a local main that is ahead of or diverged from its
   upstream blocks. A feature branch being ahead of its base is
@@ -418,7 +475,7 @@ operations. Never push by an alternate path.
 A repository becomes ship-ready when it meets the opt-in contract
 above. Readiness is current and verified per attempt by Cal. To
 become ship-ready, the owner, in order: makes the tree clean on a named
-branch (off-main requires an explicit user ask); meets the strict
+branch (on `main` or off `main`, resolved by the Step 2 helper); meets the strict
 standard so `scripts/ship/ship-doctor <repo>` reports `local_pass`;
 installs the pinned Husky v9 runtime and verifies the helper, shims,
 and the single-line pre-push delegation; adds executable
@@ -437,7 +494,9 @@ capability with its own explicit authorization and permission review.
 A local pass is never reported as dispatch readiness. For `/ship`
 itself, a web user types `@ship` with no arguments to load the skill
 when the custom client does not dispatch the native command; the
-agent then follows the fixed Cal-owned workflow above.
+agent then follows the fixed Cal-owned workflow above under the same
+authorization contract as `/ship` (routine staged-only ship with no
+routine approval stops).
 
 ## Production deployment stays separate
 
@@ -450,9 +509,10 @@ intentionally deleted) or its `scripts/deploy` entry point
 ## Verification
 
 `./scripts/ship/check` validates the scripts' shell syntax and
-ShellCheck diagnostics, the doctor's Python syntax and
-no-forbidden-mechanisms shape, runs the fixture-only test suite
-(`tests/ship_doctor_test.py`, `tests/ship_workflow_test.py`),
+ShellCheck diagnostics, the doctor's and destination helper's Python
+syntax, and the read-only shape of both helpers, runs the fixture-only
+test suite (`tests/ship_doctor_test.py`, `tests/ship_workflow_test.py`,
+`tests/ship_destination_test.py`),
 validates the fleet JSON/JSONC configuration and ignore allowlist,
 and checks this document, the skill
 (`fleet/skills/ship/SKILL.md`), the plugin (`fleet/plugins/ship.ts`),

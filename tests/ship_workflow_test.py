@@ -96,7 +96,8 @@ HUSKY_SHIM = '#!/usr/bin/env sh\n. "$(dirname "$0")/h"\n'
 
 def build_fixture(base: Path, *, e2e_ok: bool = True, deploy_ok: bool = True,
                   wrong_wiring: bool = False, deploy_wrong_sha: bool = False,
-                  deploy_moves_head: bool = False) -> tuple[Path, Path]:
+                  deploy_moves_head: bool = False,
+                  deploy_busy_lease: bool = False) -> tuple[Path, Path]:
     """Create bare remote + working repo that passes the doctor."""
     remote = base / "remote.git"
     work = base / "work"
@@ -127,7 +128,14 @@ def build_fixture(base: Path, *, e2e_ok: bool = True, deploy_ok: bool = True,
     # prints exactly one deterministic stdout line, SHIP_DEPLOYED_SHA,
     # naming the rolled-out SHA; the E2E runner requires the explicit
     # SHIP_TARGET_SHA environment the fleet wrapper passes.
-    if deploy_wrong_sha:
+    if deploy_busy_lease:
+        write(
+            work / "scripts" / "ship-deploy",
+            '#!/bin/sh\necho "non-prod lease busy: holder fixture-holder" >&2\n'
+            'exit 1\n',
+            executable=True,
+        )
+    elif deploy_wrong_sha:
         write(
             work / "scripts" / "ship-deploy",
             '#!/bin/sh\nmkdir -p .ship\nprintf "%s\\n" "$1" > .ship/deploy-sha\n'
@@ -292,6 +300,18 @@ class ShipWorkflowTest(unittest.TestCase):
         self.assertIn("deploy-failed", proc.stdout + proc.stderr)
         # Pre-push failure: nothing was uploaded.
         self.assertEqual(remote_sha(remote, "refs/heads/ship/deploy-fail"), "")
+
+    def test_busy_required_lease_blocks_upload(self) -> None:
+        work, remote = build_fixture(self.base, deploy_busy_lease=True)
+        write(work / "file.txt", "changed\n")
+        git(work, "add", "file.txt")
+        proc = run_ship_build(work, branch="ship/lease-busy")
+        self.assertNotEqual(proc.returncode, 0)
+        # The specific lease reason is preserved, upload is blocked,
+        # and nothing is retried by an alternate deploy path.
+        self.assertIn("non-prod lease busy", proc.stdout + proc.stderr)
+        self.assertIn("fixture-holder", proc.stdout + proc.stderr)
+        self.assertEqual(remote_sha(remote, "refs/heads/ship/lease-busy"), "")
 
     def test_e2e_failure_blocks_upload(self) -> None:
         work, remote = build_fixture(self.base, e2e_ok=False)
@@ -582,6 +602,10 @@ class ShipWorkflowTest(unittest.TestCase):
         self.assertEqual(outcome["accepted"][0][0], "prompt")
         self.assertIn("Load the ship skill by ID ship", outcome["accepted"][0][1])
         self.assertIn("You are Cal", outcome["accepted"][0][1])
+        # The fixed prompt carries the same no-routine-approval contract
+        # as the skill, including autonomous destination selection.
+        self.assertIn("no routine approval stops", outcome["accepted"][0][1])
+        self.assertIn("ship-destination", outcome["accepted"][0][1])
         # An unset session agent is not Cal (Session.Info.agent is
         # optional and may be absent on a fresh session).
         self.assertEqual(outcome["unset"][0][0], "synthetic")
