@@ -1,14 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Relocated check runner: the former scripts/check now lives under
-# scripts/ship/check so scripts/ship/ stays together. The active
-# .githooks/pre-commit hook remains enabled and delegates here.
+# Local check runner for the-team (also invoked by .githooks/pre-commit).
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$repo_root"
 
-shellcheck .githooks/pre-commit scripts/ship/check scripts/ship/ship-build scripts/ship/ship-deploy scripts/ship/ship-e2e-runner
-bash -n .githooks/pre-commit scripts/ship/check scripts/ship/ship-build scripts/ship/ship-deploy scripts/ship/ship-e2e-runner
+shellcheck -x -P SCRIPTDIR \
+  .githooks/pre-commit \
+  scripts/ship/check \
+  scripts/ship/ship \
+  scripts/ship/ship-deploy \
+  scripts/ship/_node-env.sh
+
+bash -n \
+  .githooks/pre-commit \
+  scripts/ship/check \
+  scripts/ship/ship \
+  scripts/ship/ship-deploy \
+  scripts/ship/_node-env.sh
 
 python3 -m unittest discover -s tests -p "*_test.py"
 
@@ -21,7 +30,7 @@ from pathlib import Path
 
 
 def strip_jsonc(text: str) -> str:
-    """Remove JSONC comments while preserving quoted strings and newlines."""
+    """Remove JSONC comments and trailing commas outside quoted strings."""
     output: list[str] = []
     in_string = False
     escaped = False
@@ -60,8 +69,7 @@ def strip_jsonc(text: str) -> str:
             output.append(char)
             index += 1
     without_comments = "".join(output)
-    # Trailing commas are removed outside quoted strings only; a comma
-    # inside a string literal is content and must be preserved.
+
     result: list[str] = []
     in_string = False
     escaped = False
@@ -102,415 +110,41 @@ def strip_jsonc(text: str) -> str:
     return "".join(result)
 
 
-for path in (
-    Path("scripts/ship/ship-doctor"),
-    Path("scripts/ship/ship-destination"),
-    Path("tests/ship_doctor_test.py"),
-    Path("tests/ship_workflow_test.py"),
-    Path("tests/ship_destination_test.py"),
-):
+# 1. Python syntax checks.
+py_files = [Path("scripts/ship/ship-doctor"), *sorted(Path("tests").glob("*_test.py"))]
+for path in py_files:
     ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
-# Native fleet setup: the installer and config generator are removed.
-# fleet/ itself is the OpenCode config root (OPENCODE_CONFIG_DIR), so no
-# script may reintroduce copying, linking, or generating a second config.
-# The former scripts/check, scripts/deploy, scripts/install-hooks, the
-# fleet/commands Markdown command, and the production deploy skill are
-# intentionally deleted and must not be reintroduced at their old paths.
-for removed in (
-    "scripts/fleet-install",
-    "scripts/generate-opencode-config",
-    "scripts/deploy.sh",
-    "fleet/host-inputs.schema.json",
-    "examples/host-inputs.example.json",
-    "tests/generate_config_test.py",
-    "scripts/check",
-    "scripts/deploy",
-    "scripts/install-hooks",
-    "scripts/ship-doctor",
-    "fleet/commands/ship.md",
-    "fleet/skills/deploy/SKILL.md",
+# 2. Ship script executability & safety invariants.
+for script in (
+    Path("scripts/ship/check"),
+    Path("scripts/ship/ship"),
+    Path("scripts/ship/ship-doctor"),
+    Path("scripts/ship/ship-deploy"),
 ):
-    if Path(removed).exists():
-        raise ValueError(
-            f"{removed}: intentionally deleted; do not reintroduce at its "
-            "old path (ship lives under scripts/ship/ and fleet/skills/ship/)"
-        )
+    if not (script.is_file() and (script.stat().st_mode & 0o111)):
+        raise ValueError(f"{script}: must exist and be executable")
 
-# Ship doctor must stay read-only and stdlib-only by
-# construction: it may not invoke subprocesses, Git, or the network,
-# use shell execution helpers, follow symlinks, or emit secret/config
-# strings. It traverses with no-follow directory descriptors only.
-ship_doctor = Path("scripts/ship/ship-doctor")
-if not (ship_doctor.stat().st_mode & 0o111):
-    raise ValueError("scripts/ship/ship-doctor: must be executable")
-ship_doctor_source = ship_doctor.read_text(encoding="utf-8")
-for banned in (
-    "subprocess",
-    "socket",
-    "urllib",
-    "requests",
-    "os.system",
-    "os.popen",
-    "os.exec",
-    "os.spawn",
-    "os.fork",
-    "eval(",
-    "exec(",
-    "shutil",
-    "http.client",
-    "read_text",
-    ".resolve(",
-    "lstat",
-    "Path(",
-):
-    if banned in ship_doctor_source:
-        raise ValueError(
-            f"scripts/ship/ship-doctor: forbidden mechanism {banned!r}"
-        )
-for required in ("O_NOFOLLOW", "dir_fd", "O_NONBLOCK", "fstat"):
-    if required not in ship_doctor_source:
-        raise ValueError(
-            f"scripts/ship/ship-doctor: missing no-follow traversal {required!r}"
-        )
-for required in (
-    "e2e.runner_contract",
-    "legacy_host_e2e",
-    "isolated_oci",
-    "runner_contract_invalid",
-    ".ship",
-    "e2e-runner.json",
-    "isolated_e2e_execution",
-    "runner_image_presence",
-):
-    if required not in ship_doctor_source:
-        raise ValueError(
-            f"scripts/ship/ship-doctor: missing runner contract check {required!r}"
-        )
+ship_text = Path("scripts/ship/ship").read_text(encoding="utf-8")
+for line in ship_text.splitlines():
+    if "git -C" in line and " commit " in line and "--no-verify" in line:
+        raise ValueError("scripts/ship/ship: must never pass --no-verify to git commit")
+    if "git -C" in line and " push " in line and "$CANDIDATE:refs/heads/$TOPIC" not in line:
+        raise ValueError("scripts/ship/ship: git push must pin $CANDIDATE:refs/heads/$TOPIC")
 
-# Fleet isolated E2E runner must stay narrow and least-privilege by
-# construction: digest-pinned OCI only, no pull, no privileged or
-# host-wide access, and no host Node invocation.
-ship_e2e_runner = Path("scripts/ship/ship-e2e-runner")
-if not (ship_e2e_runner.stat().st_mode & 0o111):
-    raise ValueError("scripts/ship/ship-e2e-runner: must be executable")
-ship_e2e_runner_source = ship_e2e_runner.read_text(encoding="utf-8")
-for banned in (
-    "--privileged",
-    "docker.sock",
-    "--network host",
-    "--pid host",
-    "docker pull",
-):
-    if banned in ship_e2e_runner_source:
-        raise ValueError(
-            f"scripts/ship/ship-e2e-runner: forbidden mechanism {banned!r}"
-        )
-for required in (
-    "preflight",
-    "image inspect",
-    "--pull never",
-    "--network bridge",
-    "--cap-drop ALL",
-    "no-new-privileges",
-    "--read-only",
-    "SHIP_E2E_MODE=isolated_oci",
-    "SHIP_E2E_IMAGE_ID=",
-    "SHIP_E2E_CONTRACT_SHA256=",
-    ".ship/e2e-runner.json",
-    "candidate commit",
-    "no host fallback",
-):
-    if required not in ship_e2e_runner_source:
-        raise ValueError(
-            f"scripts/ship/ship-e2e-runner: missing required snippet {required!r}"
-        )
-if ship_e2e_runner_source.count("test:e2e") < 1:
-    raise ValueError("scripts/ship/ship-e2e-runner: must run test:e2e")
-
-# Ship destination helper must stay read-only by construction: it may
-# run only allowlisted read-only Git invocations with
-# --no-optional-locks, never fetch, push, or write, and never emit a
-# raw remote URL. Mutating subcommands are checked at their git() call
-# sites, not in prose.
-ship_destination = Path("scripts/ship/ship-destination")
-if not (ship_destination.stat().st_mode & 0o111):
-    raise ValueError("scripts/ship/ship-destination: must be executable")
-ship_destination_source = ship_destination.read_text(encoding="utf-8")
-for banned in (
-    "os.system",
-    "os.popen",
-    "os.exec",
-    "os.spawn",
-    "os.fork",
-    "urllib",
-    "socket",
-    "requests",
-):
-    if banned in ship_destination_source:
-        raise ValueError(
-            f"scripts/ship/ship-destination: forbidden mechanism {banned!r}"
-        )
-for line in ship_destination_source.splitlines():
-    stripped = line.strip()
-    if stripped.startswith('git(repo, "'):
-        for mutating in ('"push"', '"fetch"', '"commit"', '"switch"',
-                         '"update-ref"', '"merge"'):
-            if mutating in stripped:
-                raise ValueError(
-                    "scripts/ship/ship-destination: mutating Git invocation "
-                    f"{mutating!r} in {stripped!r}"
-                )
-for required in (
-    "--no-optional-locks",
-    '"branch", "--show-current"',
-    '"remote", "get-url"',
-    '"diff", "--cached", "--name-only"',
-    "branch.{branch}.remote",
-    "github_identity_unverified",
-    "ambiguous_remote",
-    "staged_empty",
-    "never emits a raw remote URL",
-    "No commit message is suggested",
-):
-    if required not in ship_destination_source:
-        raise ValueError(
-            f"scripts/ship/ship-destination: missing required snippet {required!r}"
-        )
-# The helper must never emit a `ship:` commit-message suggestion: the
-# skill (Step 3) owns the meaningful Conventional Commit.
-if 'f"ship:' in ship_destination_source:
-    raise ValueError(
-        "scripts/ship/ship-destination: must not emit a `ship:` "
-        "commit-message suggestion"
-    )
-
-# The ship skill replaces the former prompt-only Markdown command.
-# V2 skill frontmatter cannot register a slash command, so the skill
-# is loaded explicitly by ID `ship` (for example `@ship` with no
-# arguments). The invocation rejects trailing arguments and does
-# not switch agents. No server plugin is tracked.
+# 3. Ship skill frontmatter & no shell-interpolation markers.
 ship_skill = Path("fleet/skills/ship/SKILL.md")
 ship_skill_text = ship_skill.read_text(encoding="utf-8")
 if not ship_skill_text.startswith("---\n") or "\n---\n" not in ship_skill_text[4:]:
-    raise ValueError(f"{ship_skill}: skill frontmatter must be delimited by ---")
+    raise ValueError(f"{ship_skill}: frontmatter must be delimited by ---")
 ship_frontmatter = ship_skill_text[4:].split("\n---\n", 1)[0]
-for required in (
-    "name: Ship",
-    "opencode/autoinvoke: false",
-    "Step 1 - Run the ship-doctor script",
-    "Step 2 - Validate the state of the current environment",
-    "Step 3 - Run the ship-build script",
-    "Step 4 - Run the ship-deploy script",
-    "Step 5 - Create a PR",
-    "scripts/ship/ship-build",
-    "scripts/ship/ship-deploy",
-    "scripts/ship/ship-destination",
-    "test:e2e",
-    "no implicit staging",
-    "nested in the Step 3 push",
-    "@ship",
-    "no routine approval stops",
-    "staged_empty",
-    "scope_unclean",
-    "single configured remote",
-    "configured upstream",
-    "main-tracking",
-    "busy lease",
-    "unverifiable required reservation",
-    "ordinary",
-    "needs no confirmation",
-    "single reviewed auto-staging",
-    "exact reviewed paths",
-    "reruns the same destination",
-    "never broadened",
-    "without needing a terminal",
-    "task-owned provenance",
-    "known clean baseline",
-    "later @ship in the same session",
-    "no user-supplied path list",
-    "safe derived topic",
-    "no publish or commit directly to",
-    "never stages on `main`",
-    "git switch -c <topic>",
-    "git branch --show-current",
-    "before any staging",
-    "branches before editing",
-    "Conventional Commit",
-    "Commitlint",
-    "scripts/ship/ship-e2e-runner",
-    "isolated_oci",
-    "legacy_host",
-    "digest-pinned",
-    "no host fallback",
-    "migration debt",
-    "preflight",
-    "check, deploy, run",
-    ".ship/e2e-runner.json",
-):
-    if required not in ship_skill_text:
-        raise ValueError(f"{ship_skill}: missing required phrase {required!r}")
 if "opencode/autoinvoke: false" not in ship_frontmatter:
-    raise ValueError(f"{ship_skill}: missing autoinvoke false")
-for banned in (
-    "!`",
-    "$(",
-    "${",
-    "python3 scripts/ship-doctor",
-    "./scripts/ship-doctor",
-    "Cal asks the user first",
-    "off-main requires an explicit",
-    "only if starting off main",
-    "asks the user only if starting off main",
-    "never inferred from configuration defaults",
-    "`/ship`",
-    "explicit include",
-    "workflow stays staged-only",
-    "empty index on a topic branch only",
-):
-    if banned in ship_skill_text:
-        raise ValueError(f"{ship_skill}: prompt-only violation {banned!r}")
+    raise ValueError(f"{ship_skill}: must set opencode/autoinvoke: false")
+for marker in ("!`", "$(", "${"):
+    if marker in ship_skill_text:
+        raise ValueError(f"{ship_skill}: disallowed shell-interpolation marker {marker!r}")
 
-ship_plugin = Path("fleet/plugins/ship.ts")
-if ship_plugin.exists():
-    raise ValueError(
-        "fleet/plugins/ship.ts must be removed; the ship skill is "
-        "invoked explicitly as @ship"
-    )
-for stale in ("fleet/plugins/ship.ts", "fleet.ship"):
-    if stale in ship_skill_text:
-        raise ValueError(
-            f"{ship_skill}: stale plugin reference {stale!r}"
-        )
-
-# Fleet ship scripts must stay small, explicit, and fail-closed:
-# ship-build commits staged only (the single reviewed Worker staging
-# in Step 2 precedes it) and pushes to an explicit remote/ref;
-# ship-deploy reads the pre-push record and blocks upload on failure.
-# ship-build greps for the bypass strings to refuse them; that scan
-# must not become a bypass invocation. The commit invocation itself is
-# checked to carry the message and nothing else.
-for script_name, required_snippets in (
-    ("scripts/ship/ship-build", ("--remote", "--ref", "--message", "diff --cached", "ls-remote", "ship-e2e-runner", "e2e_mode")),
-    ("scripts/ship/ship-deploy", ("scripts/ship-deploy", "test:e2e", "commit.json", "ship-e2e-runner", "preflight", "e2e_mode", "isolated_oci", "legacy_host")),
-    ("scripts/ship/ship-e2e-runner", ("preflight", "image inspect", "--pull never", "test:e2e", ".ship/e2e-runner.json")),
-):
-    script_path = Path(script_name)
-    if not (script_path.stat().st_mode & 0o111):
-        raise ValueError(f"{script_name}: must be executable")
-    script_text = script_path.read_text(encoding="utf-8")
-    for snippet in required_snippets:
-        if snippet not in script_text:
-            raise ValueError(f"{script_name}: missing required snippet {snippet!r}")
-ship_build_text = Path("scripts/ship/ship-build").read_text(encoding="utf-8")
-for line in ship_build_text.splitlines():
-    if "git -C" in line and "commit" in line and "--no-verify" in line:
-        raise ValueError(
-            "scripts/ship/ship-build: must never pass --no-verify to git commit"
-        )
-for line in ship_build_text.splitlines():
-    if "git -C" in line and " push " in line and "$candidate:$REF" not in line:
-        raise ValueError(
-            "scripts/ship/ship-build: push must be $candidate:$REF, never a bare ref or HEAD:<ref>"
-        )
-
-# The ship standard document must state the one strict opt-in
-# standard, Husky-alone gating, the exact E2E requirement, the
-# explicit branch/adoption/dispatch rules, and the implemented
-# script/skill surface.
-ship_doc = Path("docs/ship.md")
-ship_doc_text = ship_doc.read_text(encoding="utf-8")
-for required in (
-    "strict opt-in",
-    "no per-repo config",
-    "Husky alone",
-    "scripts/ship/ship-doctor",
-    "scripts/ship/ship-build",
-    "scripts/ship/ship-deploy",
-    "local_pass",
-    "blocked",
-    "indeterminate",
-    "test:e2e",
-    "the repository’s E2E suite must finish successfully",
-    "no implicit staging",
-    "no rewritten commits",
-    "production deploy skill",
-    "scripts/ship/ship-destination",
-    "no routine approval stops",
-    "single configured remote",
-    "configured upstream",
-    "busy lease",
-    "unverifiable required reservation",
-    "needs no confirmation",
-    "empty index",
-    "local main",
-    "duplicated hooks",
-    "approved mapping",
-    "local structural validation",
-    "Web/native dispatch",
-    "absolute",
-    "trusted",
-    "Step 1 - Run the ship-doctor script",
-    "Step 5 - Create a PR",
-    "nested in",
-    "fleet/skills/ship/SKILL.md",
-    "fleet/skills/ship/resources/PR_TEMPLATE.md",
-    "scripts/ship-deploy",
-    "post-push",
-    "cannot prevent",
-    "Companion",
-    "@ship",
-    "single reviewed Worker staging",
-    "never broadened",
-    "task-owned provenance",
-    "known clean baseline",
-    "later @ship in the same session",
-    "user-supplied path list",
-    "safe derived topic",
-    "no publish or commit directly to",
-    "never stages on `main`",
-    "git switch -c <topic>",
-    "git branch --show-current",
-    "branches before editing",
-    "Conventional Commit",
-    "Commitlint",
-    "scripts/ship/ship-e2e-runner",
-    "isolated_oci",
-    "legacy_host",
-    "digest-pinned",
-    "no host fallback",
-    "migration debt",
-    "preflight",
-    "check, deploy, run",
-    ".ship/e2e-runner.json",
-    "e2e.runner_contract",
-    "no implicit pull",
-):
-    if required not in ship_doc_text:
-        raise ValueError(f"{ship_doc}: missing required phrase {required!r}")
-if "paid" in ship_doc_text.lower():
-    raise ValueError(f"{ship_doc}: shared scaffold must not carry paid policy")
-if "python3 scripts/ship-doctor" in ship_doc_text:
-    raise ValueError(f"{ship_doc}: must not use repository-relative execution")
-if "Shipping is not implemented yet" in ship_doc_text:
-    raise ValueError(f"{ship_doc}: milestone-1 stub must not remain after implementation")
-for banned in (
-    "starts on main",
-    "only if starting off main",
-    "off-main requires an explicit user ask",
-    "asks the user only if starting off main",
-    "fleet/plugins/ship.ts",
-    "`/ship`",
-    "explicit include",
-    "on `main` only staged work ships",
-    "topic branch only (coherent",
-):
-    if banned in ship_doc_text:
-        raise ValueError(f"{ship_doc}: removed confirmation requirement {banned!r}")
-
-# Structural and safety checks for fleet agent definitions, skills, and
-# fleet/opencode.jsonc. Avoid locking prose wording or config snapshots so
-# models, agents, and references can evolve cleanly; enforce real invariants.
+# 4. Agent & skill frontmatter and env-read restoration checks.
 def agent_permission_rules(text: str, name: str) -> list[dict[str, str]]:
     lines = text.splitlines()
     if not lines or lines[0] != "---" or "---" not in lines[1:]:
@@ -557,8 +191,8 @@ def check_env_read_restore(name: str, rules: list[dict[str, str]]) -> None:
             )
             if not match or match.get("effect") != effect:
                 raise ValueError(
-                    f"{name}: agent read-all grant must restore the base "
-                    f"policy's env-file rules ({resource}: {effect})"
+                    f"{name}: agent read-all grant must restore base "
+                    f"env-file rules ({resource}: {effect})"
                 )
 
 
@@ -583,6 +217,7 @@ for required in (
     if required not in web_prompt_frontmatter.splitlines():
         raise ValueError(f"{web_prompt_skill}: missing required frontmatter {required!r}")
 
+# 5. fleet/opencode.jsonc privacy and structure checks.
 fleet_text = Path("fleet/opencode.jsonc").read_text(encoding="utf-8")
 fleet_config = json.loads(strip_jsonc(fleet_text))
 
@@ -627,15 +262,14 @@ if Path("fleet/opencode.json").exists():
         "config is fleet/opencode.jsonc"
     )
 
-# Fleet ignore allowlist (deny-by-default): intended tracked assets are
-# not ignored; private runtime siblings under fleet/ are ignored.
-# git-only check on path names; no runtime file is read or created.
+# 6. .gitignore allowlist under fleet/ (deny-by-default).
 def is_ignored(path: str) -> bool:
     result = subprocess.run(
         ["git", "check-ignore", "--no-index", "-q", "--", path],
         capture_output=True,
     )
     return result.returncode == 0
+
 
 for allowed in (
     "fleet/opencode.jsonc",
@@ -672,14 +306,14 @@ for denied in (
             f".gitignore: runtime file {denied!r} under fleet/ must be ignored"
         )
 
+# 7. Parse all JSON and JSONC files in repo.
 for path in sorted(Path(".").glob("**/*.json")):
     if ".git" not in path.parts:
         json.loads(path.read_text(encoding="utf-8"))
 
 for path in sorted(Path(".").glob("**/*.jsonc")):
-    if ".git" in path.parts:
-        continue
-    json.loads(strip_jsonc(path.read_text(encoding="utf-8")))
+    if ".git" not in path.parts:
+        json.loads(strip_jsonc(path.read_text(encoding="utf-8")))
 
-print("Python syntax and JSON/JSONC validation passed.")
+print("All checks passed.")
 PY

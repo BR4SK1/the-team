@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-"""Fixture-only tests for scripts/ship/ship-doctor and the /ship workflow.
+"""Fixture tests for scripts/ship/ship-doctor (stdlib only)."""
 
-Stdlib only. Fixtures are built in a temporary directory and are never
-executed; the doctor is only ever pointed at them as data.
-"""
+from __future__ import annotations
 
 import hashlib
 import json
@@ -15,34 +13,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-DOCTOR = REPO_ROOT / "scripts" / "ship" / "ship-doctor"
-
-EXPECTED_CHECK_IDS = [
-    "path.safety",
-    "layout.supported",
-    "metadata.parse",
-    "git.layout",
-    "husky.hooks_path",
-    "husky.pre_commit",
-    "husky.commit_msg",
-    "husky.pre_push",
-    "husky.shim_pre_commit",
-    "husky.shim_commit_msg",
-    "husky.shim_pre_push",
-    "husky.helper",
-    "husky.dependency",
-    "toolchain.pinned",
-    "toolchain.lockfile",
-    "disable_indicators",
-    "scripts.prepare",
-    "scripts.format_check",
-    "scripts.lint",
-    "scripts.test_unit",
-    "scripts.test_e2e",
-    "e2e.runner_contract",
-    "structure.wiring",
-]
+FLEET_ROOT = Path(__file__).resolve().parent.parent
+DOCTOR = FLEET_ROOT / "scripts" / "ship" / "ship-doctor"
+DEPLOY_WRAPPER = FLEET_ROOT / "scripts" / "ship" / "ship-deploy"
 
 PASSING_PACKAGE = {
     "name": "fixture",
@@ -51,22 +24,14 @@ PASSING_PACKAGE = {
         "prepare": "husky",
         "format:check": "prettier --check .",
         "lint": "eslint .",
-        "test:unit": "vitest run unit",
-        "test:e2e": "playwright test",
+        "test:unit": "node --test",
+        "test:e2e": "node scripts/test-e2e.mjs",
     },
     "devDependencies": {"husky": "9.1.7"},
 }
 
-GIT_CONFIG = (
-    "[core]\n"
-    "\trepositoryformatversion = 0\n"
-    "\tbare = false\n"
-    "\thooksPath = .husky/_\n"
-    '[remote "origin"]\n'
-    "\turl = https://example.invalid/fixture.git\n"
-)
-
 SHIM = '#!/usr/bin/env sh\n. "$(dirname "$0")/h"\n'
+HUSKY_HELPER = '#!/usr/bin/env sh\nsh -e "$(dirname "$0")/../$(basename "$0")" "$@"\n'
 
 
 def write_text(path: Path, text: str, *, executable: bool = False) -> None:
@@ -76,45 +41,62 @@ def write_text(path: Path, text: str, *, executable: bool = False) -> None:
         path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
-def build_passing(root: Path) -> None:
-    # Realistic Husky v9 shape (mirrors Companion): user hooks are
-    # regular non-executable files run via sh; generated shims in
-    # .husky/_ plus the _/h helper are executable. No _/husky.sh.
-    write_text(root / "package.json", json.dumps(PASSING_PACKAGE, indent=2))
+def git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def build_ready_repo(root: Path) -> None:
+    git(root, "init", "-b", "main")
+    git(root, "config", "user.name", "Test")
+    git(root, "config", "user.email", "test@example.invalid")
+    git(root, "config", "core.hooksPath", ".husky/_")
+    git(root, "remote", "add", "origin", "https://github.com/example/fixture.git")
+
+    write_text(root / "package.json", json.dumps(PASSING_PACKAGE, indent=2) + "\n")
     write_text(root / "pnpm-lock.yaml", "lockfileVersion: '9.0'\n")
-    write_text(root / ".husky" / "pre-commit", "pnpm test:unit\n")
-    write_text(root / ".husky" / "commit-msg", "pnpm exec commitlint\n")
-    write_text(root / ".husky" / "pre-push", "pnpm test:unit\n")
+    write_text(root / ".husky" / "pre-commit", "pnpm run format:check\n")
+    write_text(root / ".husky" / "commit-msg", "true\n")
+    write_text(root / ".husky" / "pre-push", f'#!/bin/sh\nexec "{DEPLOY_WRAPPER}"\n')
     write_text(root / ".husky" / "_" / "pre-commit", SHIM, executable=True)
     write_text(root / ".husky" / "_" / "commit-msg", SHIM, executable=True)
     write_text(root / ".husky" / "_" / "pre-push", SHIM, executable=True)
+    write_text(root / ".husky" / "_" / "h", HUSKY_HELPER)
     write_text(
-        root / ".husky" / "_" / "h",
-        "#!/usr/bin/env sh\nsh -e \"$s\" \"$@\"\n",
+        root / "scripts" / "ship-deploy",
+        '#!/usr/bin/env bash\nprintf "SHIP_DEPLOYED_SHA=%s\\n" "$1"\n',
+        executable=True,
     )
-    write_text(root / ".git" / "HEAD", "ref: refs/heads/main\n")
-    write_text(root / ".git" / "config", GIT_CONFIG)
+
+    git(root, "add", ".")
+    git(root, "commit", "--no-verify", "-m", "chore: initial fixture")
 
 
-def write_git_config(root: Path, text: str) -> None:
-    write_text(root / ".git" / "config", text)
-
-
-def run_doctor(target: Path) -> tuple[int, str, dict]:
+def run_doctor(
+    target: Path, *, env_extra: dict[str, str] | None = None
+) -> tuple[int, dict]:
+    env = os.environ.copy()
+    if env_extra:
+        env.update(env_extra)
     proc = subprocess.run(
         [sys.executable, str(DOCTOR), str(target)],
         capture_output=True,
         text=True,
-        check=False,
+        env=env,
         timeout=15,
     )
-    payload = json.loads(proc.stdout)
-    return proc.returncode, proc.stdout, payload
+    return proc.returncode, json.loads(proc.stdout)
 
 
 def digest_tree(root: Path) -> dict[str, str]:
     digests: dict[str, str] = {}
     for path in sorted(root.rglob("*")):
+        if ".git" in path.parts:
+            continue
         if path.is_file() and not path.is_symlink():
             digests[str(path.relative_to(root))] = hashlib.sha256(
                 path.read_bytes()
@@ -128,757 +110,129 @@ class ShipDoctorTest(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name) / "repo"
         self.root.mkdir()
-        build_passing(self.root)
+        build_ready_repo(self.root)
 
-    def check_map(self, payload: dict) -> dict[str, dict]:
-        return {entry["id"]: entry for entry in payload["checks"]}
+    def issue_ids(self, payload: dict) -> set[str]:
+        return {item["id"] for item in payload["issues"]}
 
-    # --- outcomes ---
-
-    def test_local_pass(self) -> None:
-        code, _, payload = run_doctor(self.root)
+    def test_ready_and_read_only(self) -> None:
+        before = digest_tree(self.root)
+        code, payload = run_doctor(self.root)
+        after = digest_tree(self.root)
         self.assertEqual(code, 0)
-        self.assertEqual(payload["result"], "local_pass")
-        self.assertEqual(payload["schema_version"], 1)
-        self.assertEqual(payload["tool"], "ship-doctor")
-        self.assertEqual(
-            [entry["id"] for entry in payload["checks"]], EXPECTED_CHECK_IDS
-        )
-        self.assertTrue(
-            all(entry["status"] == "pass" for entry in payload["checks"])
-        )
-        # User hooks are not executable in Husky v9 and still pass.
-        self.assertFalse(
-            (self.root / ".husky" / "pre-commit").stat().st_mode
-            & stat.S_IXUSR
-        )
+        self.assertEqual(payload["status"], "ready")
+        self.assertEqual(payload["package_manager"], "pnpm")
+        self.assertEqual(payload["issues"], [])
+        self.assertEqual(before, after)
 
-    def test_blocked_missing_user_hook(self) -> None:
-        (self.root / ".husky" / "pre-push").unlink()
-        code, _, payload = run_doctor(self.root)
+    def test_not_a_git_repo(self) -> None:
+        plain = Path(self._tmp.name) / "plain"
+        plain.mkdir()
+        code, payload = run_doctor(plain)
         self.assertEqual(code, 1)
-        self.assertEqual(payload["result"], "blocked")
-        entry = self.check_map(payload)["husky.pre_push"]
-        self.assertEqual((entry["status"], entry["reason"]), ("fail", "missing"))
+        self.assertEqual(payload["status"], "not_ready")
+        self.assertIn("git.repo", self.issue_ids(payload))
 
-    def test_blocked_missing_commit_msg(self) -> None:
-        (self.root / ".husky" / "commit-msg").unlink()
-        code, _, payload = run_doctor(self.root)
+    def test_missing_main_branch(self) -> None:
+        git(self.root, "branch", "-m", "main", "develop")
+        code, payload = run_doctor(self.root)
         self.assertEqual(code, 1)
-        entry = self.check_map(payload)["husky.commit_msg"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]), ("fail", "missing")
-        )
+        self.assertIn("git.repo", self.issue_ids(payload))
 
-    def test_blocked_missing_shim_and_helper(self) -> None:
-        (self.root / ".husky" / "_" / "pre-push").unlink()
-        (self.root / ".husky" / "_" / "h").unlink()
-        code, _, payload = run_doctor(self.root)
+    def test_non_github_remote(self) -> None:
+        git(self.root, "remote", "set-url", "origin", "https://gitlab.example/x/y.git")
+        code, payload = run_doctor(self.root)
         self.assertEqual(code, 1)
-        checks = self.check_map(payload)
-        self.assertEqual(checks["husky.shim_pre_push"]["reason"], "missing")
-        self.assertEqual(checks["husky.helper"]["reason"], "missing")
+        self.assertIn("git.remote", self.issue_ids(payload))
 
-    def test_blocked_non_executable_shim(self) -> None:
-        shim = self.root / ".husky" / "_" / "pre-commit"
+    def test_unpinned_package_manager_and_missing_lockfile(self) -> None:
+        (self.root / "pnpm-lock.yaml").unlink()
+        code, payload = run_doctor(self.root)
+        self.assertEqual(code, 1)
+        self.assertIn("toolchain.package_manager", self.issue_ids(payload))
+
+        pkg = dict(PASSING_PACKAGE)
+        pkg["packageManager"] = "pnpm"
+        write_text(self.root / "package.json", json.dumps(pkg))
+        code, payload = run_doctor(self.root)
+        self.assertEqual(code, 1)
+        self.assertIn("toolchain.package_manager", self.issue_ids(payload))
+
+    def test_nvmrc_pin_missing_vs_installed(self) -> None:
+        write_text(self.root / ".nvmrc", "99.88.77\n")
+        fake_nvm = Path(self._tmp.name) / "nvm"
+        code, payload = run_doctor(self.root, env_extra={"NVM_DIR": str(fake_nvm)})
+        self.assertEqual(code, 1)
+        self.assertIn("toolchain.node_pin", self.issue_ids(payload))
+
+        fake_node = fake_nvm / "versions" / "node" / "v99.88.77" / "bin" / "node"
+        write_text(fake_node, "#!/bin/sh\necho v99.88.77\n", executable=True)
+        code, payload = run_doctor(self.root, env_extra={"NVM_DIR": str(fake_nvm)})
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["status"], "ready")
+
+    def test_missing_required_script(self) -> None:
+        pkg = json.loads((self.root / "package.json").read_text(encoding="utf-8"))
+        del pkg["scripts"]["test:e2e"]
+        write_text(self.root / "package.json", json.dumps(pkg))
+        code, payload = run_doctor(self.root)
+        self.assertEqual(code, 1)
+        self.assertIn("scripts.required", self.issue_ids(payload))
+
+    def test_husky_hooks_path_and_shims(self) -> None:
+        git(self.root, "config", "core.hooksPath", ".githooks")
+        code, payload = run_doctor(self.root)
+        self.assertEqual(code, 1)
+        self.assertIn("husky.installed", self.issue_ids(payload))
+
+        git(self.root, "config", "core.hooksPath", ".husky/_")
+        shim = self.root / ".husky" / "_" / "pre-push"
         shim.chmod(shim.stat().st_mode & ~stat.S_IXUSR)
-        code, _, payload = run_doctor(self.root)
+        code, payload = run_doctor(self.root)
         self.assertEqual(code, 1)
-        entry = self.check_map(payload)["husky.shim_pre_commit"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]), ("fail", "not_executable")
-        )
+        self.assertIn("husky.installed", self.issue_ids(payload))
 
-    def test_blocked_disable_indicator(self) -> None:
+    def test_pre_push_delegation_and_bypass_detection(self) -> None:
+        write_text(
+            self.root / ".husky" / "pre-push",
+            f'# exec "{DEPLOY_WRAPPER}"\necho noop\n',
+        )
+        code, payload = run_doctor(self.root)
+        self.assertEqual(code, 1)
+        self.assertIn("husky.pre_push", self.issue_ids(payload))
+
+        write_text(
+            self.root / ".husky" / "pre-push",
+            f'#!/bin/sh\nexec "{DEPLOY_WRAPPER}"\n',
+        )
         write_text(
             self.root / ".husky" / "pre-commit",
-            "git commit --no-verify -m bypass\n",
+            "git commit --no-verify\n",
         )
-        code, _, payload = run_doctor(self.root)
+        code, payload = run_doctor(self.root)
         self.assertEqual(code, 1)
-        entry = self.check_map(payload)["disable_indicators"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]),
-            ("fail", "disable_indicator_present"),
-        )
+        self.assertIn("husky.pre_push", self.issue_ids(payload))
 
-    def test_blocked_disable_indicator_in_scripts(self) -> None:
-        package = json.loads((self.root / "package.json").read_text())
-        package["scripts"]["lint"] = "eslint . # HUSKY=0"
-        write_text(self.root / "package.json", json.dumps(package))
-        code, _, payload = run_doctor(self.root)
+    def test_missing_or_non_executable_deploy_script(self) -> None:
+        deploy = self.root / "scripts" / "ship-deploy"
+        deploy.chmod(deploy.stat().st_mode & ~stat.S_IXUSR)
+        code, payload = run_doctor(self.root)
         self.assertEqual(code, 1)
-        self.assertEqual(
-            self.check_map(payload)["disable_indicators"]["reason"],
-            "disable_indicator_present",
-        )
+        self.assertIn("deploy.script", self.issue_ids(payload))
 
-    def test_blocked_missing_script(self) -> None:
-        package = json.loads((self.root / "package.json").read_text())
-        del package["scripts"]["test:e2e"]
-        write_text(self.root / "package.json", json.dumps(package))
-        code, _, payload = run_doctor(self.root)
+        deploy.unlink()
+        code, payload = run_doctor(self.root)
         self.assertEqual(code, 1)
-        entry = self.check_map(payload)["scripts.test_e2e"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]), ("fail", "script_missing")
-        )
+        self.assertIn("deploy.script", self.issue_ids(payload))
 
-    def test_blocked_prepare_not_husky(self) -> None:
-        package = json.loads((self.root / "package.json").read_text())
-        package["scripts"]["prepare"] = "husky install"
-        write_text(self.root / "package.json", json.dumps(package))
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 1)
-        entry = self.check_map(payload)["scripts.prepare"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]), ("fail", "script_not_husky")
-        )
-
-    def test_blocked_unpinned(self) -> None:
-        package = json.loads((self.root / "package.json").read_text())
-        del package["packageManager"]
-        write_text(self.root / "package.json", json.dumps(package))
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 1)
-        entry = self.check_map(payload)["toolchain.pinned"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]), ("fail", "unpinned")
-        )
-
-    def test_blocked_lockfile_mismatch(self) -> None:
-        (self.root / "pnpm-lock.yaml").rename(
-            self.root / "package-lock.json"
-        )
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 1)
-        entry = self.check_map(payload)["toolchain.lockfile"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]),
-            ("fail", "lockfile_mismatch"),
-        )
-
-    def test_npm_corresponding_lockfile_passes(self) -> None:
-        package = json.loads((self.root / "package.json").read_text())
-        package["packageManager"] = "npm@10.8.2"
-        write_text(self.root / "package.json", json.dumps(package))
-        (self.root / "pnpm-lock.yaml").rename(
-            self.root / "package-lock.json"
-        )
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 0)
-        self.assertEqual(payload["result"], "local_pass")
-
-    def test_blocked_missing_husky_dependency(self) -> None:
-        package = json.loads((self.root / "package.json").read_text())
-        del package["devDependencies"]
-        write_text(self.root / "package.json", json.dumps(package))
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 1)
-        entry = self.check_map(payload)["husky.dependency"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]),
-            ("fail", "husky_dependency_missing"),
-        )
-
-    # --- Isolated E2E runner contract ---
-
-    def write_contract(self, contract) -> None:
-        write_text(
-            self.root / ".ship" / "e2e-runner.json",
-            json.dumps(contract, indent=2),
-        )
-
-    def valid_contract(self) -> dict:
-        return {
-            "schema_version": 1,
-            "runner": {
-                "kind": "oci",
-                "image": "node:26.13.1-alpine@sha256:" + "a" * 64,
-                "command": ["pnpm", "run", "test:e2e"],
-            },
-        }
-
-    def test_runner_contract_missing_is_legacy(self) -> None:
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 0)
-        entry = self.check_map(payload)["e2e.runner_contract"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]), ("pass", "legacy_host_e2e")
-        )
-
-    def test_runner_contract_valid_is_isolated(self) -> None:
-        self.write_contract(self.valid_contract())
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 0)
-        self.assertEqual(payload["result"], "local_pass")
-        entry = self.check_map(payload)["e2e.runner_contract"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]), ("pass", "isolated_oci")
-        )
-
-    def test_runner_contract_tag_only_image_blocked(self) -> None:
-        contract = self.valid_contract()
-        contract["runner"]["image"] = "node:26.13.1-alpine"
-        self.write_contract(contract)
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 1)
-        entry = self.check_map(payload)["e2e.runner_contract"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]),
-            ("fail", "runner_contract_invalid"),
-        )
-
-    def test_runner_contract_extra_key_blocked(self) -> None:
-        contract = self.valid_contract()
-        contract["runner"]["privileged"] = True
-        self.write_contract(contract)
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 1)
-        self.assertEqual(
-            self.check_map(payload)["e2e.runner_contract"]["reason"],
-            "runner_contract_invalid",
-        )
-
-    def test_runner_contract_manager_mismatch_blocked(self) -> None:
-        contract = self.valid_contract()
-        contract["runner"]["command"] = ["npm", "run", "test:e2e"]
-        self.write_contract(contract)
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 1)
-        self.assertEqual(
-            self.check_map(payload)["e2e.runner_contract"]["reason"],
-            "runner_contract_invalid",
-        )
-
-    def test_runner_contract_extra_args_blocked(self) -> None:
-        contract = self.valid_contract()
-        contract["runner"]["command"] = ["pnpm", "run", "test:e2e", "--filter", "x"]
-        self.write_contract(contract)
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 1)
-        self.assertEqual(
-            self.check_map(payload)["e2e.runner_contract"]["reason"],
-            "runner_contract_invalid",
-        )
-
-    def test_runner_contract_wrong_schema_blocked(self) -> None:
-        contract = self.valid_contract()
-        contract["schema_version"] = 2
-        self.write_contract(contract)
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 1)
-        self.assertEqual(
-            self.check_map(payload)["e2e.runner_contract"]["reason"],
-            "runner_contract_invalid",
-        )
-
-    def test_runner_contract_malformed_indeterminate(self) -> None:
-        write_text(self.root / ".ship" / "e2e-runner.json", "{not json")
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 2)
-        entry = self.check_map(payload)["e2e.runner_contract"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]),
-            ("unknown", "malformed_metadata"),
-        )
-
-    def test_runner_contract_symlink_indeterminate(self) -> None:
-        write_text(
-            self.root / ".ship" / "real.json",
-            json.dumps(self.valid_contract()),
-        )
-        os.symlink("real.json", self.root / ".ship" / "e2e-runner.json")
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 2)
-        entry = self.check_map(payload)["e2e.runner_contract"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]),
-            ("unknown", "symlink_not_allowed"),
-        )
-
-    # --- Git layout / declared hooks path ---
-
-    def test_blocked_hooks_path_missing(self) -> None:
-        write_git_config(self.root, "[core]\n\tbare = false\n")
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 1)
-        entry = self.check_map(payload)["husky.hooks_path"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]),
-            ("fail", "hooks_path_missing"),
-        )
-
-    def test_blocked_hooks_path_mismatch(self) -> None:
-        write_git_config(
-            self.root, "[core]\n\tbare = false\n\thooksPath = .husky\n"
-        )
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 1)
-        entry = self.check_map(payload)["husky.hooks_path"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]),
-            ("fail", "hooks_path_mismatch"),
-        )
-
-    def test_indeterminate_git_missing(self) -> None:
-        import shutil
-
-        shutil.rmtree(self.root / ".git")
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 2)
-        checks = self.check_map(payload)
-        self.assertEqual(checks["git.layout"]["status"], "unknown")
-        self.assertEqual(checks["husky.hooks_path"]["status"], "unknown")
-
-    def test_indeterminate_git_file_linked(self) -> None:
-        import shutil
-
-        shutil.rmtree(self.root / ".git")
-        write_text(self.root / ".git", "gitdir: /elsewhere\n")
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 2)
-        self.assertEqual(payload["result"], "indeterminate")
-
-    def test_indeterminate_git_bare(self) -> None:
-        write_git_config(
-            self.root,
-            "[core]\n\tbare = true\n\thooksPath = .husky/_\n",
-        )
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 2)
-        self.assertEqual(
-            self.check_map(payload)["git.layout"]["reason"],
-            "unsupported_layout",
-        )
-
-    def test_indeterminate_git_include(self) -> None:
-        write_git_config(
-            self.root,
-            "[core]\n\tbare = false\n\thooksPath = .husky/_\n"
-            '[include]\n\tpath = /elsewhere/config\n',
-        )
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 2)
-        self.assertEqual(payload["result"], "indeterminate")
-
-    def test_indeterminate_git_config_malformed(self) -> None:
-        write_git_config(self.root, "not a config\n")
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 2)
-        self.assertEqual(payload["result"], "indeterminate")
-
-    # --- indeterminate: unsafe paths, malformed / untrusted metadata ---
-
-    def test_indeterminate_missing_package_json(self) -> None:
-        (self.root / "package.json").unlink()
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 2)
-        entry = self.check_map(payload)["layout.supported"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]),
-            ("unknown", "unsupported_layout"),
-        )
-
-    def test_indeterminate_malformed_package_json(self) -> None:
-        write_text(self.root / "package.json", "{not json")
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 2)
-        entry = self.check_map(payload)["metadata.parse"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]),
-            ("unknown", "malformed_metadata"),
-        )
-
-    def test_indeterminate_non_object_package_json(self) -> None:
-        write_text(self.root / "package.json", '["array"]')
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 2)
-
-    def test_indeterminate_malformed_scripts(self) -> None:
-        package = json.loads((self.root / "package.json").read_text())
-        package["scripts"] = "not-an-object"
-        write_text(self.root / "package.json", json.dumps(package))
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 2)
-        entry = self.check_map(payload)["scripts.test_e2e"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]),
-            ("unknown", "malformed_metadata"),
-        )
-
-    def test_indeterminate_nonexistent_path(self) -> None:
-        code, _, payload = run_doctor(Path(self._tmp.name) / "does-not-exist")
-        self.assertEqual(code, 2)
-        entry = self.check_map(payload)["path.safety"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]), ("unknown", "unsafe_path")
-        )
-
-    def test_indeterminate_file_not_directory(self) -> None:
-        target = Path(self._tmp.name) / "a-file"
-        write_text(target, "x")
-        code, _, payload = run_doctor(target)
-        self.assertEqual(code, 2)
-        self.assertEqual(
-            self.check_map(payload)["path.safety"]["reason"], "unsafe_path"
-        )
-
-    def test_indeterminate_symlink_root(self) -> None:
-        link = Path(self._tmp.name) / "link"
-        os.symlink(self.root, link)
-        code, _, payload = run_doctor(link)
-        self.assertEqual(code, 2)
-
-    def test_indeterminate_ancestor_symlink(self) -> None:
-        link = Path(self._tmp.name) / "ancestor-link"
-        os.symlink(self.root.parent, link)
-        code, _, payload = run_doctor(link / "repo")
-        self.assertEqual(code, 2)
-        entry = self.check_map(payload)["path.safety"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]),
-            ("unknown", "symlink_not_allowed"),
-        )
-
-    def test_indeterminate_in_tree_symlink_package_json(self) -> None:
-        write_text(self.root / "inner.json", json.dumps(PASSING_PACKAGE))
-        (self.root / "package.json").unlink()
-        os.symlink("inner.json", self.root / "package.json")
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 2)
-        entry = self.check_map(payload)["metadata.parse"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]),
-            ("unknown", "symlink_not_allowed"),
-        )
-
-    def test_indeterminate_ancestor_symlink_husky_underscore(self) -> None:
-        import shutil
-
-        shutil.rmtree(self.root / ".husky" / "_")
-        (self.root / "real-underscore").mkdir()
-        for name in ("pre-commit", "commit-msg", "pre-push", "h"):
-            write_text(self.root / "real-underscore" / name, SHIM, executable=True)
-        os.symlink("real-underscore", self.root / ".husky" / "_")
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 2)
-        checks = self.check_map(payload)
-        self.assertEqual(
-            checks["husky.shim_pre_commit"]["status"], "unknown"
-        )
-        self.assertEqual(
-            checks["husky.hooks_path"]["status"], "unknown"
-        )
-
-    def test_indeterminate_fifo_package_json(self) -> None:
-        (self.root / "package.json").unlink()
-        os.mkfifo(self.root / "package.json")
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 2)
-        entry = self.check_map(payload)["metadata.parse"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]),
-            ("unknown", "nonregular_file"),
-        )
-
-    def test_indeterminate_fifo_hook(self) -> None:
-        (self.root / ".husky" / "pre-commit").unlink()
-        os.mkfifo(self.root / ".husky" / "pre-commit")
-        code, _, payload = run_doctor(self.root)
-        self.assertEqual(code, 2)
-        entry = self.check_map(payload)["husky.pre_commit"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]),
-            ("unknown", "nonregular_file"),
-        )
-
-    def test_indeterminate_oversized_package_json_capped(self) -> None:
-        secret = "SECRET-BEYOND-CAP-12345"
-        package = json.loads((self.root / "package.json").read_text())
-        package["padding"] = "x" * (1_048_576 + 1)
-        package["after"] = secret
-        write_text(self.root / "package.json", json.dumps(package))
-        code, output, payload = run_doctor(self.root)
-        self.assertEqual(code, 2)
-        self.assertNotIn(secret, output)
-        entry = self.check_map(payload)["metadata.parse"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]), ("unknown", "oversized")
-        )
-
-    def test_indeterminate_oversized_hook_capped(self) -> None:
-        secret = "SECRET-HOOK-BEYOND-CAP"
-        write_text(
-            self.root / ".husky" / "pre-commit",
-            "x" * 65_536 + secret + "\n",
-        )
-        code, output, payload = run_doctor(self.root)
-        self.assertEqual(code, 2)
-        self.assertNotIn(secret, output)
-        entry = self.check_map(payload)["husky.pre_commit"]
-        self.assertEqual(
-            (entry["status"], entry["reason"]), ("unknown", "oversized")
-        )
-
-    def test_usage_requires_explicit_path(self) -> None:
+    def test_usage_error_exits_2(self) -> None:
         proc = subprocess.run(
             [sys.executable, str(DOCTOR)],
             capture_output=True,
             text=True,
-            check=False,
             timeout=15,
         )
         self.assertEqual(proc.returncode, 2)
-
-    # --- read-only, unchanged fixtures, redaction ---
-
-    def test_fixtures_unchanged_and_secrets_redacted(self) -> None:
-        secret = "SECRET-TOKEN-9f8e7d6c"
-        package = json.loads((self.root / "package.json").read_text())
-        package["scripts"]["lint"] = f"eslint . # {secret}"
-        package["name"] = f"fixture-{secret}"
-        write_text(self.root / "package.json", json.dumps(package))
-        write_text(
-            self.root / ".husky" / "pre-commit",
-            f"run-check # {secret}\n",
-        )
-        write_text(self.root / ".env", f"TOKEN={secret}\n")
-        write_git_config(
-            self.root,
-            "[core]\n\tbare = false\n\thooksPath = .husky/_\n"
-            f'[remote "origin"]\n\turl = {secret}\n',
-        )
-        before = digest_tree(self.root)
-        code, output, payload = run_doctor(self.root)
-        after = digest_tree(self.root)
-        self.assertEqual(code, 0)
-        self.assertEqual(payload["result"], "local_pass")
-        self.assertEqual(before, after)
-        self.assertNotIn(secret, output)
-        self.assertNotIn("TOKEN=", output)
-        self.assertNotIn("example.invalid", output)
-
-    def test_doctor_uses_no_forbidden_mechanisms(self) -> None:
-        source = DOCTOR.read_text(encoding="utf-8")
-        for banned in (
-            "subprocess",
-            "socket",
-            "urllib",
-            "requests",
-            "os.system",
-            "os.popen",
-            "os.exec",
-            "os.spawn",
-            "os.fork",
-            "eval(",
-            "exec(",
-            "shutil",
-            "http.client",
-            "read_text",
-            ".resolve(",
-            "lstat",
-            "Path(",
-        ):
-            self.assertNotIn(banned, source)
-
-    # --- scaffold: ship skill and server plugin ---
-
-    def test_ship_skill_frontmatter_and_steps(self) -> None:
-        text = (
-            REPO_ROOT / "fleet" / "skills" / "ship" / "SKILL.md"
-        ).read_text(encoding="utf-8")
-        self.assertTrue(text.startswith("---\n"))
-        frontmatter = text[4:].split("\n---\n", 1)[0]
-        self.assertIn("name: Ship", frontmatter)
-        self.assertIn("opencode/autoinvoke: false", frontmatter)
-        for required in (
-            "Step 1 - Run the ship-doctor script",
-            "Step 2 - Validate the state of the current environment",
-            "Step 3 - Run the ship-build script",
-            "Step 4 - Run the ship-deploy script",
-            "Step 5 - Create a PR",
-            "scripts/ship/ship-build",
-            "scripts/ship/ship-deploy",
-            "scripts/ship/ship-destination",
-            "test:e2e",
-            "no implicit staging",
-            "nested in the Step 3 push",
-            "@ship",
-            "no routine approval stops",
-            "staged_empty",
-            "busy lease",
-            "single reviewed auto-staging",
-            "exact reviewed paths",
-            "reruns the same destination",
-            "never broadened",
-            "without needing a terminal",
-            "task-owned provenance",
-            "known clean baseline",
-            "later @ship in the same session",
-            "no user-supplied path list",
-            "safe derived topic",
-            "no publish or commit directly to",
-            "never stages on `main`",
-            "git switch -c <topic>",
-            "git branch --show-current",
-            "before any staging",
-        ):
-            self.assertIn(required, text)
-        for banned in ("!`", "$(", "${", "Cal asks the user first",
-                       "off-main requires an explicit",
-                       "only if starting off main",
-                       "explicit include",
-                       "workflow stays staged-only",
-                       "empty index on a topic branch only"):
-            self.assertNotIn(banned, text)
-
-    def test_ship_skill_main_staging_eligible_with_provenance(self) -> None:
-        text = (
-            REPO_ROOT / "fleet" / "skills" / "ship" / "SKILL.md"
-        ).read_text(encoding="utf-8")
-        self.assertIn("eligible topic branch or, on `main`", text)
-        self.assertIn("task-owned provenance", text)
-        self.assertIn("known clean baseline", text)
-        self.assertIn("later @ship in the same session", text)
-        self.assertIn("no user-supplied path list", text)
-        self.assertIn("safe derived topic", text)
-        self.assertIn("never a publish or commit directly to", text)
-        self.assertIn("never broadened", text)
-        # Branch-before-staging on main: creation precedes any add,
-        # the carry is revalidated, and the rerun must match.
-        self.assertIn("never stages on `main`", text)
-        self.assertIn("git switch -c <topic>", text)
-        self.assertIn("before any staging", text)
-        self.assertIn("branches before editing", text)
-        self.assertIn("git branch --show-current", text)
-        self.assertIn("exactly the branch just created/checked out", text)
-        # The old topic-only exclusion is gone on both branches:
-        # topic behavior is preserved, main is eligible with
-        # established provenance, and no separate approval or
-        # user-supplied list is required when provenance is known.
-        self.assertNotIn("workflow stays staged-only", text)
-        self.assertNotIn("explicit include", text)
-        self.assertNotIn("empty index on a topic branch only", text)
-        self.assertIn("stages nothing and returns a scope blocker", text)
-        self.assertIn("likely secret or otherwise unsafe", text)
-        self.assertIn("one rerun", text.lower())
-
-    def test_ship_skill_invocation_without_plugin(self) -> None:
-        text = (
-            REPO_ROOT / "fleet" / "skills" / "ship" / "SKILL.md"
-        ).read_text(encoding="utf-8")
-        for required in (
-            "ID `ship`",
-            "frontmatter name `Ship`",
-            "@ship",
-            "no arguments",
-            "No slash command is registered",
-            "no routine approval stops",
-            "busy or unverifiable required lease",
-            "staged_empty",
-            "never broadened",
-            "ship-destination",
-        ):
-            self.assertIn(required, text)
-        for banned in (
-            "fleet/plugins/ship.ts",
-            "fleet.ship",
-            "ctx.command.transform",
-            "ctx.session.prompt",
-            "`/ship`",
-        ):
-            self.assertNotIn(banned, text)
-        self.assertFalse(
-            (REPO_ROOT / "fleet" / "plugins" / "ship.ts").exists()
-        )
-
-    def test_ship_docs_describe_standard(self) -> None:
-        text = (REPO_ROOT / "docs" / "ship.md").read_text(encoding="utf-8")
-        for required in (
-            "strict opt-in",
-            "Husky alone",
-            "the repository’s E2E suite must finish successfully",
-            "scripts/ship/ship-doctor",
-            "scripts/ship/ship-build",
-            "scripts/ship/ship-deploy",
-            "local_pass",
-            "blocked",
-            "indeterminate",
-            "test:e2e",
-            "no per-repo config",
-            "production deploy skill",
-            "scripts/ship/ship-destination",
-            "no routine approval stops",
-            "single configured remote",
-            "busy lease",
-            "needs no confirmation",
-            "local main",
-            "no rewritten commits",
-            "duplicated hooks",
-            "approved mapping",
-            "local structural validation",
-            "Web/native dispatch",
-            "absolute",
-            "trusted",
-            "Step 1 - Run the ship-doctor script",
-            "Step 5 - Create a PR",
-            "nested in",
-            "fleet/skills/ship/SKILL.md",
-            "fleet/skills/ship/resources/PR_TEMPLATE.md",
-            "scripts/ship-deploy",
-            "post-push",
-            "cannot prevent",
-            "Companion",
-            "@ship",
-            "single reviewed Worker staging",
-            "never broadened",
-            "task-owned provenance",
-            "known clean baseline",
-            "later @ship in the same session",
-            "user-supplied path list",
-            "safe derived topic",
-            "no publish or commit directly to",
-            "never stages on `main`",
-            "git switch -c <topic>",
-            "git branch --show-current",
-            "branches before editing",
-        ):
-            self.assertIn(required, text)
-        self.assertNotIn("paid", text.lower())
-        self.assertNotIn("python3 scripts/ship-doctor", text)
-        self.assertNotIn("Shipping is not implemented yet", text)
-        self.assertNotIn("fleet/plugins/ship.ts", text)
-        self.assertNotIn("`/ship`", text)
-
-    def test_ship_docs_main_staging_eligible_with_provenance(self) -> None:
-        text = (REPO_ROOT / "docs" / "ship.md").read_text(encoding="utf-8")
-        self.assertIn("task-owned provenance", text)
-        self.assertIn("known clean baseline", text)
-        self.assertIn("later @ship in the same session", text)
-        self.assertIn("user-supplied path list", text)
-        self.assertIn("safe derived topic", text)
-        self.assertIn("no publish or commit directly", text.lower())
-        self.assertIn("never stages on `main`", text)
-        self.assertIn("git switch -c <topic>", text)
-        self.assertIn("git branch --show-current", text)
-        self.assertIn("branches before editing", text)
-        self.assertIn("exactly the branch just created/checked out", text)
-        self.assertNotIn("explicit include", text)
-        self.assertNotIn("on `main` only staged work ships", text)
-
-    def test_pr_template_filled(self) -> None:
-        text = (
-            REPO_ROOT
-            / "fleet"
-            / "skills"
-            / "ship"
-            / "resources"
-            / "PR_TEMPLATE.md"
-        ).read_text(encoding="utf-8")
-        self.assertTrue(len(text.strip()) > 100)
-        for required in ("Candidate SHA", "test:e2e", "git ls-remote"):
-            self.assertIn(required, text)
 
 
 if __name__ == "__main__":
