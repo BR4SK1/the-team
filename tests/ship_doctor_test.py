@@ -596,12 +596,56 @@ class ShipDoctorTest(unittest.TestCase):
             "reruns the same destination",
             "never broadened",
             "without needing a terminal",
+            "task-owned provenance",
+            "known clean baseline",
+            "later @ship in the same session",
+            "no user-supplied path list",
+            "safe derived topic",
+            "no publish or commit directly to",
+            "never stages on `main`",
+            "git switch -c <topic>",
+            "git branch --show-current",
+            "before any staging",
         ):
             self.assertIn(required, text)
         for banned in ("!`", "$(", "${", "Cal asks the user first",
                        "off-main requires an explicit",
-                       "only if starting off main"):
+                       "only if starting off main",
+                       "explicit include",
+                       "workflow stays staged-only",
+                       "empty index on a topic branch only"):
             self.assertNotIn(banned, text)
+
+    def test_ship_skill_main_staging_eligible_with_provenance(self) -> None:
+        text = (
+            REPO_ROOT / "fleet" / "skills" / "ship" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("eligible topic branch or, on `main`", text)
+        self.assertIn("task-owned provenance", text)
+        self.assertIn("known clean baseline", text)
+        self.assertIn("later @ship in the same session", text)
+        self.assertIn("no user-supplied path list", text)
+        self.assertIn("safe derived topic", text)
+        self.assertIn("never a publish or commit directly to", text)
+        self.assertIn("never broadened", text)
+        # Branch-before-staging on main: creation precedes any add,
+        # the carry is revalidated, and the rerun must match.
+        self.assertIn("never stages on `main`", text)
+        self.assertIn("git switch -c <topic>", text)
+        self.assertIn("before any staging", text)
+        self.assertIn("branches before editing", text)
+        self.assertIn("git branch --show-current", text)
+        self.assertIn("exactly the branch just created/checked out", text)
+        # The old topic-only exclusion is gone on both branches:
+        # topic behavior is preserved, main is eligible with
+        # established provenance, and no separate approval or
+        # user-supplied list is required when provenance is known.
+        self.assertNotIn("workflow stays staged-only", text)
+        self.assertNotIn("explicit include", text)
+        self.assertNotIn("empty index on a topic branch only", text)
+        self.assertIn("stages nothing and returns a scope blocker", text)
+        self.assertIn("likely secret or otherwise unsafe", text)
+        self.assertIn("one rerun", text.lower())
 
     def test_ship_skill_invocation_without_plugin(self) -> None:
         text = (
@@ -672,6 +716,16 @@ class ShipDoctorTest(unittest.TestCase):
             "@ship",
             "single reviewed Worker staging",
             "never broadened",
+            "task-owned provenance",
+            "known clean baseline",
+            "later @ship in the same session",
+            "user-supplied path list",
+            "safe derived topic",
+            "no publish or commit directly to",
+            "never stages on `main`",
+            "git switch -c <topic>",
+            "git branch --show-current",
+            "branches before editing",
         ):
             self.assertIn(required, text)
         self.assertNotIn("paid", text.lower())
@@ -679,6 +733,29 @@ class ShipDoctorTest(unittest.TestCase):
         self.assertNotIn("Shipping is not implemented yet", text)
         self.assertNotIn("fleet/plugins/ship.ts", text)
         self.assertNotIn("`/ship`", text)
+
+    def test_ship_docs_main_staging_eligible_with_provenance(self) -> None:
+        text = (REPO_ROOT / "docs" / "ship.md").read_text(encoding="utf-8")
+        self.assertIn("task-owned provenance", text)
+        self.assertIn("known clean baseline", text)
+        self.assertIn("later @ship in the same session", text)
+        self.assertIn("user-supplied path list", text)
+        self.assertIn("safe derived topic", text)
+        self.assertIn("no publish or commit directly", text.lower())
+        self.assertIn("never stages on `main`", text)
+        self.assertIn("git switch -c <topic>", text)
+        self.assertIn("git branch --show-current", text)
+        self.assertIn("branches before editing", text)
+        self.assertIn("exactly the branch just created/checked out", text)
+        self.assertNotIn("explicit include", text)
+        self.assertNotIn("on `main` only staged work ships", text)
+
+    def test_fleet_agents_ship_bound_branch_before_editing(self) -> None:
+        text = (REPO_ROOT / "fleet" / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn("ship-bound", text)
+        self.assertIn("docs/ship.md", text)
+        self.assertIn("never stage on `main`", text)
+        self.assertIn("scoped to ship-bound work only", text)
 
     def test_pr_template_filled(self) -> None:
         text = (

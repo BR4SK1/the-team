@@ -23,7 +23,12 @@ Usage:
   change (ship/<staged-path slug>, suffixed -2, -3, ... until free
   locally and in the selected remote's tracking refs). The remote is
   main's configured tracking remote when set, otherwise the single
-  configured remote.
+  configured remote. When the index is empty on main but work
+  exists (unstaged tracked plus non-ignored untracked), the helper
+  still resolves and emits that derived proposal (topic, remote,
+  GitHub identity, selection) in the blocked staged_empty payload,
+  so the caller can create the topic branch carrying the edits
+  before any staging; the branch is never selected implicitly.
 - A multiple-remote repository with no explicit, upstream, or
   main-tracking resolution is ambiguous and blocks. A selected remote
   that would divert or add refs (pushurl, mirror, tagOpt --tags),
@@ -197,13 +202,25 @@ def main(argv):
         [line for line in outgoing_text.splitlines() if line] if outgoing_text else []
     )
 
-    if not staged:
-        payload["reason"] = "staged_empty"
-        return emit(payload, 1)
-    if unstaged or untracked:
+    # Empty index: blocked, but on main with work to ship the
+    # blocked payload still carries a fully resolved topic proposal
+    # (derived from the unstaged plus untracked paths) so the caller
+    # can create/switch that branch before any staging and never
+    # stage on main. Off main and clean-empty cases stay plain
+    # staged_empty with no proposal.
+    staged_empty_case = not staged
+    if staged_empty_case:
+        if not payload["on_main"] or (not unstaged and not untracked):
+            payload["reason"] = "staged_empty"
+            return emit(payload, 1)
+    elif unstaged or untracked:
         payload["reason"] = "scope_unclean"
         return emit(payload, 1)
 
+    # --- Topic branch. For a staged_empty proposal on main the
+    # slug source is the candidate unstaged plus untracked work, in
+    # the same order the reviewer will stage (exact examined paths).
+    source_paths = staged if staged else sorted(set(unstaged + untracked))
     # --- Topic branch.
     if payload["on_main"]:
         if explicit_branch:
@@ -221,7 +238,7 @@ def main(argv):
                 return emit(payload, 1)
             selection_topic = "explicit"
         else:
-            base_topic = f"ship/{slug_from_path(sorted(staged)[0])}"
+            base_topic = f"ship/{slug_from_path(sorted(source_paths)[0])}"
             topic = base_topic
             suffix = 2
             while True:
@@ -320,7 +337,7 @@ def main(argv):
             if explicit_branch:
                 payload["reason"] = "explicit_branch_exists"
                 return emit(payload, 1)
-            base_topic = f"ship/{slug_from_path(sorted(staged)[0])}"
+            base_topic = f"ship/{slug_from_path(sorted(source_paths)[0])}"
             # Re-derive with tracking awareness (local loop above
             # already ensured local freedom for the current topic).
             suffix = 2
@@ -332,8 +349,8 @@ def main(argv):
                 topic = f"{base_topic}-{suffix}"
                 suffix += 1
 
-    payload["status"] = "selected"
-    payload["reason"] = "selected"
+    payload["status"] = "blocked" if staged_empty_case else "selected"
+    payload["reason"] = "staged_empty" if staged_empty_case else "selected"
     payload["remote"] = remote
     payload["topic"] = topic
     payload["ref"] = f"refs/heads/{topic}"
@@ -342,7 +359,12 @@ def main(argv):
     # No commit message is suggested here: the skill (Step 3) requires a
     # meaningful Conventional Commit crafted from the staged scope and
     # the repo Commitlint policy. The field stays null for schema
-    # stability, so no competing `ship:` hint is ever emitted.
+    # stability, so no competing `ship:` hint is ever emitted. A
+    # staged_empty proposal is not selection: the caller must still
+    # create the proposed topic before staging on main, then rerun
+    # to get a selected destination on the topic branch.
+    if staged_empty_case:
+        return emit(payload, 1)
     return emit(payload, 0)
 
 
