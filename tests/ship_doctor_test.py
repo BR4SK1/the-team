@@ -603,34 +603,34 @@ class ShipDoctorTest(unittest.TestCase):
                        "only if starting off main"):
             self.assertNotIn(banned, text)
 
-    def test_ship_plugin_registers_command_without_shell(self) -> None:
-        text = (REPO_ROOT / "fleet" / "plugins" / "ship.ts").read_text(
-            encoding="utf-8"
-        )
+    def test_ship_skill_invocation_without_plugin(self) -> None:
+        text = (
+            REPO_ROOT / "fleet" / "skills" / "ship" / "SKILL.md"
+        ).read_text(encoding="utf-8")
         for required in (
-            'name: "ship"',
-            "ctx.command.transform",
-            "ctx.session.prompt",
-            "ctx.session.synthetic",
-            "session.agent",
-            "fleet.ship",
-            "ship-destination",
+            "ID `ship`",
+            "frontmatter name `Ship`",
+            "@ship",
+            "no arguments",
+            "No slash command is registered",
             "no routine approval stops",
-            "staged_empty on an eligible topic branch",
+            "busy or unverifiable required lease",
+            "staged_empty",
             "never broadened",
+            "ship-destination",
         ):
             self.assertIn(required, text)
         for banned in (
-            "child_process",
-            "execSync",
-            "shell",
-            "subprocess",
-            "git push",
-            "git commit",
+            "fleet/plugins/ship.ts",
+            "fleet.ship",
+            "ctx.command.transform",
+            "ctx.session.prompt",
+            "`/ship`",
         ):
             self.assertNotIn(banned, text)
-        # Fixed prompt to Cal, rejects trailing args, wrong agent.
-        self.assertIn("ship", text.lower())
+        self.assertFalse(
+            (REPO_ROOT / "fleet" / "plugins" / "ship.ts").exists()
+        )
 
     def test_ship_docs_describe_standard(self) -> None:
         text = (REPO_ROOT / "docs" / "ship.md").read_text(encoding="utf-8")
@@ -660,12 +660,10 @@ class ShipDoctorTest(unittest.TestCase):
             "Web/native dispatch",
             "absolute",
             "trusted",
-            "/ship",
             "Step 1 - Run the ship-doctor script",
             "Step 5 - Create a PR",
             "nested in",
             "fleet/skills/ship/SKILL.md",
-            "fleet/plugins/ship.ts",
             "fleet/skills/ship/resources/PR_TEMPLATE.md",
             "scripts/ship-deploy",
             "post-push",
@@ -679,6 +677,8 @@ class ShipDoctorTest(unittest.TestCase):
         self.assertNotIn("paid", text.lower())
         self.assertNotIn("python3 scripts/ship-doctor", text)
         self.assertNotIn("Shipping is not implemented yet", text)
+        self.assertNotIn("fleet/plugins/ship.ts", text)
+        self.assertNotIn("`/ship`", text)
 
     def test_pr_template_filled(self) -> None:
         text = (

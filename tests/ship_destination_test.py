@@ -83,7 +83,10 @@ class ShipDestinationTest(unittest.TestCase):
         self.assertEqual(payload["ref"], "refs/heads/feat/topic")
         self.assertEqual(payload["github"], {"owner": "example", "repo": "fixture"})
         self.assertEqual(payload["selection"], "current_branch/single_remote")
-        self.assertEqual(payload["suggested_message"], "ship: topic")
+        # The helper suggests no commit message; the skill (Step 3)
+        # requires a meaningful Conventional Commit.
+        self.assertIsNone(payload["suggested_message"])
+        self.assertNotIn("ship:", json.dumps(payload))
         self.assertEqual(payload["staged_files"], ["file.txt"])
 
     def test_off_main_upstream_resolves_multiple_remotes(self):

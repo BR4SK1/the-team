@@ -220,18 +220,25 @@ for required in (
     "ambiguous_remote",
     "staged_empty",
     "never emits a raw remote URL",
+    "No commit message is suggested",
 ):
     if required not in ship_destination_source:
         raise ValueError(
             f"scripts/ship/ship-destination: missing required snippet {required!r}"
         )
+# The helper must never emit a `ship:` commit-message suggestion: the
+# skill (Step 3) owns the meaningful Conventional Commit.
+if 'f"ship:' in ship_destination_source:
+    raise ValueError(
+        "scripts/ship/ship-destination: must not emit a `ship:` "
+        "commit-message suggestion"
+    )
 
-# The /ship skill and server plugin replace the former prompt-only
-# Markdown command. V2 skill frontmatter cannot register a slash
-# command, so /ship is registered by the server plugin with a fixed
-# prompt to Cal. The plugin contains no shell or repository
-# operations, rejects trailing arguments before admission, and does
-# not switch agents.
+# The ship skill replaces the former prompt-only Markdown command.
+# V2 skill frontmatter cannot register a slash command, so the skill
+# is loaded explicitly by ID `ship` (for example `@ship` with no
+# arguments). The invocation rejects trailing arguments and does
+# not switch agents. No server plugin is tracked.
 ship_skill = Path("fleet/skills/ship/SKILL.md")
 ship_skill_text = ship_skill.read_text(encoding="utf-8")
 if not ship_skill_text.startswith("---\n") or "\n---\n" not in ship_skill_text[4:]:
@@ -268,6 +275,8 @@ for required in (
     "never broadened",
     "without needing a terminal",
     "explicit include",
+    "Conventional Commit",
+    "Commitlint",
 ):
     if required not in ship_skill_text:
         raise ValueError(f"{ship_skill}: missing required phrase {required!r}")
@@ -284,41 +293,22 @@ for banned in (
     "only if starting off main",
     "asks the user only if starting off main",
     "never inferred from configuration defaults",
+    "`/ship`",
 ):
     if banned in ship_skill_text:
         raise ValueError(f"{ship_skill}: prompt-only violation {banned!r}")
 
 ship_plugin = Path("fleet/plugins/ship.ts")
-ship_plugin_text = ship_plugin.read_text(encoding="utf-8")
-for required in (
-    'name: "ship"',
-    "ctx.command.transform",
-    "ctx.session.prompt",
-    "ctx.session.synthetic",
-    "session.agent",
-    "SHIP_PROMPT",
-    "no arguments",
-    "fleet.ship",
-    "ship-destination",
-    "no routine approval stops",
-    "busy or unverifiable required lease",
-    "staged_empty on an eligible topic branch",
-    "never broadened",
-):
-    if required not in ship_plugin_text:
-        raise ValueError(f"{ship_plugin}: missing required phrase {required!r}")
-for banned in (
-    "child_process",
-    "execSync",
-    "spawn",
-    "shell",
-    "subprocess",
-    "git push",
-    "git commit",
-    "fetch(",
-):
-    if banned in ship_plugin_text:
-        raise ValueError(f"{ship_plugin}: plugin must contain no shell/operations {banned!r}")
+if ship_plugin.exists():
+    raise ValueError(
+        "fleet/plugins/ship.ts must be removed; the ship skill is "
+        "invoked explicitly as @ship"
+    )
+for stale in ("fleet/plugins/ship.ts", "fleet.ship"):
+    if stale in ship_skill_text:
+        raise ValueError(
+            f"{ship_skill}: stale plugin reference {stale!r}"
+        )
 
 # Fleet ship scripts must stay small, explicit, and fail-closed:
 # ship-build commits staged only (the single reviewed Worker staging
@@ -353,7 +343,7 @@ for line in ship_build_text.splitlines():
 # The ship standard document must state the one strict opt-in
 # standard, Husky-alone gating, the exact E2E requirement, the
 # explicit branch/adoption/dispatch rules, and the implemented
-# script/skill/plugin surface.
+# script/skill surface.
 ship_doc = Path("docs/ship.md")
 ship_doc_text = ship_doc.read_text(encoding="utf-8")
 for required in (
@@ -386,12 +376,10 @@ for required in (
     "Web/native dispatch",
     "absolute",
     "trusted",
-    "/ship",
     "Step 1 - Run the ship-doctor script",
     "Step 5 - Create a PR",
     "nested in",
     "fleet/skills/ship/SKILL.md",
-    "fleet/plugins/ship.ts",
     "fleet/skills/ship/resources/PR_TEMPLATE.md",
     "scripts/ship-deploy",
     "post-push",
@@ -400,6 +388,8 @@ for required in (
     "@ship",
     "single reviewed Worker staging",
     "never broadened",
+    "Conventional Commit",
+    "Commitlint",
 ):
     if required not in ship_doc_text:
         raise ValueError(f"{ship_doc}: missing required phrase {required!r}")
@@ -414,6 +404,8 @@ for banned in (
     "only if starting off main",
     "off-main requires an explicit user ask",
     "asks the user only if starting off main",
+    "fleet/plugins/ship.ts",
+    "`/ship`",
 ):
     if banned in ship_doc_text:
         raise ValueError(f"{ship_doc}: removed confirmation requirement {banned!r}")
@@ -909,7 +901,6 @@ for marker in (
     "scripts/ship/check",
     "scripts/ship/ship-doctor",
     "fleet/skills/ship/SKILL.md",
-    "fleet/plugins/ship.ts",
 ):
     if marker not in readme_text:
         raise ValueError(f"README.md: missing configuration marker {marker!r}")
@@ -923,6 +914,7 @@ for banned in (
     "./scripts/install-hooks",
     "scripts/check`",
     "fleet/commands/ship.md",
+    "fleet/plugins/ship.ts",
 ):
     if banned in readme_text:
         raise ValueError(
@@ -948,7 +940,6 @@ for allowed in (
     "fleet/skills/new-skill/SKILL.md",
     "fleet/skills/ship/SKILL.md",
     "fleet/skills/ship/resources/PR_TEMPLATE.md",
-    "fleet/plugins/ship.ts",
 ):
     if is_ignored(allowed):
         raise ValueError(

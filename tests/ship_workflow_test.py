@@ -505,154 +505,27 @@ class ShipWorkflowTest(unittest.TestCase):
         proc = run([str(SHIP_DEPLOY)], cwd=work, input_text="")
         self.assertNotEqual(proc.returncode, 0)
 
-    def test_plugin_loads_in_isolated_standalone_without_inference(self) -> None:
-        # Isolated config: only the fleet plugin copy + minimal config.
-        # No live settings touched, no model call, no billed inference.
-        tmp = tempfile.mkdtemp(dir=self.base)
-        isolated = Path(tmp)
-        (isolated / "plugins").mkdir()
-        shutil.copy(FLEET_ROOT / "fleet" / "plugins" / "ship.ts",
-                    isolated / "plugins" / "ship.ts")
-        (isolated / "opencode.jsonc").write_text(
-            '{"$schema": "https://opencode.ai/config.json"}\n',
-            encoding="utf-8",
-        )
-        # Debug paths must report the isolated root (isolation proof).
-        proc = run(
-            ["opencode", "debug", "paths", "config"],
-            cwd=self.base,
-            timeout=20,
-        )
-        self.assertEqual(proc.returncode, 0, f"stderr={proc.stderr!r}")
-        # Standalone plugin discovery must not error on the fleet file.
-        env = dict(**__import__("os").environ)
-        env["OPENCODE_CONFIG_DIR"] = str(isolated)
-        proc2 = subprocess.run(
-            ["opencode", "--standalone", "api", "get", "/api/info"],
-            cwd=str(self.base), capture_output=True, text=True,
-            check=False, timeout=30, env=env,
-        )
-        self.assertEqual(proc2.returncode, 0, f"stderr={proc2.stderr!r}")
-        self.assertIn('"version"', proc2.stdout)
-
-    def test_plugin_rejection_strings(self) -> None:
-        text = (FLEET_ROOT / "fleet" / "plugins" / "ship.ts").read_text(
+    def test_ship_skill_invocation_without_plugin(self) -> None:
+        # Ship is invoked by loading the skill (ID `ship`) as `@ship`
+        # with no arguments; no plugin dispatch executes.
+        skill = (FLEET_ROOT / "fleet" / "skills" / "ship" / "SKILL.md").read_text(
             encoding="utf-8"
         )
-        # Trailing args rejected before admission (synthetic, no prompt).
-        self.assertIn("prompt.text.trim()", text)
-        self.assertIn("takes no arguments", text)
-        self.assertIn("ctx.session.synthetic", text)
-        # Wrong agent reported, not switched.
-        self.assertIn('session.agent !== "cal"', text)
-        self.assertIn("was not switched", text)
-
-    def test_plugin_dispatch_execution_without_inference(self) -> None:
-        # Execute the real plugin `execute` function (not substring
-        # matching) with a mocked plugin context: no OpenCode server, no
-        # model call, no billed inference. Covers rejected trailing
-        # input, rejected wrong agent, and the accepted fixed prompt.
-        harness = Path(self.base) / "plugin-harness"
-        (harness / "node_modules" / "@opencode" / "plugin").mkdir(parents=True)
-        (harness / "node_modules" / "@opencode" / "plugin" / "package.json").write_text(
-            '{"name":"@opencode/plugin","version":"0.0.0","type":"module",'
-            '"exports":{".":"./index.js"}}\n',
-            encoding="utf-8",
+        for required in (
+            "@ship",
+            "no arguments",
+            "by ID `ship`",
+            "No slash command is registered",
+            "no routine approval stops",
+            "ship-destination",
+            "never broadened",
+        ):
+            self.assertIn(required, skill)
+        self.assertNotIn("fleet/plugins/ship.ts", skill)
+        self.assertNotIn("`/ship`", skill)
+        self.assertFalse(
+            (FLEET_ROOT / "fleet" / "plugins" / "ship.ts").exists()
         )
-        (harness / "node_modules" / "@opencode" / "plugin" / "index.js").write_text(
-            "export const Plugin = { define: (def) => def };\n",
-            encoding="utf-8",
-        )
-        shutil.copy(
-            FLEET_ROOT / "fleet" / "plugins" / "ship.ts",
-            harness / "ship.ts",
-        )
-        (harness / "package.json").write_text('{"type":"module"}\n', encoding="utf-8")
-        (harness / "run.mjs").write_text(
-            'import shipPlugin from "./ship.ts";\n'
-            "async function invoke(agent, text) {\n"
-            "  let added = null; const calls = [];\n"
-            "  const ctx = {\n"
-            "    command: { list: async () => [], transform: async (fn) => fn({ add: (d) => { added = d; } }) },\n"
-            "    session: {\n"
-            "      get: async () => ({ agent }),\n"
-            "      synthetic: async (a) => calls.push(['synthetic', a.text]),\n"
-            "      prompt: async (a) => calls.push(['prompt', a.text]),\n"
-            "    },\n"
-            "  };\n"
-            "  await shipPlugin.setup(ctx);\n"
-            "  await added.execute({ sessionID: 'ses_test', prompt: { text }, delivery: 'sync' });\n"
-            "  return calls;\n"
-            "}\n"
-            "console.log(JSON.stringify({\n"
-            "  trailing: await invoke('cal', ' extra'),\n"
-            "  wrong: await invoke('worker', ''),\n"
-            "  accepted: await invoke('cal', ''),\n"
-            "  unset: await invoke(undefined, ''),\n"
-            "}));\n",
-            encoding="utf-8",
-        )
-        proc = run(["node", "run.mjs"], cwd=harness, timeout=30)
-        self.assertEqual(proc.returncode, 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}")
-        outcome = json.loads(proc.stdout.strip().splitlines()[-1])
-        self.assertEqual(outcome["trailing"][0][0], "synthetic")
-        self.assertIn("takes no arguments", outcome["trailing"][0][1])
-        self.assertEqual(outcome["wrong"][0][0], "synthetic")
-        self.assertIn("was not switched", outcome["wrong"][0][1])
-        self.assertEqual(outcome["accepted"][0][0], "prompt")
-        self.assertIn("Load the ship skill by ID ship", outcome["accepted"][0][1])
-        self.assertIn("You are Cal", outcome["accepted"][0][1])
-        # The fixed prompt carries the same no-routine-approval contract
-        # as the skill, including autonomous destination selection.
-        self.assertIn("no routine approval stops", outcome["accepted"][0][1])
-        self.assertIn("ship-destination", outcome["accepted"][0][1])
-        # The prompt carries the single reviewed auto-staging: empty
-        # index on a topic branch stages reviewed paths, then reruns.
-        self.assertIn("staged_empty on an eligible topic branch",
-                      outcome["accepted"][0][1])
-        self.assertIn("never broadened", outcome["accepted"][0][1])
-        # An unset session agent is not Cal (Session.Info.agent is
-        # optional and may be absent on a fresh session).
-        self.assertEqual(outcome["unset"][0][0], "synthetic")
-
-    def test_session_info_agent_shape_without_inference(self) -> None:
-        # The session API shape the plugin relies on (Session.Info.agent
-        # is optional; a fresh session carries no provider cost) without
-        # sending any prompt, so without billed inference.
-        tmp = tempfile.mkdtemp(dir=self.base)
-        isolated = Path(tmp)
-        (isolated / "plugins").mkdir()
-        shutil.copy(FLEET_ROOT / "fleet" / "plugins" / "ship.ts",
-                    isolated / "plugins" / "ship.ts")
-        (isolated / "opencode.jsonc").write_text(
-            '{"$schema": "https://opencode.ai/config.json"}\n',
-            encoding="utf-8",
-        )
-        env = dict(**__import__("os").environ)
-        env["OPENCODE_CONFIG_DIR"] = str(isolated)
-        created = subprocess.run(
-            ["opencode", "--standalone", "api", "post", "/api/session",
-             "--data", '{"title":"ship-shape-probe"}'],
-            cwd=str(self.base), capture_output=True, text=True,
-            check=False, timeout=30, env=env,
-        )
-        self.assertEqual(created.returncode, 0, f"stderr={created.stderr!r}")
-        session_id = json.loads(created.stdout)["data"]["id"]
-        self.assertTrue(session_id.startswith("ses_"))
-        fetched = subprocess.run(
-            ["opencode", "--standalone", "api", "get", f"/api/session/{session_id}"],
-            cwd=str(self.base), capture_output=True, text=True,
-            check=False, timeout=30, env=env,
-        )
-        self.assertEqual(fetched.returncode, 0, f"stderr={fetched.stderr!r}")
-        info = json.loads(fetched.stdout)["data"]
-        self.assertEqual(info["id"], session_id)
-        self.assertEqual(info["location"]["directory"], str(self.base))
-        self.assertEqual(info["cost"], 0)
-        # Agent identity is an optional Session.Info field; when present
-        # it must be a string ID.
-        if "agent" in info:
-            self.assertIsInstance(info["agent"], str)
 
 
 if __name__ == "__main__":

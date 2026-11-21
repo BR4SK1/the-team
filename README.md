@@ -10,15 +10,13 @@ workflows, including modular CAD modeling and verification.
 global config directory itself: when the service launch environment sets
 `OPENCODE_CONFIG_DIR` to the absolute `fleet/` path, OpenCode loads
 `fleet/opencode.jsonc` as its global config and discovers
-`fleet/AGENTS.md`, `fleet/agents/`, `fleet/skills/`, and
-`fleet/plugins/` directly from there, with no installer, generator, or
-second config.
+`fleet/AGENTS.md`, `fleet/agents/`, and `fleet/skills/` directly from
+there, with no installer, generator, or second config.
 
 ```text
 fleet/              # OpenCode global config root (OPENCODE_CONFIG_DIR)
 ├── agents/         # Markdown agent definitions
 ├── skills/         # Skill folders, each with a SKILL.md
-├── plugins/        # Server plugins (registers /ship)
 ├── AGENTS.md       # Shared fleet-wide instructions (global file)
 └── opencode.jsonc  # Complete tracked global OpenCode config (only config)
 examples/           # Device-settings example only (fake values)
@@ -35,8 +33,8 @@ Requirements: OpenCode V2 and Python 3 / Bash / ShellCheck for checks.
 read/write tests, in the tagged v2.2.6 source (the global paths layer
 overrides its config directory from this variable, and the instruction
 plugin resolves `AGENTS.md` as `<config>/AGENTS.md`), and in an
-isolated fake-root discovery check (fleet agents, commands including
-`/ship`, and skills from the fake config root appear after location
+isolated fake-root discovery check (fleet agents, commands, and
+skills from the fake config root appear after location
 boot and a session; an immediate one-shot query before activation can
 show only built-ins). It is not documented in the V2 docs. Recheck it
 on upgrade: `opencode debug paths config` in the service environment
@@ -147,8 +145,8 @@ file. Never commit a competing `.json`.
 files live on disk under `fleet/` when it is the config root, but
 `.gitignore` denies everything under `fleet/` by default and allows
 only `opencode.jsonc`, `AGENTS.md`, `agents/*.md`,
-`skills/*/SKILL.md`, `skills/ship/resources/PR_TEMPLATE.md`, and
-`plugins/ship.ts`. Do not stage, print, or read the contents
+`skills/*/SKILL.md`, and `skills/ship/resources/PR_TEMPLATE.md`.
+Do not stage, print, or read the contents
 of `service.json`/auth files; inspect only their names via Git
 status. Because `fleet/` is both the checkout and the live config
 root, review the native Git diff and status before every commit and
@@ -188,7 +186,7 @@ commands, and skills are watched as `{agents,command,commands,skill,
 skills}` definition directories under each config entry and reloaded
 on change (emitting `agent.updated` / `command.updated` /
 `skill.updated` / `config.updated`). Discovery itself is verified in
-the isolated check above (fleet agents, `/ship`, and skills appear
+the isolated check above (fleet agents and skills appear
 after location boot and a session; an immediate one-shot query
 before activation can show only built-ins). Hot reload of MCP
 servers and live verification of every definition type on save were
@@ -244,15 +242,13 @@ to use `.githooks`; the retained pre-commit hook runs checks only via
 The one strict opt-in ship standard, the read-only
 `scripts/ship/ship-doctor` diagnostic (versioned JSON; exit `0` local
 pass, `1` blocked, `2` indeterminate), the fleet skill
-`fleet/skills/ship/SKILL.md`, the `/ship` server plugin
-(`fleet/plugins/ship.ts`), and the workflow scripts
+`fleet/skills/ship/SKILL.md`, and the workflow scripts
 (`scripts/ship/ship-build`, `scripts/ship/ship-deploy`) are documented
 in [docs/ship.md](docs/ship.md). Run the doctor only against an
 explicit repository path; it inspects bounded allowlisted local
 metadata and never writes, executes target code, or uses the network.
-The plugin registers `/ship` with a fixed prompt to Cal that loads
-the ship skill by ID; a web user without native command dispatch
-loads it explicitly as `@ship` with no arguments.
+The ship skill is loaded explicitly by ID `ship` (for example `@ship`
+with no arguments), which loads the fixed Cal-owned workflow.
 
 ## Starter agents
 
@@ -571,8 +567,10 @@ device owner directs, and never commit them.
   alongside a skill need an explicit `.gitignore` exception (the
   fleet ignore is deny-by-default).
 - Add slash commands via a server plugin under `fleet/plugins/`
-  (see `fleet/plugins/ship.ts`); the Markdown `fleet/commands/`
-  directory is intentionally removed.
+  (create the directory and an explicit ignore exception if needed);
+  the Markdown `fleet/commands/` directory is intentionally removed.
+  The ship skill is invoked explicitly as `@ship`; no slash command
+  is currently registered.
 - Put reusable team conventions in `fleet/AGENTS.md`.
 - Add configuration structure and policy to `fleet/opencode.jsonc`;
   host-only values stay in the private service environment as

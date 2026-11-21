@@ -4,10 +4,11 @@ Ship a staged change through Husky commit and push gates, a nested
 non-prod deploy and E2E run, then an open GitHub PR for review. Cal
 owns authority and user decisions; Worker runs only the fleet scripts
 below. The skill is `fleet/skills/ship/SKILL.md` (ID `ship`, frontmatter
-name `Ship`, `opencode/autoinvoke: false`), the `/ship` slash command
-is registered by the server plugin `fleet/plugins/ship.ts`, and the PR
-body template is `fleet/skills/ship/resources/PR_TEMPLATE.md`. Keep
-`scripts/ship/` together.
+name `Ship`, `opencode/autoinvoke: false`), invoked explicitly as
+`@ship` with no arguments (or via the skill tool by ID `ship`); no
+plugin is registered. The PR body template is
+`fleet/skills/ship/resources/PR_TEMPLATE.md`. Keep `scripts/ship/`
+together.
 
 ## What exists
 
@@ -32,30 +33,28 @@ body template is `fleet/skills/ship/resources/PR_TEMPLATE.md`. Keep
 - `scripts/ship/check` — relocated check runner (former
   `scripts/check`), wired from the still-active `.githooks/pre-commit`
   hook. Run it with `./scripts/ship/check`.
-- `/ship` via `fleet/plugins/ship.ts` — registers a fixed prompt to
-  Cal that loads the skill by ID. V2 skill frontmatter cannot
-  register a slash command. The plugin performs no shell or
-  repository operations, rejects trailing arguments before admission
-  (no prompt is admitted), and does not switch agents: on a non-Cal
-  session it reports the wrong agent instead. It replaces the deleted
-  Markdown command because trailing input in a Markdown or JSON
-  command template would be expanded by shell interpolation outside
-  the agent permission flow. Title matching and ID `ship` guard the
-  registration; a pre-existing `ship` command is left in place.
+- Ship skill invocation (`fleet/skills/ship/SKILL.md`) — loaded
+  explicitly by ID `ship` (for example `@ship` with no arguments).
+  V2 skill frontmatter cannot register a slash command, so no plugin
+  or Markdown command template registers the ship command; trailing
+  input in such a template would be expanded by shell interpolation
+  outside the agent permission flow. The invocation rejects trailing
+  arguments and does not switch agents: on a non-Cal session it
+  reports the wrong agent instead. No plugin file is tracked.
 - This document and `tests/ship_doctor_test.py`,
   `tests/ship_workflow_test.py`,
   `tests/ship_destination_test.py` — the one strict opt-in standard
   and the realistic Git fixtures that prove the boundary.
 
 When the service launch environment points `OPENCODE_CONFIG_DIR` at
-`fleet/` (see README Native setup), the skill and the plugin are
-discovered from the fleet root. The web client does not perform
-native command dispatch for this fleet; a web user loads the skill
-explicitly as `@ship` with no arguments, under the same rules and the
-same authorization contract: the invocation authorizes the routine
-workflow (staged-only, plus the single reviewed auto-staging in Step
-2 that fills an empty index on a topic branch) through deploy, E2E,
-push, and PR creation, with no routine approval stops.
+`fleet/` (see README Native setup), the skill is discovered from the
+fleet root. A user loads the skill explicitly as `@ship` with no
+arguments (or via the skill tool by ID `ship`), under the same rules
+and the same authorization contract: the invocation authorizes the
+routine workflow (staged-only, plus the single reviewed
+auto-staging in Step 2 that fills an empty index on a topic branch)
+through deploy, E2E, push, and PR creation, with no routine
+approval stops.
 
 ## Five steps
 
@@ -250,7 +249,7 @@ configured tracking remote when set, otherwise the single configured
 remote. Multiple remotes with no such resolution, a mismatched
 upstream, a diverting or ref-adding remote, or a remote URL that does
 not parse to one GitHub owner and repository blocks with a specific
-reason code. A normal `/ship` authorizes this routine derivation with
+reason code. A normal ship invocation authorizes this routine derivation with
 no routine approval stops: an ordinary eligible off-main topic branch
 needs no confirmation, and no routine git-derived value is demanded
 from the user. Staged scope and
@@ -286,7 +285,12 @@ Worker runs with the Step 2 helper values:
 ```
 
 All of remote, ref, and message are required and explicit at the
-script boundary; there are no defaults. The script, in order:
+script boundary; there are no defaults. Worker crafts a meaningful
+Conventional Commit message from the staged scope and the repository's
+Commitlint policy (for example `feat: add Companion config manager`)
+and passes it as `--message`; `ship:` is never a valid ship type and
+the destination helper suggests no commit message (Step 3 in the
+skill). The script, in order:
 
 1. Requires the doctor's `local_pass` (Step 1) and the executable
    opt-in (`scripts/ship-deploy`, a regular file, not a symlink).
@@ -520,12 +524,11 @@ succeeds. Production deployment stays separate (see below).
 Dispatching work to a browser or a native client (Web/native
 dispatch), and the permissions that allow it, are a separate
 capability with its own explicit authorization and permission review.
-A local pass is never reported as dispatch readiness. For `/ship`
-itself, a web user types `@ship` with no arguments to load the skill
-when the custom client does not dispatch the native command; the
-agent then follows the fixed Cal-owned workflow above under the same
-authorization contract as `/ship` (routine staged scope, including the
-single reviewed auto-staging, with no routine approval stops).
+A local pass is never reported as dispatch readiness. To ship, a user
+types `@ship` with no arguments to load the skill; the agent then
+follows the fixed Cal-owned workflow above under the same
+authorization contract (routine staged scope, including the single
+reviewed auto-staging, with no routine approval stops).
 
 ## Production deployment stays separate
 
@@ -544,8 +547,8 @@ test suite (`tests/ship_doctor_test.py`, `tests/ship_workflow_test.py`,
 `tests/ship_destination_test.py`),
 validates the fleet JSON/JSONC configuration and ignore allowlist,
 and checks this document, the skill
-(`fleet/skills/ship/SKILL.md`), the plugin (`fleet/plugins/ship.ts`),
-and the PR template against the standard described here. The skill
+(`fleet/skills/ship/SKILL.md`), and the PR template against the
+standard described here. The skill
 contains no OpenCode shell interpolation marker (the
 exclamation-and-backtick marker), no other interpolation, and no
 repository-relative doctor execution. Run it with
@@ -558,5 +561,4 @@ fixture upload; and the live Step 5 orchestration that creates a real
 GitHub pull request against a live remote is not covered by a fixture
 (a faked pull request object is never substituted for that live
 claim), while the duplicate-safe identity checks and the pull request
-head versus remote-ref distinction are exercised by the debilled
-plugin dispatch tests and the Git fixtures.
+head versus remote-ref distinction are exercised by the Git fixtures.

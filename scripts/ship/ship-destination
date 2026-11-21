@@ -2,7 +2,7 @@
 """Read-only ship destination selection (Step 2 helper).
 
 Resolves the ship destination (remote, topic branch, ref, GitHub
-identity, suggested commit message) from verified repository state
+identity) from verified repository state
 only, so Worker never has to guess or ask the user for a routine
 git-derived value. The /ship invocation itself authorizes the routine
 staged-only workflow; this helper only decides whether a destination
@@ -339,8 +339,10 @@ def main(argv):
     payload["ref"] = f"refs/heads/{topic}"
     payload["github"] = github
     payload["selection"] = f"{selection_topic}/{selection}"
-    topic_slug = slugify(Path(topic).name) or "change"
-    payload["suggested_message"] = f"ship: {topic_slug}"
+    # No commit message is suggested here: the skill (Step 3) requires a
+    # meaningful Conventional Commit crafted from the staged scope and
+    # the repo Commitlint policy. The field stays null for schema
+    # stability, so no competing `ship:` hint is ever emitted.
     return emit(payload, 0)
 
 

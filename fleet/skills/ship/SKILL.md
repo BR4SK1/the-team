@@ -13,21 +13,18 @@ conforming exactly to the one strict opt-in standard in `docs/ship.md`.
 A repository that cannot meet the standard is blocked, never
 accommodated with a per-repository adapter, fallback, or alternate gate.
 
-Invocation is `/ship` with no trailing arguments. The fleet server plugin
-registers `/ship` and submits a fixed prompt to Cal that loads this skill
-(ID `ship`, frontmatter name `Ship`) by ID. The plugin performs no shell
-or repository operations, rejects any trailing argument before admission,
-and does not switch agents: when the session agent is not Cal it reports
-the wrong agent instead of switching. A Markdown or JSON command template
-is not used, because its trailing input would be expanded by shell
-interpolation outside the agent permission flow. If a custom web client
-does not perform native command dispatch, the user loads this skill
-explicitly by naming it in the prompt text (for example `@ship` with no
-arguments); the same no-argument rule and the same authorization contract
-below then apply on that path too. No web client code is changed by this
-skill.
+Invocation is loading this skill by ID `ship` (frontmatter name `Ship`)
+with no trailing arguments — explicitly as `@ship` with no arguments, or
+via the skill tool with the same ID. No slash command is registered and
+no plugin performs the invocation; the former plugin is removed. The
+invocation itself performs no shell or repository operations, rejects
+any trailing argument, and does not switch agents: when the session
+agent is not Cal it reports the wrong agent instead of switching. A
+Markdown or JSON command template is not used, because its trailing
+input would be expanded by shell interpolation outside the agent
+permission flow. No web client code is changed by this skill.
 
-A normal `/ship` invocation (or explicit `@ship` with no arguments)
+A normal ship invocation (explicit `@ship` with no arguments)
 itself authorizes the routine workflow through non-production
 deploy, the full E2E suite, push, and opening a pull request: the
 staged-only workflow, plus the single reviewed auto-staging in Step 2
@@ -133,7 +130,8 @@ the workflow stops before any mutation and reports the specific
 reason code, except for the single handled `staged_empty` case
 below. On `selected`, Worker returns the full decision to Cal:
 remote, topic, ref, GitHub owner and repository, staged files,
-outgoing commits, suggested commit message, and selection path.
+outgoing commits, and selection path. The helper suggests no commit
+message; Step 3 crafts it.
 The destination is used only when it is verified and unambiguous,
 by this order:
 
@@ -225,7 +223,7 @@ above, unless the user already gave a clear explicit include
 authorization naming the exact worktree paths to include; only then
 may Worker inspect and exact-path stage just those named paths
 through the same steps, followed by one rerun. No standing
-auto-staging on `main` is inferred from `/ship` alone.
+auto-staging on `main` is inferred from the ship invocation alone.
 
 When the index is already non-empty, Worker preserves that staged
 scope exactly and never broadens it: Worker stages no additional
@@ -273,9 +271,14 @@ Validation also requires:
 
 ## Step 3 - Run the ship-build script
 
-Worker runs with the Step 2 helper values (remote, ref, branch when
-on `main`, and the helper's suggested commit message), so no routine
-git-derived value is demanded from the user. On the auto-staging
+Before invoking ship-build, Worker crafts a meaningful Conventional Commit
+message from the staged scope and the repository's Commitlint policy
+(for example `feat: add Companion config manager`) and passes it as
+`--message`. The message must describe the staged change and use a
+type the Commitlint policy accepts — never `ship:`, never a mechanical
+topic slug or placeholder. Worker runs with the Step 2 helper values
+(remote, ref, branch when on `main`), so no routine git-derived value is
+demanded from the user. On the auto-staging
 path these are the rerun helper values (the reviewed newly staged
 set), not the first `staged_empty` output:
 
