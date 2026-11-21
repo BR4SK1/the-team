@@ -15,19 +15,15 @@ accommodated with a per-repository adapter, fallback, or alternate gate.
 
 Invocation is loading this skill by ID `ship` (frontmatter name `Ship`)
 with no trailing arguments — explicitly as `@ship` with no arguments, or
-via the skill tool with the same ID — or, for recovery only, loading it
-after the user explicitly states `resume` with a full 40-hex candidate
-SHA (the explicit `@ship resume <SHA>` form, where SHA is that full
-hex value). No slash command is registered and
+via the skill tool with the same ID. No slash command is registered and
 no plugin performs the invocation; the former plugin is removed. The
 invocation itself performs no shell or repository operations, rejects
-any trailing argument beyond those two documented forms, and does not
-switch agents: when the session
-agent is not Cal it reports the wrong agent instead of switching. The
-resume SHA is never shell-interpolated from the invocation; Cal copies
-the exact full hex value from the user's explicit statement into the
-documented script arguments below, and the scripts validate its shape
-before use. A
+any trailing argument, and does not switch agents: when the session
+agent is not Cal it reports the wrong agent instead of switching.
+Recovering a retained candidate is automatic inside this one ordinary
+invocation: there is no second skill, no new command, and no SHA for
+the user to supply — the workflow discovers the candidate SHA from
+HEAD internally (see the retained-candidate section below). A
 Markdown or JSON command template is not used, because its trailing
 input would be expanded by shell interpolation outside the agent
 permission flow. No web client code is changed by this skill.
@@ -41,12 +37,13 @@ on an eligible task-owned change with established task-owned
 provenance after branching to the helper-proposed topic before any
 staging, so the user never stages by hand or in a terminal and no
 staging is ever done on `main`.
-An explicit resume invocation (explicit `@ship resume <SHA>` with the
-full 40-hex SHA the user named) itself authorizes the routine resume
-workflow below through the same non-production deploy, full E2E
-suite, push, and pull request creation, under the same
-no routine approval stops contract, but only for that one named SHA
-and only when the resume gates below pass.
+The same ordinary invocation also authorizes the automatic
+retained-candidate recovery below: when the Step 2 helper selects a
+proven retained candidate, Worker resumes that discovered candidate
+through the same non-production deploy, full E2E suite, push, and
+pull request creation, under the same
+no routine approval stops contract, and only when the resume gates
+pass. Nothing extra is asked of the user.
 There are no routine approval stops: neither Cal nor Worker pauses
 to ask the user for a routine git-derived value (remote, branch,
 ref, commit message) or to reconfirm a routine staged scope,
@@ -60,10 +57,10 @@ a blocked or indeterminate destination (other than the handled
 where task-owned provenance cannot be established), an unclean
 staged scope, mixed or ambiguous work, a likely secret or unsafe
 file, a scope surprise, a repository policy or authority limit, a
-busy or unverifiable required lease, a failed gate, a resume
-mismatch (wrong SHA, branch, remote, or dirty checkout), ambiguous
-prior evidence, an already-advanced remote ref, a prior rollout that
-already succeeded, or a tool
+busy or unverifiable required lease, a failed gate, a
+retained-candidate mismatch (moved HEAD, branch, remote, or dirty
+checkout), ambiguous prior evidence, an already-advanced remote ref,
+a prior rollout that already succeeded, or a tool
 denial. Those stops are blockers, never prompts to guess a value
 or to proceed anyway.
 
@@ -153,7 +150,12 @@ helper, the trusted absolute fleet installation only:
 
 Cal passes `--remote` or `--branch` only when the user already named
 that value in explicit prior instructions; otherwise Worker omits both
-and the helper derives the destination. The helper inspects the
+and the helper derives the destination. The helper also performs the
+read-only retained-candidate detection described below: with no
+user-supplied SHA, a clean empty index on a topic branch whose HEAD
+is a proven prior ship candidate is selected automatically (the
+candidate SHA is discovered from HEAD internally), while any other
+clean empty index stays `staged_empty`. The helper inspects the
 configured GitHub remote identity and current branch with read-only Git
 invocations only (`git --no-optional-locks`), never writes, never
 fetches, and prints versioned JSON (`selected` or `blocked`, exit `0`
@@ -162,7 +164,9 @@ the workflow stops before any mutation and reports the specific
 reason code, except for the single handled `staged_empty` case
 below. On `selected`, Worker returns the full decision to Cal:
 remote, topic, ref, GitHub owner and repository, staged files,
-outgoing commits, and selection path. The helper suggests no commit
+outgoing commits, and selection path. A `candidate_resume`
+selection additionally carries the discovered candidate SHA, which
+Step 3 resumes instead of committing. The helper suggests no commit
 message; Step 3 crafts it.
 The destination is used only when it is verified and unambiguous,
 by this order:
@@ -384,7 +388,12 @@ Validation also requires:
 
 ## Step 3 - Run the ship-build script
 
-Before invoking ship-build, Worker crafts a meaningful Conventional Commit
+When the Step 2 decision is a retained-candidate selection
+(`candidate_resume`), Worker does not run ship-build and creates no
+commit; it resumes the discovered candidate with the resume script
+in the retained-candidate section below, using the candidate SHA
+from the decision and no routine reconfirmation. Otherwise, before
+invoking ship-build, Worker crafts a meaningful Conventional Commit
 message from the staged scope and the repository's Commitlint policy
 (for example `feat: add Companion config manager`) and passes it as
 `--message`. The message must describe the staged change and use a
@@ -496,7 +505,8 @@ operations named below. There is no merge in this step.
    candidate SHA, run identity, and verified remote ref have been
    copied into the PR draft. Worker removes only the single owned
    per-run directory under `.git` for this run (the run directory named
-   by `ship-build` output). Worker verifies that the path is the
+   by `ship-build` output, or by `ship-resume` output on the
+   retained-candidate path). Worker verifies that the path is the
    expected run directory, is a directory, and is not a symlink, then
    removes that one directory only. Worker never removes broad paths,
    other runs, or any other owner's data. Before opening the PR,
@@ -516,7 +526,7 @@ operations named below. There is no merge in this step.
    own head SHA equals the exact tested candidate SHA from the commit
    and deploy evidence, and its URL is present. The pull request head
    SHA (the PR object's own head) and the remote ref SHA (from
-   `git ls-remote` in Step 3) are verified separately and must agree
+   `git ls-remote` in Step 3 or the resume step) are verified separately and must agree
    with the candidate; they are never conflated into one check. When a
    query result is ambiguous, query again before any retry; never guess.
 6. Return clean to local `main`, leaving the topic branch intact.
@@ -528,73 +538,75 @@ operations named below. There is no merge in this step.
    clean, Worker does not switch and the block is returned to Cal. The
    topic branch is not deleted.
 
-## Resume an existing candidate
+## Retained candidate (automatic recovery)
 
-A plain `@ship` rerun after a failed push stops at `staged_empty`
-when the candidate commit is already committed and the index is
-empty. It never pushes HEAD on its own. Recovery is the explicit
-`@ship resume <SHA>` form only: the user names the full 40-hex
-candidate SHA retained locally by the failed attempt, and Worker runs
-the resume scripts below for exactly that SHA. No second commit is
-ever created, staged, amended, or rebased; there is no new commit,
-no checkout of the target branch, no bypass flag, and no force.
+A failed push can leave the candidate commit retained locally on the
+topic branch with the destination branch still absent. The ordinary
+`@ship` with no arguments recovers it automatically: nobody names a
+SHA, there is no second skill and no new command. In Step 2 the
+read-only destination helper discovers the retained candidate from
+HEAD internally and selects it only when the checkout is clean on a
+non-`main` topic branch, HEAD is the exact candidate, and exactly one
+trustworthy prior commit receipt matches the run, branch, parent, and
+tree and names the selected remote and ref. A clean HEAD with no
+such receipt stays `staged_empty` and is never pushed; the ordinary
+staged and unstaged flow is unchanged. Recovery creates no second
+commit, stages nothing, amends or rebases nothing, checks out no
+branch, uses no bypass flag and no force; there is no new commit,
+and the full gates rerun.
 
 1. R1 - Run the ship-doctor script, exactly as in Step 1. On
    `local_pass`, continue; on `blocked` or `indeterminate`, stop.
-2. R2 - Resolve the destination with the candidate-aware helper:
-
-   ```sh
-   <fleet-checkout>/scripts/ship/ship-destination <repo-path> --candidate <SHA> [--remote <remote>] [--branch <topic>]
-   ```
-
-   Cal passes `--remote` or `--branch` only for values the user
-   already named. On `selected`, Worker returns the full decision to
-   Cal (remote, topic, ref, GitHub owner and repository, candidate,
-   outgoing commits, and the `candidate_resume` selection). On any
-   block (`candidate_invalid`, `candidate_unknown`,
-   `candidate_not_head`, `candidate_dirty`, `candidate_on_main`,
-   `candidate_not_ahead`, or any remote/ref ambiguity), stop before
-   any mutation. A plain `ship-destination` call without
-   `--candidate` on the same checkout must still report
-   `staged_empty`; if it does not, stop and report the drift.
-3. R3 - Run the resume script with the R2 helper values:
+2. R2 - The Step 2 decision already carries the retained-candidate
+   selection. On `selected`, Worker returns the full decision to Cal
+   (remote, topic, ref, GitHub owner and repository, the discovered
+   candidate SHA, outgoing commits, and the `candidate_resume`
+   selection). On any block (`resume_ambiguous_evidence`,
+   `resume_evidence_invalid`, `resume_already_rolled_out`,
+   `resume_already_resumed`, `resume_remote_mismatch`,
+   `resume_ref_mismatch`, `candidate_not_ahead`, or any remote/ref
+   ambiguity), stop before any mutation. A clean HEAD without a
+   proven receipt is `staged_empty`, never a selection.
+3. R3 - Run the resume script with the R2 helper values; the SHA
+   is the discovered candidate from the decision, passed internally:
 
    ```sh
    <fleet-checkout>/scripts/ship/ship-resume <repo-path> \
      --remote <remote> --ref refs/heads/<topic> \
-     [--branch <topic>] --sha <SHA>
+     [--branch <topic>] --sha <discovered-SHA>
    ```
 
-   `ship-resume` re-validates everything before it pushes: the
-   doctor result, the genuine installed Husky v9 runtime and the
-   single-line pre-push delegation, the push-config guards, that
-   HEAD is exactly SHA on the topic branch with a clean checkout
-   and matching tree and parent, that the candidate is not already
-   in `main` history, and that exactly one prior commit receipt
-   proves the SHA, remote, ref, branch, parent, and tree. A missing
-   or ambiguous prior commit receipt, a dirty or moved checkout, a
-   mismatched remote or ref, an already-advanced remote ref, an
-   already-uploaded remote ref (`remote ref already equals the
-   candidate`), or a prior rollout that already succeeded (deploy
-   evidence present) all block with no push and no success claim.
-   Local `main` follows the same remote-main rules as `ship-build`
-   (fetch the explicit remote first; ahead or diverged blocks;
-   behind-only fast-forwards the `main` ref off-main without moving
-   HEAD). A stale read-only preflight artifact that provably
-   belongs to the same run and candidate is removed so the resumed
-   push records honest fresh preflight evidence; the immutable
-   commit receipt is never modified. The script then pushes the
-   pinned `<SHA>:<ref>` with the real pre-push gate, so the
-   rollout and the full `test:e2e` suite rerun fresh for that SHA,
-   and it verifies the post-push remote SHA and the receipt
-   contents before reporting success. Worker returns the actual
-   output, exit status, the candidate SHA, and the run identity;
+   `ship-resume` re-verifies at the mutation boundary everything
+   the helper decided: the doctor result, the genuine installed
+   Husky v9 runtime and the single-line pre-push delegation, the
+   push-config guards, that HEAD is exactly the discovered SHA on
+   the topic branch with a clean checkout and matching tree and
+   parent, that the candidate is not already in `main` history, and
+   that exactly one prior commit receipt proves the SHA, remote,
+   ref, branch, parent, and tree. A missing or ambiguous prior
+   commit receipt, a dirty or moved checkout, a mismatched remote
+   or ref, an already-advanced remote ref, an already-uploaded
+   remote ref (`remote ref already equals the candidate`), or a
+   prior rollout that already succeeded (deploy evidence present)
+   all block with no push and no success claim. Local `main`
+   follows the same remote-main rules as `ship-build` (fetch the
+   explicit remote first; ahead or diverged blocks; behind-only
+   fast-forwards the `main` ref off-main without moving HEAD). A
+   stale read-only preflight artifact that provably belongs to the
+   same run and candidate is removed so the resumed push records
+   honest fresh preflight evidence; the immutable commit receipt
+   is never modified. The script then pushes the pinned
+   `<SHA>:<ref>` with the real pre-push gate, so the rollout and
+   the full `test:e2e` suite rerun fresh for that SHA, and it
+   verifies the post-push remote SHA and the receipt contents
+   before reporting success. Worker returns the actual output,
+   exit status, the discovered candidate SHA, and the run identity;
    a failed resume returns the gate output and the reconcile read
    exactly as `ship-build` reports a failed push.
-4. R4 - Create the PR, exactly as in Step 5, using the R2
-   destination identity and the named SHA as the candidate: the
-   run directory to clean up is the original run directory named
-   by `ship-resume` output.
+4. R4 - Create the PR, exactly as in Step 5, using the Step 2
+   destination identity and the discovered SHA as the candidate:
+   the run directory to clean up is the original run directory
+   named by `ship-resume` output.
 
 ## Owner adoption checklist
 
@@ -623,7 +635,8 @@ inside that image, keep the isolated fixtures green, and only then
 claim isolation; until then the repository stays legacy migration
 debt and is never reported as isolated. Authorization stays with
 Cal; Worker reports blockers rather than adapting around them. A
-candidate retained after a failed push is recovered only through
-the explicit `@ship resume <SHA>` form with its proven prior
-commit receipt; a plain rerun stays blocked at `staged_empty` and
-never pushes HEAD.
+candidate retained after a failed push is recovered automatically
+by the ordinary `@ship` with no arguments, once the Step 2 helper
+discovers and proves it from HEAD and its single prior commit
+receipt; a clean HEAD with no such receipt stays `staged_empty`
+and is never pushed.

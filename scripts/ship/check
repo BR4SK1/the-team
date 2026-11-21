@@ -278,6 +278,9 @@ for required in (
     "--candidate",
     "candidate_not_head",
     "candidate_resume",
+    "scan_commit_receipts",
+    "resume_ambiguous_evidence",
+    "resume_evidence_invalid",
 ):
     if required not in ship_destination_source:
         raise ValueError(
@@ -352,10 +355,10 @@ for required in (
     "preflight",
     "check, deploy, run",
     ".ship/e2e-runner.json",
-    "@ship resume",
-    "full 40-hex",
+    "automatically",
+    "no SHA",
+    "discovered",
     "scripts/ship/ship-resume",
-    "--candidate",
     "prior commit receipt",
     "no new commit",
     "already succeeded",
@@ -380,6 +383,7 @@ for banned in (
     "explicit include",
     "workflow stays staged-only",
     "empty index on a topic branch only",
+    "@ship resume",
 ):
     if banned in ship_skill_text:
         raise ValueError(f"{ship_skill}: prompt-only violation {banned!r}")
@@ -529,7 +533,8 @@ for required in (
     ".ship/e2e-runner.json",
     "e2e.runner_contract",
     "no implicit pull",
-    "@ship resume",
+    "automatically",
+    "no SHA",
     "scripts/ship/ship-resume",
     "--candidate",
     "prior commit receipt",
@@ -555,6 +560,7 @@ for banned in (
     "explicit include",
     "on `main` only staged work ships",
     "topic branch only (coherent",
+    "@ship resume",
 ):
     if banned in ship_doc_text:
         raise ValueError(f"{ship_doc}: removed confirmation requirement {banned!r}")

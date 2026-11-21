@@ -756,6 +756,47 @@ class ShipWorkflowTest(unittest.TestCase):
         self.assertFalse((run_dir / "deploy.json").exists())
         self.assertFalse((run_dir / "resume.json").exists())
 
+    def test_automatic_recovery_from_derived_head(self) -> None:
+        # No user-supplied SHA: the workflow derives the candidate
+        # from HEAD (git rev-parse HEAD) and resumes exactly that
+        # commit. The decision logic that produces the same value
+        # automatically is covered in tests/ship_destination_test.py
+        # (GitHub-URL fixtures, since the destination helper
+        # verifies GitHub identity), while this fixture proves the
+        # push path against a real local bare remote.
+        work, remote, candidate, run_dir = self.retained_candidate(
+            branch="ship/resume-auto"
+        )
+        parent = git(work, "rev-parse", "HEAD^")
+        tree = git(work, "rev-parse", "HEAD^{tree}")
+        clear_fail_marker(work)
+        derived_sha = git(work, "rev-parse", "HEAD")
+        self.assertEqual(derived_sha, candidate)
+        proc = run_ship_resume(work, sha=derived_sha, branch="ship/resume-auto")
+        self.assertEqual(proc.returncode, 0,
+                         f"stdout={proc.stdout!r} stderr={proc.stderr!r}")
+        self.assertEqual(git(work, "rev-parse", "HEAD"), candidate)
+        self.assertEqual(git(work, "rev-parse", "HEAD^"), parent)
+        self.assertEqual(git(work, "rev-parse", "HEAD^{tree}"), tree)
+        self.assertEqual(remote_sha(remote, "refs/heads/ship/resume-auto"), candidate)
+        self.assertEqual(
+            json.loads((run_dir / "deploy.json").read_text())["sha"], candidate
+        )
+
+    def test_ordinary_commit_without_receipt_not_auto_resumed(self) -> None:
+        # An ordinary existing commit with no proven prior ship
+        # receipt must never be auto-resumed or pushed.
+        work, remote = build_fixture(self.base)
+        candidate, run_dir = self.setup_candidate(work, branch="ship/topic-ordinary")
+        shutil.rmtree(run_dir)
+        derived_sha = git(work, "rev-parse", "HEAD")
+        self.assertEqual(derived_sha, candidate)
+        proc = run_ship_resume(work, sha=derived_sha, branch="ship/topic-ordinary")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("exactly one receipt", proc.stdout + proc.stderr)
+        self.assertEqual(remote_sha(remote, "refs/heads/ship/topic-ordinary"), "")
+        self.assertEqual(git(work, "rev-parse", "HEAD"), candidate)
+
     def test_resume_wrong_sha_blocks(self) -> None:
         work, remote, candidate, _run_dir = self.retained_candidate(
             branch="ship/resume-wrong-sha"

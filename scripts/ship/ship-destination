@@ -16,16 +16,21 @@ Usage:
   passes them when the user already named them; otherwise they are
   omitted and the destination is derived below. They are never
   invented here.
-- --candidate carries an explicit prior resume instruction only: the
-  full 40-hex SHA of a commit retained locally after a failed push.
-  With --candidate the checked-out topic branch must have HEAD
-  exactly at that SHA with a clean checkout (empty staged, unstaged,
-  and untracked sets), and the candidate must not already be in the
-  local main history. Only then is the destination selected, with
-  the same remote/ref/GitHub verification as a normal selection.
-  Without --candidate, a clean empty index stays a staged_empty
-  blocker even when outgoing commits exist: a plain invocation
-  never selects a bare HEAD for pushing.
+- --candidate carries an internal verification instruction only: the
+  full 40-hex SHA the workflow derives itself (from HEAD) when it
+  checks a retained candidate. With --candidate the checked-out topic
+  branch must have HEAD exactly at that SHA with a clean checkout
+  (empty staged, unstaged, and untracked sets), and the candidate
+  must not already be in the local main history. Only then is the
+  destination selected, with the same remote/ref/GitHub verification
+  as a normal selection. The user never supplies a SHA.
+- Without --candidate, a clean empty index on a topic branch whose
+  HEAD has exactly one trustworthy matching prior commit receipt is
+  selected automatically as a retained candidate (the SHA is
+  discovered from HEAD internally). Without --candidate and without
+  such a receipt, a clean empty index stays a staged_empty blocker
+  even when outgoing commits exist: a plain invocation never selects
+  a bare HEAD for pushing.
 - Off main: the topic is the current branch. The remote is the
   current branch's configured upstream remote when that upstream is
   appropriate (its merge ref names the same branch), otherwise the
@@ -144,6 +149,35 @@ def parse_github(url):
     return None
 
 
+def scan_commit_receipts(git_dir, head_sha):
+    """Read-only scan of prior ship commit receipts for one SHA.
+
+    Returns a list of (run_id, run_dir, payload) for receipts naming
+    head_sha, skipping symlinked run directories and receipt files
+    exactly as the resume push validation does. A missing ship-runs
+    directory returns an empty list. Nothing in the payloads is ever
+    emitted; callers validate fields and emit only reason codes.
+    """
+    runs_dir = Path(git_dir) / "ship-runs"
+    if runs_dir.is_symlink() or not runs_dir.is_dir():
+        return []
+    found = []
+    for run_dir in sorted(runs_dir.iterdir(), key=lambda entry: entry.name):
+        if run_dir.is_symlink() or not run_dir.is_dir():
+            continue
+        commit_file = run_dir / "commit.json"
+        if commit_file.is_symlink() or not commit_file.is_file():
+            continue
+        try:
+            payload = json.loads(commit_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict) or payload.get("sha") != head_sha:
+            continue
+        found.append((run_dir.name, run_dir, payload))
+    return found
+
+
 def main(argv):
     payload = base_payload()
     if not argv or argv[0].startswith("-"):
@@ -222,13 +256,13 @@ def main(argv):
         [line for line in outgoing_text.splitlines() if line] if outgoing_text else []
     )
 
-    # Explicit candidate (resume) mode: the user named one full SHA of
-    # a commit retained after a failed push. The destination may be
-    # selected only when HEAD is exactly that commit on a clean topic
-    # checkout and the commit is not already in local main history.
-    # Any mismatch blocks; HEAD is never substituted by inference.
-    # The resume script re-validates the same facts plus the prior
-    # commit receipt before anything is pushed.
+    # Explicit candidate (resume) mode: the caller derived one full SHA
+    # internally and named it for verification. The destination may
+    # be selected only when HEAD is exactly that commit on a clean
+    # topic checkout and the commit is not already in local main
+    # history. Any mismatch blocks; HEAD is never substituted by
+    # inference. The resume script re-validates the same facts plus
+    # the prior commit receipt before anything is pushed.
     resume_case = bool(explicit_candidate)
     if resume_case:
         payload["candidate"] = explicit_candidate
@@ -264,18 +298,86 @@ def main(argv):
             payload["reason"] = "indeterminate"
             return emit(payload, 2)
 
+    # Automatic retained-candidate detection (the ordinary path): a
+    # clean empty index on a topic branch whose HEAD is the exact
+    # SHA of one trustworthy prior ship attempt. The SHA is
+    # discovered from HEAD here; nobody supplies it. The single
+    # matching commit receipt must bind the run, branch, parent, and
+    # tree of HEAD, and must not already show a completed rollout or
+    # a prior resume. Ship-resume re-validates every field (plus
+    # the selected remote and ref, and the actual remote ref) at
+    # the mutation boundary before it pushes.
+    auto_resume_case = False
+    auto_receipt = None
+    if (
+        not resume_case
+        and not staged
+        and not payload["on_main"]
+        and not unstaged
+        and not untracked
+    ):
+        rc, head_sha = git(repo, "rev-parse", "HEAD")
+        if rc != 0:
+            payload["reason"] = "indeterminate"
+            return emit(payload, 2)
+        receipts = scan_commit_receipts(git_dir, head_sha)
+        if len(receipts) > 1:
+            payload["reason"] = "resume_ambiguous_evidence"
+            return emit(payload, 1)
+        if len(receipts) == 1:
+            run_id, run_dir, receipt = receipts[0]
+            rc_parent, head_parent = git(repo, "rev-parse", "HEAD^")
+            rc_tree, head_tree = git(repo, "rev-parse", "HEAD^{tree}")
+            rc_main, main_sha = git(repo, "rev-parse", f"refs/heads/{MAIN}")
+            if rc_parent != 0 or rc_tree != 0 or rc_main != 0:
+                payload["reason"] = "indeterminate"
+                return emit(payload, 2)
+            if (
+                receipt.get("run_id") != run_id
+                or receipt.get("type") != "commit"
+                or receipt.get("branch") != branch
+                or receipt.get("parent") != head_parent
+                or receipt.get("tree") != head_tree
+                or not isinstance(receipt.get("remote"), str)
+                or not receipt.get("remote")
+                or not isinstance(receipt.get("ref"), str)
+                or not receipt.get("ref")
+            ):
+                payload["reason"] = "resume_evidence_invalid"
+                return emit(payload, 1)
+            if (run_dir / "deploy.json").exists() or (run_dir / "deploy.json").is_symlink():
+                payload["reason"] = "resume_already_rolled_out"
+                return emit(payload, 1)
+            if (run_dir / "resume.json").exists() or (run_dir / "resume.json").is_symlink():
+                payload["reason"] = "resume_already_resumed"
+                return emit(payload, 1)
+            if head_sha == main_sha:
+                payload["reason"] = "candidate_not_ahead"
+                return emit(payload, 1)
+            rc, _ = git(repo, "merge-base", "--is-ancestor", head_sha, MAIN)
+            if rc == 0:
+                payload["reason"] = "candidate_not_ahead"
+                return emit(payload, 1)
+            if rc != 1:
+                payload["reason"] = "indeterminate"
+                return emit(payload, 2)
+            auto_resume_case = True
+            auto_receipt = receipt
+            payload["candidate"] = head_sha
+
     # Empty index: blocked, but on main with work to ship the
     # blocked payload still carries a fully resolved topic proposal
     # (derived from the unstaged plus untracked paths) so the caller
     # can create/switch that branch before any staging and never
     # stage on main. Off main and clean-empty cases stay plain
-    # staged_empty with no proposal.
-    staged_empty_case = (not staged) and not resume_case
+    # staged_empty with no proposal. A proven retained candidate
+    # (explicit or auto-detected) is selected instead.
+    staged_empty_case = (not staged) and not resume_case and not auto_resume_case
     if staged_empty_case:
         if not payload["on_main"] or (not unstaged and not untracked):
             payload["reason"] = "staged_empty"
             return emit(payload, 1)
-    elif (unstaged or untracked) and not resume_case:
+    elif (unstaged or untracked) and not resume_case and not auto_resume_case:
         payload["reason"] = "scope_unclean"
         return emit(payload, 1)
 
@@ -390,6 +492,19 @@ def main(argv):
         payload["reason"] = "github_identity_unverified"
         return emit(payload, 1)
 
+    # An auto-detected retained candidate is selected only when its
+    # prior receipt names the selected remote and ref; a mismatch
+    # means the retained attempt is for a different destination and
+    # must never be pushed here. Ship-resume re-checks both, plus
+    # the actual remote ref, before pushing.
+    if auto_resume_case:
+        if auto_receipt.get("remote") != remote:
+            payload["reason"] = "resume_remote_mismatch"
+            return emit(payload, 1)
+        if auto_receipt.get("ref") != f"refs/heads/{topic}":
+            payload["reason"] = "resume_ref_mismatch"
+            return emit(payload, 1)
+
     # On-main derived topics must also be free in the selected
     # remote's tracking refs; an explicit topic that already tracks
     # remotely is a conflict, not something to silently rename.
@@ -418,7 +533,7 @@ def main(argv):
     payload["ref"] = f"refs/heads/{topic}"
     payload["github"] = github
     payload["selection"] = f"{selection_topic}/{selection}"
-    if resume_case:
+    if resume_case or auto_resume_case:
         payload["selection"] = f"candidate_resume/{payload['selection']}"
     # No commit message is suggested here: the skill (Step 3) requires a
     # meaningful Conventional Commit crafted from the staged scope and

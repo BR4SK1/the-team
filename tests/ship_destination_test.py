@@ -74,6 +74,29 @@ def commit_candidate(work, path="file.txt", text="candidate\n"):
     return git(work, "rev-parse", "HEAD")
 
 
+def write_retained_receipt(work, candidate, *, branch="feat/topic",
+                           remote="origin", ref=None, run_id="run-1",
+                           parent=None, tree=None,
+                           extra_files=()):
+    run_dir = work / ".git" / "ship-runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "run_id": run_id,
+        "sha": candidate,
+        "remote": remote,
+        "ref": ref or f"refs/heads/{branch}",
+        "branch": branch,
+        "parent": parent or git(work, "rev-parse", "HEAD^"),
+        "tree": tree or git(work, "rev-parse", "HEAD^{tree}"),
+        "type": "commit",
+    }
+    (run_dir / "commit.json").write_text(json.dumps(payload, indent=2) + "\n",
+                                          encoding="utf-8")
+    for name in extra_files:
+        (run_dir / name).write_text("{}", encoding="utf-8")
+    return run_dir
+
+
 class ShipDestinationTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -355,6 +378,92 @@ class ShipDestinationTest(unittest.TestCase):
         rc, payload = decide(work)
         self.assertEqual(rc, 1)
         self.assertEqual(payload["reason"], "detached_head")
+
+    def test_plain_auto_selects_retained_candidate(self):
+        # Ordinary invocation, no user-supplied SHA: the helper
+        # discovers the candidate from HEAD via its sole receipt.
+        work = make_repo(self.base, branch="feat/topic",
+                         remotes={"origin": GITHUB_URL})
+        candidate = commit_candidate(work)
+        write_retained_receipt(work, candidate)
+        rc, payload = decide(work)
+        self.assertEqual(rc, 0, payload)
+        self.assertEqual(payload["status"], "selected")
+        self.assertEqual(payload["candidate"], candidate)
+        self.assertEqual(payload["topic"], "feat/topic")
+        self.assertEqual(payload["ref"], "refs/heads/feat/topic")
+        self.assertEqual(payload["remote"], "origin")
+        self.assertTrue(payload["selection"].startswith("candidate_resume/"))
+        self.assertEqual(payload["staged_files"], [])
+
+    def test_plain_ambiguous_receipts_block(self):
+        work = make_repo(self.base, branch="feat/topic",
+                         remotes={"origin": GITHUB_URL})
+        candidate = commit_candidate(work)
+        write_retained_receipt(work, candidate, run_id="run-1")
+        write_retained_receipt(work, candidate, run_id="run-2")
+        rc, payload = decide(work)
+        self.assertEqual(rc, 1)
+        self.assertEqual(payload["reason"], "resume_ambiguous_evidence")
+        self.assertIsNone(payload["candidate"])
+
+    def test_plain_invalid_receipt_blocks(self):
+        work = make_repo(self.base, branch="feat/topic",
+                         remotes={"origin": GITHUB_URL})
+        candidate = commit_candidate(work)
+        wrong_tree = git(work, "rev-parse", "refs/heads/main^{tree}")
+        write_retained_receipt(work, candidate, tree=wrong_tree)
+        rc, payload = decide(work)
+        self.assertEqual(rc, 1)
+        self.assertEqual(payload["reason"], "resume_evidence_invalid")
+
+    def test_plain_moved_head_stays_staged_empty(self):
+        # A receipt for an older commit does not cover a moved HEAD.
+        work = make_repo(self.base, branch="feat/topic",
+                         remotes={"origin": GITHUB_URL})
+        candidate = commit_candidate(work)
+        write_retained_receipt(work, candidate)
+        commit_candidate(work, path="other.txt", text="moved on\n")
+        rc, payload = decide(work)
+        self.assertEqual(rc, 1)
+        self.assertEqual(payload["reason"], "staged_empty")
+        self.assertIsNone(payload["candidate"])
+
+    def test_plain_already_rolled_out_blocks(self):
+        work = make_repo(self.base, branch="feat/topic",
+                         remotes={"origin": GITHUB_URL})
+        candidate = commit_candidate(work)
+        write_retained_receipt(work, candidate, extra_files=("deploy.json",))
+        rc, payload = decide(work)
+        self.assertEqual(rc, 1)
+        self.assertEqual(payload["reason"], "resume_already_rolled_out")
+
+    def test_plain_already_resumed_blocks(self):
+        work = make_repo(self.base, branch="feat/topic",
+                         remotes={"origin": GITHUB_URL})
+        candidate = commit_candidate(work)
+        write_retained_receipt(work, candidate, extra_files=("resume.json",))
+        rc, payload = decide(work)
+        self.assertEqual(rc, 1)
+        self.assertEqual(payload["reason"], "resume_already_resumed")
+
+    def test_plain_remote_mismatch_blocks(self):
+        work = make_repo(self.base, branch="feat/topic",
+                         remotes={"origin": GITHUB_URL})
+        candidate = commit_candidate(work)
+        write_retained_receipt(work, candidate, remote="other")
+        rc, payload = decide(work)
+        self.assertEqual(rc, 1)
+        self.assertEqual(payload["reason"], "resume_remote_mismatch")
+
+    def test_plain_ref_mismatch_blocks(self):
+        work = make_repo(self.base, branch="feat/topic",
+                         remotes={"origin": GITHUB_URL})
+        candidate = commit_candidate(work)
+        write_retained_receipt(work, candidate, ref="refs/heads/feat/other")
+        rc, payload = decide(work)
+        self.assertEqual(rc, 1)
+        self.assertEqual(payload["reason"], "resume_ref_mismatch")
 
     def test_candidate_resume_selects_exact_head(self):
         work = make_repo(self.base, branch="feat/topic",
