@@ -38,6 +38,12 @@
   prefer Git history and rebuilding from source. Do not force a production
   deployment as part of cleanup; deployment remains subject to task
   authorization and project operational rules.
+- For ship-bound work in a repository that conforms to `docs/ship.md`,
+  when starting clean on `main` for authorized new work, create a separate
+  topic branch before editing and never stage on `main`; if work was
+  already authored on `main`, the ship workflow carries the verified
+  edits to the helper-proposed topic before staging. This rule is
+  scoped to ship-bound work only.
 - Report Git status separately from workspace cleanup, including known
   exclusions or blockers. A clean Git status alone does not establish that
   temporary or ignored workspace artifacts are gone.

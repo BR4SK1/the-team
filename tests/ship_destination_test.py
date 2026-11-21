@@ -185,10 +185,148 @@ class ShipDestinationTest(unittest.TestCase):
     def test_empty_staged_is_scope_blocker(self):
         work = make_repo(self.base, branch="feat/topic",
                          remotes={"origin": GITHUB_URL})
+        (work / "file.txt").write_text("changed\n", encoding="utf-8")
         rc, payload = decide(work)
         self.assertEqual(rc, 1)
         self.assertEqual(payload["reason"], "staged_empty")
         self.assertTrue(payload["scope"]["staged_empty"])
+        # Off main the current branch is already the topic: the
+        # ordinary staging path needs no proposal or switch.
+        self.assertIsNone(payload["topic"])
+
+    def test_empty_staged_on_main_reports_on_main_staged_empty(self):
+        # Helper still reports staged_empty uniformly; eligibility of
+        # the one-pass reviewed staging on main with established
+        # task-owned provenance is a skill-level decision the helper
+        # leaves to Caller. The helper surfaces on_main and scope.
+        work = make_repo(self.base, remotes={"origin": GITHUB_URL})
+        (work / "file.txt").write_text("changed\n", encoding="utf-8")
+        (work / "new.txt").write_text("payload\n", encoding="utf-8")
+        rc, payload = decide(work)
+        self.assertEqual(rc, 1)
+        self.assertEqual(payload["reason"], "staged_empty")
+        self.assertTrue(payload["on_main"])
+        self.assertIn("file.txt", payload["scope"]["unstaged"])
+        self.assertIn("new.txt", payload["scope"]["untracked"])
+        # Even while blocked, the proposal lets the caller branch
+        # before staging: fully resolved remote/topic/github.
+        self.assertTrue(payload["topic"].startswith("ship/"))
+        self.assertNotEqual(payload["topic"], "main")
+        self.assertEqual(payload["remote"], "origin")
+        self.assertEqual(payload["github"], {"owner": "example", "repo": "fixture"})
+        self.assertEqual(payload["ref"], f"refs/heads/{payload['topic']}")
+        self.assertEqual(payload["selection"], "derived_on_main/single_remote")
+        # Proposal is derived from the candidate work (first sorted
+        # path is file.txt) before any staging.
+        self.assertEqual(payload["topic"], "ship/file")
+        # Topic does not already exist (duplicate-branch safety).
+        self.assertEqual(
+            run(["git", "-C", str(work), "show-ref", "--verify", "-q",
+                 f"refs/heads/{payload['topic']}"]).returncode, 1)
+
+    def test_empty_staged_on_main_explicit_branch_proposal(self):
+        work = make_repo(self.base, remotes={"origin": GITHUB_URL})
+        (work / "file.txt").write_text("changed\n", encoding="utf-8")
+        rc, payload = decide(work, "--branch", "ship/explicit-proposal")
+        self.assertEqual(rc, 1)
+        self.assertEqual(payload["reason"], "staged_empty")
+        self.assertEqual(payload["topic"], "ship/explicit-proposal")
+        self.assertTrue(payload["on_main"])
+        self.assertEqual(payload["selection"], "explicit/single_remote")
+
+    def test_empty_staged_on_main_existing_branch_blocks_proposal(self):
+        # An existing local topic must not be silently chosen again:
+        # the derived proposal suffixes until free, and an explicit
+        # existing branch is a hard block (no duplicate).
+        work = make_repo(self.base, remotes={"origin": GITHUB_URL})
+        (work / "file.txt").write_text("changed\n", encoding="utf-8")
+        git(work, "branch", "ship/file")
+        rc, payload = decide(work)
+        self.assertEqual(rc, 1)
+        self.assertEqual(payload["reason"], "staged_empty")
+        self.assertEqual(payload["topic"], "ship/file-2")
+        rc2, payload2 = decide(work, "--branch", "ship/file")
+        self.assertEqual(rc2, 1)
+        self.assertEqual(payload2["reason"], "explicit_branch_exists")
+        self.assertIsNone(payload2["topic"])
+
+    def test_empty_staged_on_main_ambiguous_remote_blocks_proposal(self):
+        work = make_repo(self.base, remotes={"origin": GITHUB_URL,
+                                             "other": "https://github.com/example/other.git"})
+        (work / "file.txt").write_text("changed\n", encoding="utf-8")
+        rc, payload = decide(work)
+        self.assertEqual(rc, 1)
+        self.assertEqual(payload["reason"], "ambiguous_remote")
+        self.assertIsNone(payload["remote"])
+
+    def test_branch_before_staging_on_main_carries_edits_and_reruns(self):
+        # End-to-end branch-before-add ordering: helper proposes,
+        # Worker switches -c that proposal carrying edits, verifies
+        # the carry, stages exact paths, and reruns to selected.
+        work = make_repo(self.base, remotes={"origin": GITHUB_URL})
+        (work / "file.txt").write_text("changed\n", encoding="utf-8")
+        (work / "new.txt").write_text("payload\n", encoding="utf-8")
+        before_head = git(work, "rev-parse", "HEAD")
+        before_unstaged = sorted(
+            line for line in git(work, "diff", "--name-only").splitlines() if line)
+        before_untracked = sorted(
+            line for line in git(work, "ls-files", "--others", "--exclude-standard").splitlines() if line)
+        rc0, payload0 = decide(work)
+        self.assertEqual(rc0, 1)
+        self.assertEqual(payload0["reason"], "staged_empty")
+        self.assertTrue(payload0["on_main"])
+        proposal = payload0["topic"]
+        self.assertTrue(proposal.startswith("ship/"))
+        # Branch before any add: the index is still empty on main
+        # and no staging has run while on main.
+        self.assertEqual(git(work, "branch", "--show-current"), "main")
+        self.assertEqual(git(work, "diff", "--cached", "--name-only"), "")
+        git(work, "switch", "-c", proposal)
+        # Carry verification: topic current + not main, HEAD same,
+        # index still empty, unstaged/untracked sets unchanged.
+        self.assertEqual(git(work, "branch", "--show-current"), proposal)
+        self.assertNotEqual(git(work, "branch", "--show-current"), "main")
+        self.assertEqual(git(work, "rev-parse", "HEAD"), before_head)
+        self.assertEqual(git(work, "diff", "--cached", "--name-only"), "")
+        self.assertEqual(sorted(
+            line for line in git(work, "diff", "--name-only").splitlines() if line),
+            before_unstaged)
+        self.assertEqual(sorted(
+            line for line in git(work, "ls-files", "--others", "--exclude-standard").splitlines() if line),
+            before_untracked)
+        # Exact-path staging only now that the topic is checked out.
+        for path in ("file.txt", "new.txt"):
+            git(work, "add", "--", path)
+        rc, payload = decide(work)
+        self.assertEqual(rc, 0, payload)
+        self.assertEqual(payload["status"], "selected")
+        self.assertEqual(payload["topic"], proposal)
+        self.assertEqual(payload["ref"], f"refs/heads/{proposal}")
+        self.assertFalse(payload["on_main"])
+        self.assertEqual(sorted(payload["staged_files"]), ["file.txt", "new.txt"])
+
+    def test_clean_empty_on_main_is_scope_blocker(self):
+        work = make_repo(self.base, remotes={"origin": GITHUB_URL})
+        rc, payload = decide(work)
+        self.assertEqual(rc, 1)
+        self.assertEqual(payload["reason"], "staged_empty")
+        self.assertTrue(payload["on_main"])
+        self.assertEqual(payload["scope"]["unstaged"], [])
+        self.assertEqual(payload["scope"]["untracked"], [])
+        # No work to ship: no branch proposal.
+        self.assertIsNone(payload["topic"])
+
+    def test_nonempty_index_on_main_preserved_and_scope_unclean(self):
+        # A pre-existing non-empty index is preserved, never broadened:
+        # unstaged or untracked alongside it is scope_unclean rather
+        # than staged_empty, so no auto-staging applies.
+        work = make_repo(self.base, remotes={"origin": GITHUB_URL})
+        stage(work, "file.txt")
+        (work / "untracked.txt").write_text("payload\n", encoding="utf-8")
+        rc, payload = decide(work)
+        self.assertEqual(rc, 1)
+        self.assertEqual(payload["reason"], "scope_unclean")
+        self.assertFalse(payload["scope"]["staged_empty"])
 
     def test_unstaged_and_untracked_are_scope_blockers(self):
         work = make_repo(self.base, branch="feat/topic",

@@ -52,8 +52,11 @@ fleet root. A user loads the skill explicitly as `@ship` with no
 arguments (or via the skill tool by ID `ship`), under the same rules
 and the same authorization contract: the invocation authorizes the
 routine workflow (staged-only, plus the single reviewed
-auto-staging in Step 2 that fills an empty index on a topic branch)
-through deploy, E2E, push, and PR creation, with no routine
+auto-staging in Step 2 that fills an empty index on a topic branch
+or, on `main`, on an eligible task-owned change with established
+task-owned provenance from a known clean baseline after branching to
+the helper-proposed topic before any staging — never staging on
+`main`) through deploy, E2E, push, and PR creation, with no routine
 approval stops.
 
 ## Five steps
@@ -256,23 +259,47 @@ from the user. Staged scope and
 outgoing commits are surfaced from the helper decision and do not
 require reconfirmation in routine cases.
 
-An empty index (`staged_empty`) on an eligible topic branch with
-unstaged or untracked work is the one exception to blocking: Worker
-read-only inspects the full tracked diffs and the non-ignored
-untracked contents, and when the whole set reads as one coherent,
-safe change, stages the exact reviewed paths (never a blanket add,
-never an ignored file or a symlink) through the normal permission
-flow, then reruns the destination helper once and continues to
-Step 3 on `selected`, with no terminal step and no routine
-confirmation. Mixed or ambiguous work and likely secret or unsafe
-files stage nothing and block. On `main` an empty index stays a
-scope blocker unless an explicit include authorization already names
-the exact paths to include. A pre-existing non-empty index is
-preserved exactly and never broadened: unstaged or untracked work
-alongside it stays `scope_unclean`, never hidden, stashed, deleted,
-or swept into the candidate. A clean empty index with no work to
-ship still blocks: there is nothing to ship. The rerun is single
-and terminal: a second block stops without re-staging.
+An empty index (`staged_empty`) with unstaged or untracked work is
+eligible for the one-pass reviewed staging when the branch is an
+eligible topic branch or, on `main`, when task-owned provenance is
+established: Worker read-only inspects the full tracked diffs and
+the non-ignored untracked contents, and when the whole set reads as
+one coherent, safe change, branches on `main` before staging and
+then stages the exact reviewed paths (never a blanket add, never an
+ignored file or a symlink) through the normal permission flow, then
+reruns the destination helper once and continues to Step 3 on
+`selected`, with no terminal step and no routine confirmation. On
+`main`, Worker resolves the helper's blocked `staged_empty`
+proposal (topic, ref, remote, GitHub identity, selection derived
+from the candidate unstaged plus untracked paths), verifies the
+topic is safe and not already present locally, and creates it with
+`git switch -c <topic>` before any `git add`, then verifies the
+carry via `git branch --show-current` (topic is current and not `main`, HEAD unchanged, index still
+empty, unstaged and untracked lists unchanged exactly). Worker never
+stages on `main`; new ship-bound work that starts clean on `main`
+branches before editing where the workflow can govern that. On
+`main`, provenance means a known clean baseline from the authoring
+context (clean index and worktree when the authoring work started)
+and a task-owned scope that is the user-authorized change, carried
+into a later @ship in the same session without a routine extra
+approval and without requiring a
+user-supplied path list. Worker verifies every listed path fits
+that scope from that baseline; if provenance cannot be established
+from the authoring context or other evidence, or the work does not
+fit the scope (unrelated, pre-existing, or ambiguous work), Worker
+stages nothing and `main` stays a scope blocker. Mixed or ambiguous
+work and likely secret or unsafe files stage nothing and block on
+topic branches and on `main` alike. A pre-existing non-empty index
+is preserved exactly and never broadened (no new staging on `main`):
+unstaged or untracked work alongside it stays `scope_unclean`,
+never hidden, stashed, deleted, or swept into the candidate. A
+clean empty index with no work to ship still blocks: there is
+nothing to ship. After the pre-staging branch on `main`, the single
+rerun resolves to the safe derived topic (`ship/<staged-path slug>`);
+the rerun must select exactly the branch just created/checked out;
+there is no publish or commit directly
+to `main`. The rerun is single and terminal: a second block stops
+without re-staging.
 
 ## Ship-build (Steps 2–3)
 
@@ -477,10 +504,13 @@ operations. Never push by an alternate path.
   intended change set. The scripts perform no implicit staging —
   unstaged or untracked work is never swept in by the scripts. The
   single reviewed Worker staging in Step 2 covers the empty-index
-  case on a topic branch only (coherent, safe, exact reviewed paths,
-  then one rerun); a clean empty index and an empty index on `main`
-  (without an explicit include authorization) remain scope blockers,
-  and a pre-existing non-empty index is preserved exactly and never
+  case on a topic branch and on `main` with established task-owned
+  provenance (coherent, safe, branch to the helper-proposed topic
+  before any staging, exact reviewed paths, then one rerun,
+  verified against a known clean baseline and task-owned scope);
+  Worker never stages on `main`; a clean empty index and an empty
+  index on `main` without that provenance remain scope blockers, and
+  a pre-existing non-empty index is preserved exactly and never
   broadened.
 - Selected remotes and refs: `ship-build` takes the Step 2 helper
   values explicitly. There is no destructive cleanup.
@@ -506,9 +536,17 @@ operations. Never push by an alternate path.
 A repository becomes ship-ready when it meets the opt-in contract
 above. Readiness is current and verified per attempt by Cal. To
 become ship-ready, the owner, in order: is on a named topic branch
-with the change to ship (on `main` only staged work ships; off
-`main` unstaged work is reviewed and auto-staged once in Step 2,
-resolved by the Step 2 helper); meets the strict
+with the change to ship (new ship-bound work that starts clean on
+`main` branches before editing where the workflow can govern that;
+on `main` staged work ships and unstaged task-owned work with a
+known clean baseline and established task-owned provenance branches
+to the helper-proposed topic before any staging and is then
+auto-staged once in Step 2; off `main` unstaged work is reviewed
+and auto-staged once in Step 2, resolved by the Step 2 helper on
+rerun, on `main` to a safe
+derived topic with no publish or commit directly to `main`, and
+Worker never stages on `main`); meets
+the strict
 standard so `scripts/ship/ship-doctor <repo>` reports `local_pass`;
 installs the pinned Husky v9 runtime and verifies the helper, shims,
 and the single-line pre-push delegation; adds executable
@@ -528,7 +566,9 @@ A local pass is never reported as dispatch readiness. To ship, a user
 types `@ship` with no arguments to load the skill; the agent then
 follows the fixed Cal-owned workflow above under the same
 authorization contract (routine staged scope, including the single
-reviewed auto-staging, with no routine approval stops).
+reviewed auto-staging on topic branches and on `main` with
+established task-owned provenance, with no routine approval
+stops).
 
 ## Production deployment stays separate
 

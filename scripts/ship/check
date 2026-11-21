@@ -274,7 +274,17 @@ for required in (
     "reruns the same destination",
     "never broadened",
     "without needing a terminal",
-    "explicit include",
+    "task-owned provenance",
+    "known clean baseline",
+    "later @ship in the same session",
+    "no user-supplied path list",
+    "safe derived topic",
+    "no publish or commit directly to",
+    "never stages on `main`",
+    "git switch -c <topic>",
+    "git branch --show-current",
+    "before any staging",
+    "branches before editing",
     "Conventional Commit",
     "Commitlint",
 ):
@@ -294,6 +304,9 @@ for banned in (
     "asks the user only if starting off main",
     "never inferred from configuration defaults",
     "`/ship`",
+    "explicit include",
+    "workflow stays staged-only",
+    "empty index on a topic branch only",
 ):
     if banned in ship_skill_text:
         raise ValueError(f"{ship_skill}: prompt-only violation {banned!r}")
@@ -388,6 +401,16 @@ for required in (
     "@ship",
     "single reviewed Worker staging",
     "never broadened",
+    "task-owned provenance",
+    "known clean baseline",
+    "later @ship in the same session",
+    "user-supplied path list",
+    "safe derived topic",
+    "no publish or commit directly to",
+    "never stages on `main`",
+    "git switch -c <topic>",
+    "git branch --show-current",
+    "branches before editing",
     "Conventional Commit",
     "Commitlint",
 ):
@@ -406,9 +429,27 @@ for banned in (
     "asks the user only if starting off main",
     "fleet/plugins/ship.ts",
     "`/ship`",
+    "explicit include",
+    "on `main` only staged work ships",
+    "topic branch only (coherent",
 ):
     if banned in ship_doc_text:
         raise ValueError(f"{ship_doc}: removed confirmation requirement {banned!r}")
+
+# Fleet-wide early-branching guidance is scoped to ship-bound work only:
+# it lives in fleet/AGENTS.md but must stay bounded to docs/ship.md repos
+# and must never stage on main.
+fleet_agents = Path("fleet/AGENTS.md")
+fleet_agents_text = fleet_agents.read_text(encoding="utf-8")
+for required in (
+    "ship-bound",
+    "docs/ship.md",
+    "before editing",
+    "never stage on `main`",
+    "scoped to ship-bound work only",
+):
+    if required not in fleet_agents_text:
+        raise ValueError(f"{fleet_agents}: missing ship-bound guidance {required!r}")
 
 # Permission hardening for the fleet agent definitions:
 # - A wildcard shell allow rule (for example "git diff *") also permits mutating

@@ -28,21 +28,27 @@ A normal ship invocation (explicit `@ship` with no arguments)
 itself authorizes the routine workflow through non-production
 deploy, the full E2E suite, push, and opening a pull request: the
 staged-only workflow, plus the single reviewed auto-staging in Step 2
-that fills an empty index on an eligible topic branch so the user
-never stages by hand or in a terminal. There are
-no routine approval stops: neither Cal nor Worker pauses to ask the
-user for a routine git-derived value (remote, branch, ref, commit
-message) or to reconfirm a routine staged scope, including the scope
-created by that single reviewed auto-staging. Staging itself runs
-through Worker's normal permission flow for the exact reviewed paths;
-that permission flow is not a separate conversational reconfirmation.
-Work stops and returns to the user only on a real blocker: a blocked
-or indeterminate destination (other than the handled `staged_empty`
-case below), an unclean staged scope, mixed or ambiguous work, a
-likely secret or unsafe file, a scope surprise, a repository policy
-or authority limit, a busy or unverifiable required lease, a failed
-gate, or a tool denial. Those stops are blockers, never prompts to
-guess a value or to proceed anyway.
+that fills an empty index on an eligible topic branch or, on `main`,
+on an eligible task-owned change with established task-owned
+provenance after branching to the helper-proposed topic before any
+staging, so the user never stages by hand or in a terminal and no
+staging is ever done on `main`.
+There are no routine approval stops: neither Cal nor Worker pauses
+to ask the user for a routine git-derived value (remote, branch,
+ref, commit message) or to reconfirm a routine staged scope,
+including the scope created by that single reviewed auto-staging.
+Staging itself runs through Worker's normal permission flow for the
+exact reviewed paths; that permission flow is not a separate
+conversational reconfirmation and is not a separate approval of the
+change. Work stops and returns to the user only on a real blocker:
+a blocked or indeterminate destination (other than the handled
+`staged_empty` case below, including a `staged_empty` on `main`
+where task-owned provenance cannot be established), an unclean
+staged scope, mixed or ambiguous work, a likely secret or unsafe
+file, a scope surprise, a repository policy or authority limit, a
+busy or unverifiable required lease, a failed gate, or a tool
+denial. Those stops are blockers, never prompts to guess a value
+or to proceed anyway.
 
 Cal owns authority and user decisions. Cal delegates operational steps
 to Worker and never runs the scripts directly. Worker runs the fleet
@@ -166,14 +172,25 @@ without needing a terminal. The helper output already carries the
 branch, `on_main`, and `scope` (`staged_empty`, unstaged tracked
 paths, and non-ignored untracked paths); the helper has already
 verified the branch is not detached and that local `main` exists.
-If `staged_empty` is reported, the branch is an eligible topic (not
-`main`), and the scope shows work to ship (unstaged or untracked is
-non-empty), Worker inspects and stages that work as follows, then
-automatically reruns the destination helper once and continues to
-Step 3 on `selected`. This is the only auto-staging in the
-workflow; it never runs in a loop and it never re-stages after the
-rerun. A clean empty scope (no unstaged and no untracked work) is
-still a scope blocker: there is nothing to ship.
+On `main` with work to ship the helper also carries a fully
+resolved topic proposal (remote, topic, ref, GitHub identity,
+selection derived from the candidate unstaged plus untracked
+paths) in the blocked `staged_empty` payload, so Worker can
+branch before staging. If `staged_empty` is reported and the scope
+shows work to ship (unstaged or untracked is non-empty), the case
+is eligible for the one-pass reviewed staging below when either
+(a) the branch is an eligible topic (not `main`), or (b) the
+branch is `main` and Cal carries task-owned provenance for the
+change that Worker verifies (see the `main` provenance rule
+below). On an eligible case Worker inspects, coherently clears,
+and stages that work as follows, then automatically reruns the
+destination helper once and continues to Step 3 on `selected`.
+This is the only auto-staging in the workflow; it never runs in a
+loop and it never re-stages after the rerun. A clean empty scope
+(no unstaged and no untracked work) is still a scope blocker:
+there is nothing to ship. A `staged_empty` on `main` without
+eligible provenance is likewise a scope blocker: Worker stages
+nothing and creates no branch.
 
 1. Read-only inspection with no staging yet. Worker reads the full
    tracked diffs for every unstaged path, the contents of every
@@ -186,11 +203,34 @@ still a scope blocker: there is nothing to ship.
    (unrelated changes) or ambiguous (the set cannot be judged as one
    change), Worker stages nothing and returns that mixed-work
    blocker to the user. Worker also stages nothing and returns a
-   blocker when any reviewed path looks like a likely secret or
-   otherwise unsafe to commit (for example a credential, key, token,
+   blocker when any reviewed path looks like a likely secret or otherwise unsafe to commit (for example a credential, key, token,
    or private data file, or an unreadable file) or is not a regular
    file (a symlink or other non-regular path).
-3. Exact-path staging only. On a coherent, safe set Worker stages
+3. Branch before staging on `main`. Only on `main` Worker resolves
+   the helper's blocked `staged_empty` proposal (topic, ref, remote,
+   GitHub identity, selection) and creates the topic branch
+   carrying the reviewed edits before any `git add`:
+   `git switch -c <topic>` through Worker's normal shell permission
+   flow (that flow is not a separate approval of the change). Worker
+   never stages on `main`: no `git add` runs while
+   `git branch --show-current` is `main`. Before the switch Worker
+   verifies the proposal is safe and not already present — topic
+   is not `main`, matches the safe branch pattern, and
+   `git show-ref --verify -q refs/heads/<topic>` fails because the
+   helper suffix already ensures local and remote-tracking
+   uniqueness. Worker creates exactly that helper-selected topic
+   with `git switch -c <topic>` and never invents, renames, or
+   picks another branch by hand. After the switch Worker verifies
+   the carry: `git branch --show-current` equals the topic and is
+   not `main`, `git rev-parse HEAD` equals the pre-switch HEAD, the
+   index is still empty, and the unstaged tracked list
+   (`git diff --name-only`) and non-ignored untracked list
+   (`git ls-files --others --exclude-standard`) equal the reviewed
+   sets exactly. If any carry verification fails, Worker stages
+   nothing and returns a blocker; there is no stash-back loop and
+   no staging before a failed carry. On a topic branch Worker
+   skips this step — the checked-out branch is the topic.
+4. Exact-path staging only. On a coherent, safe set Worker stages
    each reviewed path exactly as listed, one path at a time or in a
    single invocation naming exactly those paths, through Worker's
    normal permission flow (for example `git add -- <path>` repeated
@@ -202,28 +242,72 @@ still a scope blocker: there is nothing to ship.
    deploys to production either. A deleted tracked path staged this
    way records its deletion, and a rename needs both the old deleted
    path and the new path staged, so deletes and renames carry
-   through. Worker first re-verifies the index is still empty
-   immediately before staging; if the index is no longer empty,
-   Worker stops and preserves that pre-existing index rather than
-   broadening it.
-4. One rerun, then Step 3. Worker reruns the same destination
+   through. Worker first re-verifies, immediately before the first
+   `git add`, that `git branch --show-current` is the topic (not
+   `main`), that the index is still empty, and that HEAD is still
+   the pre-switch HEAD; if the index is no longer empty or the
+   branch is `main`, Worker stops and preserves that state rather
+   than broadening it.
+5. One rerun, then Step 3. Worker reruns the same destination
    invocation once (same repo path and same explicit `--remote` /
    `--branch` values, if any) and continues to Step 3 on `selected`,
    surfacing the now-staged files and outgoing commits without a
-   routine reconfirmation. If the rerun still blocks (`staged_empty`,
-   `scope_unclean`, an ambiguous remote, or any other reason), Worker
-   stops and reports it with the staged set left as staged; Worker
+   routine reconfirmation. On a `main` early-branch path the rerun
+   must select exactly the branch just created/checked out (same
+   topic and ref, now off `main` with `on_main` false) and stage
+   that exact reviewed set; if the rerun topic, staged files, or
+   branch differ from the carry verification, Worker stops and
+   reports the mismatch with the staged set left as staged. If the
+   rerun still blocks (`staged_empty`, `scope_unclean`, an ambiguous
+   remote, or any other reason), Worker stops and reports it; Worker
    never stages a second time, never broadens scope to force a
-   selection, and never asks the user to run a terminal staging
-   command instead.
+   selection, never switches back to `main` to stage, and never
+   asks the user to run a terminal staging command instead.
 
-On `main` the workflow stays staged-only. A `staged_empty` result on
-`main` remains a scope blocker and never triggers the auto-staging
-above, unless the user already gave a clear explicit include
-authorization naming the exact worktree paths to include; only then
-may Worker inspect and exact-path stage just those named paths
-through the same steps, followed by one rerun. No standing
-auto-staging on `main` is inferred from the ship invocation alone.
+On `main`, the same eligible empty-index case applies with
+task-owned provenance, but only through branch-before-staging. A
+`staged_empty` on `main` is eligible for the auto-staging above
+(same read-only inspection, coherence and secret/unsafe checks,
+branch creation before any staging, exact-path staging, single
+rerun, and safe derived topic selection — never a publish or commit directly to `main`, and never a `git add` run on `main`)
+when provenance is established before Worker branches or stages,
+and it is a scope blocker otherwise. New ship-bound authorized
+work that starts clean on `main` branches before editing where the
+workflow can govern that; if the work was already authored
+directly on `main`, Worker carries the verified edits to the
+helper-proposed topic with `git switch -c <topic>` as in step 3 —
+no separate approval is asked for either path.
+
+Establishing provenance is practical, not blind. Cal carries the
+task scope and a known clean baseline from the authoring context:
+the known clean baseline is that the repository was clean when the
+authoring work started (empty index and empty worktree, recorded
+in this session's authoring context or otherwise established from
+evidence), and the task-owned scope is the user-authorized change
+that work was asked to make in this session. A later @ship in the same session where provenance is already
+established carries that same known clean baseline and task-owned
+scope forward; Cal supplies them to Worker as context and the same
+branch-before-staging eligibility applies, with no routine extra
+approval and no user-supplied path list required. No artificial
+paperwork is required: Cal does not re-ask for a path list and the
+user does not re-authorize branching or staging when clean-start
+provenance and task-owned scope are already known.
+
+Worker verifies provenance against the reviewed work before
+staging: read the full unstaged plus untracked set, read the
+outgoing commits as needed, and confirm that every unstaged and
+untracked path fits the claimed task-owned scope from the known
+clean baseline. If provenance cannot be established from the
+authoring context or other evidence, or if the reviewed work does
+not fit that scope — for example unrelated or pre-existing edits,
+a dirty starting tree, paths outside the task scope, or an
+ambiguous set that cannot be judged as one user-authorized change —
+Worker stages nothing and returns a scope blocker. The ship
+invocation alone is not provenance; a known clean baseline plus a
+task-owned scope that is already in hand is. The convenience of
+carrying that context is not permission to stage blindly:
+unrelated, pre-existing, or ambiguous work is never staged on the
+claim of task ownership.
 
 When the index is already non-empty, Worker preserves that staged
 scope exactly and never broadens it: Worker stages no additional
@@ -241,13 +325,16 @@ Validation also requires:
   staged set with no unstaged or untracked remainder and never runs
   `git add`. The candidate is the staged set as reviewed, including
   the single reviewed auto-staging above (empty index on a topic
-  branch only) and a pre-existing staged set, which is preserved
-  exactly and never broadened. An empty index on `main`, or a clean
-  empty index with no work to ship, is a scope blocker
-  (`staged_empty`). Unstaged tracked changes or untracked files
-  alongside a non-empty index make the candidate unclean
-  (`scope_unclean`); they are rejected before publish and are never
-  swept into the candidate, hidden, stashed, or deleted.
+  branch, or on `main` with established task-owned provenance from
+  a known clean baseline, branched before any staging) and a
+  pre-existing staged set, which is preserved exactly and never broadened. An empty index without
+  eligible provenance — including `main` without a known clean
+  baseline and task-owned scope — or a clean empty index with no
+  work to ship, is a scope blocker (`staged_empty`). Unstaged
+  tracked changes or untracked files alongside a non-empty index
+  make the candidate unclean (`scope_unclean`); they are rejected
+  before publish and are never swept into the candidate, hidden,
+  stashed, or deleted.
 - Scope is surfaced, not reconfirmed. Worker surfaces the staged
   files and outgoing commits from the helper decision and from
   `ship-build` output. In routine cases (non-empty staged scope,
@@ -407,9 +494,13 @@ A repository becomes ship-ready when it meets the opt-in contract
 above. Readiness is current and is verified per attempt by Cal; a past
 state does not prohibit ship after adoption. To become ship-ready, in
 order: be on a named topic branch with the change to ship (on `main`
-only staged work ships; off `main` unstaged work is reviewed and
-auto-staged once in Step 2, and the Step 2 destination helper
-resolves the topic, no separate ask); meet the strict standard so
+staged work ships and unstaged task-owned work with a known clean
+baseline and established task-owned provenance is reviewed and
+auto-staged once in Step 2; off `main` unstaged work is reviewed and
+auto-staged once in Step 2; in either case the Step 2 destination
+helper resolves the topic on rerun, on `main` to a safe derived
+topic with no publish or commit directly to `main`, no separate
+ask); meet the strict standard so
 `scripts/ship-doctor <repo>` reports `local_pass`; install the pinned
 Husky v9 runtime and verify the helper, shims, and the single-line
 pre-push delegation; add executable `scripts/ship-deploy` with the
