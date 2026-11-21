@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Fleet-owned isolated E2E runner: the only supported isolated backend
+# is a narrow digest-pinned OCI image. The fleet, not a repository
+# script, owns and verifies execution: this runner reads the versioned
+# candidate contract from the candidate commit (never from the working
+# tree), verifies the exact image is already present locally by
+# digest, and runs the full test:e2e command inside that image.
+#
+# Usage (invoked by the fleet ship-deploy wrapper only):
+#   ship-e2e-runner preflight <repo> <candidate-sha>
+#   ship-e2e-runner run <repo> <candidate-sha> <expected-image-id> <expected-contract-sha256>
+#
+# preflight is read-only: it never pulls, never runs a container,
+# never writes, and never mutates live state. It must be called
+# before the non-prod rollout so readiness is verified before
+# rollout. run must be called only after that exact-candidate
+# rollout, and it re-verifies the same image before running, so
+# the image that was verified is the image that runs.
+# No host Node or package manager is used in either phase, and
+# there is no fallback to a host invocation when isolation is
+# declared: a missing runner, a missing image, or any contract
+# mismatch blocks.
+
+err() { printf 'ship-e2e-runner: %s\n' "$*" >&2; }
+fail() { err "$*"; exit 1; }
+
+[[ $# -ge 3 ]] || fail "usage: ship-e2e-runner preflight|run <repo> <candidate-sha> [...]"
+PHASE="$1"; shift
+REPO="$1"; shift
+CANDIDATE="$1"; shift
+
+[[ "$PHASE" == "preflight" || "$PHASE" == "run" ]] \
+  || fail "phase must be preflight or run"
+[[ "$CANDIDATE" =~ ^[0-9a-f]{40}$ ]] \
+  || fail "candidate SHA is not a full SHA"
+[[ -d "$REPO" ]] || fail "repository path does not exist or is not a directory"
+REPO_ABS="$(cd -- "$REPO" && pwd)"
+git -C "$REPO_ABS" cat-file -e "$CANDIDATE" >/dev/null 2>&1 \
+  || fail "candidate SHA not present locally: $CANDIDATE"
+
+EXPECTED_IMAGE_ID=""
+EXPECTED_CONTRACT_SHA256=""
+if [[ "$PHASE" == "run" ]]; then
+  [[ $# -eq 2 ]] || fail "run requires <expected-image-id> <expected-contract-sha256>"
+  EXPECTED_IMAGE_ID="$1"; EXPECTED_CONTRACT_SHA256="$2"; shift 2
+  [[ "$EXPECTED_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || fail "expected image id is not a digest"
+  [[ "$EXPECTED_CONTRACT_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+    || fail "expected contract hash is not a digest"
+else
+  [[ $# -eq 0 ]] || fail "preflight takes no extra arguments"
+fi
+
+# --- Candidate contract and package manifest, from the candidate
+# commit only. Working-tree copies are never read here, so a later
+# working-tree edit or a moved HEAD cannot change what runs for
+# this candidate. Both files are extracted to owned temp files.
+CONTRACT_TMP="$(mktemp)"
+PKG_TMP="$(mktemp)"
+# shellcheck disable=SC2329
+cleanup_tmp() { rm -f -- "$CONTRACT_TMP" "$PKG_TMP"; }
+trap cleanup_tmp EXIT
+
+git -C "$REPO_ABS" cat-file -p "$CANDIDATE:.ship/e2e-runner.json" >"$CONTRACT_TMP" 2>/dev/null \
+  || fail "isolated E2E contract missing in candidate tree (.ship/e2e-runner.json)"
+git -C "$REPO_ABS" cat-file -p "$CANDIDATE:package.json" >"$PKG_TMP" 2>/dev/null \
+  || fail "package.json is not tracked in the candidate tree"
+
+CONTRACT_SHA256="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$CONTRACT_TMP")"
+
+# Validate the versioned contract and cross-check it against the
+# candidate package manifest. Prints manager and image on stdout
+# as tab-separated values for the shell to consume; any invalid
+# shape blocks. No contract value is ever evaluated as shell code.
+VALIDATED="$(python3 - "$CONTRACT_TMP" "$PKG_TMP" <<'PYEOF'
+import json
+import re
+import sys
+
+contract_path, pkg_path = sys.argv[1], sys.argv[2]
+try:
+    with open(contract_path, encoding="utf-8") as handle:
+        contract = json.load(handle)
+except (OSError, ValueError) as error:
+    print(f"ship-e2e-runner: isolated E2E contract is not valid JSON: {error}", file=sys.stderr)
+    sys.exit(1)
+try:
+    with open(pkg_path, encoding="utf-8") as handle:
+        pkg = json.load(handle)
+except (OSError, ValueError) as error:
+    print(f"ship-e2e-runner: candidate package.json is not valid JSON: {error}", file=sys.stderr)
+    sys.exit(1)
+
+def invalid(message):
+    print(f"ship-e2e-runner: {message}", file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(contract, dict) or set(contract) != {"schema_version", "runner"}:
+    invalid("isolated E2E contract must have exactly schema_version and runner")
+if contract.get("schema_version") != 1 or isinstance(contract.get("schema_version"), bool):
+    invalid("isolated E2E contract schema_version must be 1")
+runner = contract.get("runner")
+if not isinstance(runner, dict) or set(runner) != {"kind", "image", "command"}:
+    invalid("isolated E2E runner must have exactly kind, image, and command")
+if runner.get("kind") != "oci":
+    invalid("isolated E2E runner kind must be oci (only supported backend)")
+image = runner.get("image")
+if not isinstance(image, str) or not re.fullmatch(
+    r"[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}", image
+):
+    invalid("isolated E2E runner image must be digest-pinned as <repository>@sha256:<64 hex>")
+command = runner.get("command")
+if (
+    not isinstance(command, list)
+    or len(command) != 3
+    or command[1:] != ["run", "test:e2e"]
+    or command[0] not in ("npm", "pnpm", "yarn", "bun")
+):
+    invalid("isolated E2E runner command must be exactly [<manager>, run, test:e2e]")
+manager = command[0]
+if not isinstance(pkg, dict):
+    invalid("candidate package.json must be an object")
+pinned = pkg.get("packageManager")
+if not isinstance(pinned, str) or not re.fullmatch(
+    r"[A-Za-z0-9][A-Za-z0-9._-]*@[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?",
+    pinned.strip(),
+):
+    invalid("candidate packageManager pin is missing or invalid")
+if pinned.strip().split("@", 1)[0] != manager:
+    invalid("isolated E2E runner command manager must match candidate packageManager")
+scripts = pkg.get("scripts")
+if not isinstance(scripts, dict) or not isinstance(scripts.get("test:e2e"), str) or not scripts["test:e2e"].strip():
+    invalid("candidate test:e2e script must be a non-empty string")
+print(f"{manager}\t{image}")
+PYEOF
+)" || fail "isolated E2E contract validation failed"
+MANAGER="$(printf '%s' "$VALIDATED" | cut -f1)"
+IMAGE="$(printf '%s' "$VALIDATED" | cut -f2)"
+[[ "$MANAGER" == npm || "$MANAGER" == pnpm || "$MANAGER" == yarn || "$MANAGER" == bun ]] \
+  || fail "unsupported package manager in isolated E2E contract: $MANAGER"
+[[ "$IMAGE" == *"@sha256:"* ]] || fail "isolated E2E runner image must be digest-pinned"
+
+# --- OCI runtime resolution. The runner is required; there is no
+# host fallback when isolation is declared.
+DOCKER_BIN="$(command -v docker || true)"
+[[ -n "$DOCKER_BIN" ]] \
+  || fail "docker is required for isolated E2E and was not found; no host fallback"
+
+inspect_image_id() {
+  local resolved
+  resolved="$("$DOCKER_BIN" image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null)" \
+    || fail "runner image is not present locally (no pull will be attempted): $IMAGE"
+  resolved="$(printf '%s' "$resolved" | tr -d '[:space:]')"
+  [[ "$resolved" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || fail "runner image inspect did not resolve to a digest id for $IMAGE"
+  printf '%s' "$resolved"
+}
+
+IMAGE_ID="$(inspect_image_id)"
+
+if [[ "$PHASE" == "preflight" ]]; then
+  printf 'SHIP_E2E_MODE=isolated_oci\n'
+  printf 'SHIP_E2E_MANAGER=%s\n' "$MANAGER"
+  printf 'SHIP_E2E_IMAGE=%s\n' "$IMAGE"
+  printf 'SHIP_E2E_IMAGE_ID=%s\n' "$IMAGE_ID"
+  printf 'SHIP_E2E_CONTRACT_SHA256=%s\n' "$CONTRACT_SHA256"
+  exit 0
+fi
+
+# --- run phase: the same contract and the same image, re-verified.
+[[ "$CONTRACT_SHA256" == "$EXPECTED_CONTRACT_SHA256" ]] \
+  || fail "isolated E2E contract drift: candidate contract hash $CONTRACT_SHA256 does not equal the preflight hash $EXPECTED_CONTRACT_SHA256"
+[[ "$IMAGE_ID" == "$EXPECTED_IMAGE_ID" ]] \
+  || fail "isolated E2E runner image drift: resolved image id $IMAGE_ID does not equal the preflight image id $EXPECTED_IMAGE_ID"
+
+# Export exactly the candidate tree into an owned temporary
+# workspace. Only that export is mounted into the container: no
+# .git directory, no untracked files, no host secrets, and no
+# other host paths are exposed. A temporary index keeps the host
+# index untouched.
+WORKSPACE="$(mktemp -d)"
+TMP_INDEX="$(mktemp)"
+# shellcheck disable=SC2329
+cleanup_run() {
+  rm -rf -- "$WORKSPACE"
+  rm -f -- "$TMP_INDEX"
+}
+trap 'cleanup_tmp; cleanup_run' EXIT
+GIT_INDEX_FILE="$TMP_INDEX" git -C "$REPO_ABS" read-tree "$CANDIDATE" \
+  || fail "cannot stage candidate tree for isolated E2E export"
+GIT_INDEX_FILE="$TMP_INDEX" git -C "$REPO_ABS" checkout-index -a -f --prefix="$WORKSPACE/" \
+  || fail "cannot export candidate tree for isolated E2E"
+
+# Run the full test:e2e command inside the verified image with
+# least-privilege container settings: no pull, bridge network
+# only (never host), capabilities dropped, no-new-privileges,
+# read-only root filesystem with a bounded tmpfs for /tmp, and
+# only the exported workspace mounted. Only the two explicit
+# candidate variables plus HOME are passed; no host environment,
+# credential, or socket is forwarded. The image and toolchain
+# are independent of the application image; the command is the
+# fixed manager invocation, never a shell snippet.
+"$DOCKER_BIN" run --rm --pull never --network bridge \
+  --cap-drop ALL --security-opt no-new-privileges:true \
+  --read-only --tmpfs /tmp:rw,noexec,nosuid,size=268435456 \
+  --pids-limit 512 --user 1000:1000 \
+  --workdir /workspace \
+  --volume "$WORKSPACE:/workspace" \
+  --env "SHIP_TARGET_SHA=$CANDIDATE" \
+  --env "SHIP_DEPLOYED_SHA=$CANDIDATE" \
+  --env HOME=/tmp \
+  "$IMAGE" "$MANAGER" run test:e2e
+# With set -e, a non-zero container exit exits here and blocks the
+# push; reaching the next line means the full suite succeeded.
+printf 'ship-e2e-runner: isolated E2E succeeded for %s with image %s\n' "$CANDIDATE" "$IMAGE"
+exit 0

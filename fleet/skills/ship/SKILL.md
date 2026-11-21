@@ -90,6 +90,15 @@ Step 1; there is no other opt-in signal:
   `SHIP_DEPLOYED_SHA` in the environment, both set to the exact
   candidate SHA. The repository's E2E suite must finish successfully
   against the deployment of the exact candidate SHA.
+- When `.ship/e2e-runner.json` is present in the candidate tree, the
+  repository opts into isolation: a versioned, digest-pinned OCI
+  contract (`isolated_oci`) read from the candidate commit and
+  enforced by the fleet `scripts/ship/ship-e2e-runner`, with no
+  host Node or package manager in the E2E path and no host fallback.
+  When it is absent, the repository stays on the legacy host
+  invocation (`legacy_host`), which is explicit migration debt and
+  is never reported as isolated. Companion remains legacy until it
+  migrates; this change alone does not fix Companion.
 - `.husky/pre-push` delegates with exactly one effective line to the
   fleet wrapper `scripts/ship/ship-deploy` (see `docs/ship.md` for the
   standardized wiring fixture). A comment mentioning the wrapper path
@@ -400,16 +409,30 @@ nested in the Step 3 push: the real `.husky/pre-push` hook calls
 ```
 
 with the Git pre-push record on standard input. `ship-deploy` extracts
-the single exact outgoing SHA, runs `<repo>/scripts/ship-deploy <SHA>`
-for the non-production rollout, verifies the single deterministic
-`SHIP_DEPLOYED_SHA` line naming that SHA, then runs the full owner
-`test:e2e` suite against that deployment with `SHIP_TARGET_SHA` and
-`SHIP_DEPLOYED_SHA` set to the candidate. The repository's E2E suite
-must finish successfully. Both succeed before Git uploads anything;
-any failure exits non-zero and blocks the push. The shared layer does
-not classify tests and does not ask which tests to run: the whole
-`test:e2e` suite runs every time. Receipt content, not a filename, binds
-the run to the candidate, remote, and ref.
+the single exact outgoing SHA, then runs check, deploy, run in that
+order. When the candidate carries the isolated contract, the fleet
+`scripts/ship/ship-e2e-runner` preflight runs first: it reads the
+versioned digest-pinned OCI contract from the candidate commit,
+verifies the runner image is already present locally with no
+implicit pull, and records the image id and contract hash. Only
+then does `ship-deploy` run `<repo>/scripts/ship-deploy <SHA>` for
+the non-production rollout and verify the single deterministic
+`SHIP_DEPLOYED_SHA` line naming that SHA. After rollout, the runner
+re-verifies the same contract hash and the same image id and runs
+the full owner `test:e2e` suite inside that exact image with
+`SHIP_TARGET_SHA` and `SHIP_DEPLOYED_SHA` set to the candidate, with
+no host Node or package manager and no host fallback. When the
+candidate has no contract, the suite runs on the host in legacy
+mode, recorded as `legacy_host` migration debt. The repository's
+E2E suite must finish successfully. Every step succeeds before Git
+uploads anything; any failure exits non-zero and blocks the push.
+The shared layer does not classify tests and does not ask which
+tests to run: the whole `test:e2e` suite runs every time. Receipt
+content, not a filename, binds the run to the candidate, remote,
+and ref. Worker never runs the runner directly and never falls
+back to a host invocation when isolation is declared; a missing
+image or a drifted image is a blocker, reported with its preflight
+output preserved.
 
 Deployment goes to the repository's existing configured non-production
 target only: the repository's own `scripts/ship-deploy` entry. If that
@@ -508,5 +531,10 @@ one-SHA-argument and single `SHIP_DEPLOYED_SHA` line contract; wire
 `.husky/pre-push` to the fleet `scripts/ship/ship-deploy` wrapper per
 `docs/ship.md`; keep run evidence under `.git` (never commit it); and
 run the realistic fixtures in `tests/ship_workflow_test.py` until a
-real push of the exact candidate succeeds. Authorization stays with
+real push of the exact candidate succeeds. To migrate from legacy to
+isolation, add a valid `.ship/e2e-runner.json` with a digest-pinned
+image that is present locally before rollout and runs the suite
+inside that image, keep the isolated fixtures green, and only then
+claim isolation; until then the repository stays legacy migration
+debt and is never reported as isolated. Authorization stays with
 Cal; Worker reports blockers rather than adapting around them.

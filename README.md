@@ -20,7 +20,7 @@ fleet/              # OpenCode global config root (OPENCODE_CONFIG_DIR)
 ├── AGENTS.md       # Shared fleet-wide instructions (global file)
 └── opencode.jsonc  # Complete tracked global OpenCode config (only config)
 examples/           # Device-settings example only (fake values)
-scripts/ship/       # Check runner, ship doctor, ship-build, ship-deploy
+scripts/ship/       # Check runner, ship doctor, ship-build, ship-deploy, ship-e2e-runner
 ```
 
 Private runtime siblings (see below) also live on disk under `fleet/`

@@ -37,6 +37,7 @@ TOOL = "ship-doctor"
 MAX_PACKAGE_JSON_BYTES = 1_048_576
 MAX_HOOK_BYTES = 65_536
 MAX_GIT_CONFIG_BYTES = 65_536
+MAX_RUNNER_CONTRACT_BYTES = 65_536
 
 MANAGER_LOCKFILES = {
     "npm": ("package-lock.json",),
@@ -67,6 +68,8 @@ NOT_CHECKED = [
     "git_state_and_remotes",
     "environment_and_endpoints",
     "deployment",
+    "isolated_e2e_execution",
+    "runner_image_presence",
 ]
 
 CHECK_IDS = [
@@ -91,6 +94,7 @@ CHECK_IDS = [
     "scripts.lint",
     "scripts.test_unit",
     "scripts.test_e2e",
+    "e2e.runner_contract",
     "structure.wiring",
 ]
 
@@ -832,6 +836,98 @@ def _run_with_root(root_fd: int) -> int:
                 checks[check_id] = check(check_id, "fail", "script_not_husky")
             else:
                 checks[check_id] = check(check_id, "pass", "ok")
+
+    # --- Isolated E2E runner contract (shape only, never executed) ---
+    # Absence is the legacy host invocation: it passes with an
+    # explicit legacy reason so the debt stays visible, and it
+    # never claims isolation. Presence opts the repository into
+    # the fleet isolated path: any invalid shape is a known
+    # mismatch (fail), never a fallback to the host invocation.
+    contract_state, contract_text = _read_file(
+        root_fd, (".ship", "e2e-runner.json"), MAX_RUNNER_CONTRACT_BYTES
+    )
+    if contract_state == "missing":
+        checks["e2e.runner_contract"] = check(
+            "e2e.runner_contract", "pass", "legacy_host_e2e"
+        )
+    elif contract_state == "symlink":
+        checks["e2e.runner_contract"] = check(
+            "e2e.runner_contract", "unknown", "symlink_not_allowed"
+        )
+    elif contract_state == "nonregular":
+        checks["e2e.runner_contract"] = check(
+            "e2e.runner_contract", "unknown", "nonregular_file"
+        )
+    elif contract_state == "not_directory":
+        checks["e2e.runner_contract"] = check(
+            "e2e.runner_contract", "fail", "not_directory"
+        )
+    elif contract_state == "oversized":
+        checks["e2e.runner_contract"] = check(
+            "e2e.runner_contract", "unknown", "oversized"
+        )
+    elif contract_state == "malformed":
+        checks["e2e.runner_contract"] = check(
+            "e2e.runner_contract", "unknown", "malformed_metadata"
+        )
+    elif contract_state != "ok" or contract_text is None:
+        checks["e2e.runner_contract"] = check(
+            "e2e.runner_contract", "unknown", "unreadable"
+        )
+    else:
+        try:
+            contract = json.loads(contract_text)
+        except (ValueError, RecursionError):
+            contract = None
+        if not isinstance(contract, dict):
+            checks["e2e.runner_contract"] = check(
+                "e2e.runner_contract", "unknown", "malformed_metadata"
+            )
+        elif not metadata_usable or metadata is None:
+            checks["e2e.runner_contract"] = check(
+                "e2e.runner_contract", "unknown", "not_evaluated"
+            )
+        else:
+            contract_valid = True
+            if set(contract) != {"schema_version", "runner"}:
+                contract_valid = False
+            elif (
+                contract.get("schema_version") != 1
+                or isinstance(contract.get("schema_version"), bool)
+            ):
+                contract_valid = False
+            else:
+                runner = contract.get("runner")
+                if not isinstance(runner, dict) or set(runner) != {
+                    "kind", "image", "command"
+                }:
+                    contract_valid = False
+                elif runner.get("kind") != "oci":
+                    contract_valid = False
+                elif not isinstance(runner.get("image"), str) or not re.fullmatch(
+                    r"[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}",
+                    runner["image"],
+                ):
+                    contract_valid = False
+                else:
+                    command = runner.get("command")
+                    if (
+                        not isinstance(command, list)
+                        or len(command) != 3
+                        or command[1:] != ["run", "test:e2e"]
+                        or command[0] not in ("npm", "pnpm", "yarn", "bun")
+                    ):
+                        contract_valid = False
+                    elif pinned_valid and pinned_name is not None and command[0] != pinned_name:
+                        contract_valid = False
+            if contract_valid:
+                checks["e2e.runner_contract"] = check(
+                    "e2e.runner_contract", "pass", "isolated_oci"
+                )
+            else:
+                checks["e2e.runner_contract"] = check(
+                    "e2e.runner_contract", "fail", "runner_contract_invalid"
+                )
 
     # --- Static structure (only where provable) ---
     if husky_underscore_state == "symlink":

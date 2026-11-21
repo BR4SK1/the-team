@@ -3,8 +3,11 @@ set -euo pipefail
 
 # Fleet ship-deploy wrapper: invoked by the real .husky/pre-push hook
 # with the Git pre-push record on standard input. Extracts the single
-# exact outgoing SHA, runs <repo>/scripts/ship-deploy <SHA>, then runs
-# the full owner test:e2e suite. Both must succeed before upload.
+# exact outgoing SHA, runs the isolated E2E preflight when the
+# candidate opts into isolation, runs <repo>/scripts/ship-deploy
+# <SHA>, then runs the full owner test:e2e suite (inside the
+# preflight-verified image when isolated). All must succeed before
+# upload, in that check, deploy, run order.
 # Usage (via pre-push only):
 #   ship-deploy   # reads refs from stdin
 # No arguments; no staging-endpoint inference; no retries.
@@ -20,6 +23,11 @@ export HUSKY=1
 REPO_ROOT="$(git -C . rev-parse --show-toplevel 2>/dev/null)" \
   || fail "must run inside a Git repository (pre-push hook)"
 cd -- "$REPO_ROOT" || fail "cannot enter repository root"
+# Fleet checkout root: two levels above scripts/ship/. The isolated
+# E2E runner is fleet-owned; a repository script never owns it.
+SHIP_DEPLOY_SCRIPT="${BASH_SOURCE[0]}"
+FLEET_ROOT="$(cd -- "$(dirname -- "$SHIP_DEPLOY_SCRIPT")/../.." && pwd)"
+E2E_RUNNER="$FLEET_ROOT/scripts/ship/ship-e2e-runner"
 GIT_DIR="$(git rev-parse --absolute-git-dir)" || fail "not a Git repository"
 [[ -d "$GIT_DIR" && ! -L "$GIT_DIR" ]] || fail "unsafe Git layout: .git must be a directory, not a symlink"
 
@@ -140,6 +148,78 @@ COMMIT_REMOTE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))
   || fail "opt-in missing: executable scripts/ship-deploy is required"
 [[ ! -L "scripts/ship-deploy" ]] || fail "opt-in invalid: scripts/ship-deploy must not be a symlink"
 
+# --- Isolated E2E mode selection from the candidate tree only.
+# A candidate that carries .ship/e2e-runner.json has opted into
+# the fleet isolated path; a candidate without it is legacy.
+# Legacy keeps the current host invocation until migration: that
+# is explicit migration debt, not isolation, and the evidence
+# records it as legacy_host. Once isolation is declared there
+# is no host fallback: preflight must pass before any rollout,
+# and the run re-verifies the same image after rollout.
+E2E_MODE="legacy_host"
+E2E_IMAGE=""
+E2E_IMAGE_ID=""
+E2E_CONTRACT_SHA256=""
+MANAGER=""
+if git cat-file -e "$candidate:.ship/e2e-runner.json" >/dev/null 2>&1; then
+  E2E_MODE="isolated_oci"
+fi
+if [[ "$E2E_MODE" == "isolated_oci" ]]; then
+  [[ -x "$E2E_RUNNER" ]] \
+    || fail "isolated E2E runner missing or not executable: $E2E_RUNNER; no host fallback"
+  PREFLIGHT_OUT="$(mktemp)"
+  if ! "$E2E_RUNNER" preflight "$REPO_ROOT" "$candidate" >"$PREFLIGHT_OUT" 2>&1; then
+    err "isolated E2E preflight failed for $candidate (before rollout):"
+    cat -- "$PREFLIGHT_OUT" >&2
+    rm -f -- "$PREFLIGHT_OUT"
+    exit 1
+  fi
+  cat -- "$PREFLIGHT_OUT"
+  for key in SHIP_E2E_MODE SHIP_E2E_MANAGER SHIP_E2E_IMAGE SHIP_E2E_IMAGE_ID SHIP_E2E_CONTRACT_SHA256; do
+    count="$(grep -c "^$key=" "$PREFLIGHT_OUT" || true)"
+    [[ "$count" == "1" ]] \
+      || fail "isolated E2E preflight must print exactly one $key line (found $count)"
+  done
+  E2E_MANAGER="$(grep '^SHIP_E2E_MANAGER=' "$PREFLIGHT_OUT" | cut -d= -f2-)"
+  E2E_IMAGE="$(grep '^SHIP_E2E_IMAGE=' "$PREFLIGHT_OUT" | cut -d= -f2-)"
+  E2E_IMAGE_ID="$(grep '^SHIP_E2E_IMAGE_ID=' "$PREFLIGHT_OUT" | cut -d= -f2-)"
+  E2E_CONTRACT_SHA256="$(grep '^SHIP_E2E_CONTRACT_SHA256=' "$PREFLIGHT_OUT" | cut -d= -f2-)"
+  [[ "$E2E_MANAGER" == npm || "$E2E_MANAGER" == pnpm || "$E2E_MANAGER" == yarn || "$E2E_MANAGER" == bun ]] \
+    || fail "isolated E2E preflight manager is unsupported: $E2E_MANAGER"
+  [[ "$E2E_IMAGE" == *"@sha256:"* ]] \
+    || fail "isolated E2E preflight image must be digest-pinned"
+  [[ "$E2E_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || fail "isolated E2E preflight image id is not a digest"
+  [[ "$E2E_CONTRACT_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+    || fail "isolated E2E preflight contract hash is not a digest"
+  MANAGER="$E2E_MANAGER"
+  preflight_evidence="$RUN_DIR/preflight.json"
+  [[ ! -e "$preflight_evidence" && ! -L "$preflight_evidence" ]] \
+    || fail "preflight evidence already exists; refusing to overwrite"
+  tmp_preflight="$(mktemp "$RUN_DIR/.tmp.XXXXXX")"
+  python3 - "$tmp_preflight" "$RUN_ID" "$candidate" "$E2E_IMAGE" "$E2E_IMAGE_ID" "$E2E_CONTRACT_SHA256" "$MANAGER" <<'PYEOF' || fail "cannot write preflight evidence"
+import json
+import sys
+
+out_path = sys.argv[1]
+payload = {
+    "run_id": sys.argv[2],
+    "sha": sys.argv[3],
+    "e2e_mode": "isolated_oci",
+    "e2e_image": sys.argv[4],
+    "e2e_image_id": sys.argv[5],
+    "e2e_contract_sha256": sys.argv[6],
+    "manager": sys.argv[7],
+    "e2e": "test:e2e",
+    "type": "preflight",
+}
+with open(out_path, "w", encoding="utf-8") as handle:
+    handle.write(json.dumps(payload, indent=2) + "\n")
+PYEOF
+  mv "$tmp_preflight" "$preflight_evidence"
+  rm -f -- "$PREFLIGHT_OUT"
+fi
+
 DEPLOY_OUT="$(mktemp)"
 trap 'rm -f "$DEPLOY_OUT"' EXIT
 # --- Non-prod rollout for the exact candidate SHA (one argument).
@@ -167,16 +247,27 @@ DEPLOYED_SHA="$(grep '^SHIP_DEPLOYED_SHA=' "$DEPLOY_OUT" | cut -d= -f2-)"
 # runs in full with no filtering or skipping. The manager comes from
 # the pinned packageManager field; the script name is fixed and always
 # runs in full (no filtering, no skipping).
-MANAGER="$(python3 -c 'import json; d=json.load(open("package.json")); pm=str(d.get("packageManager","")); print(pm.split("@",1)[0])' 2>/dev/null || true)"
-[[ -n "$MANAGER" ]] \
-  || fail "packageManager pin missing; cannot derive the test runner"
-case "$MANAGER" in
-  npm|pnpm|yarn|bun) ;;
-  *) fail "unsupported package manager: $MANAGER" ;;
-esac
-# test:e2e must be a non-empty string (owner command); run it in full.
-if ! SHIP_TARGET_SHA="$candidate" SHIP_DEPLOYED_SHA="$candidate" "$MANAGER" run test:e2e; then
-  exit 1
+# Isolated mode: the fleet runner re-verifies the preflight image
+# and contract, then runs the suite inside that image. No host Node
+# or package manager is used, and there is no fallback to the host
+# invocation. Legacy mode (migration debt until a repository
+# migrates): the host invocation below, recorded as legacy_host.
+if [[ "$E2E_MODE" == "isolated_oci" ]]; then
+  if ! "$E2E_RUNNER" run "$REPO_ROOT" "$candidate" "$E2E_IMAGE_ID" "$E2E_CONTRACT_SHA256"; then
+    exit 1
+  fi
+else
+  MANAGER="$(python3 -c 'import json; d=json.load(open("package.json")); pm=str(d.get("packageManager","")); print(pm.split("@",1)[0])' 2>/dev/null || true)"
+  [[ -n "$MANAGER" ]] \
+    || fail "packageManager pin missing; cannot derive the test runner"
+  case "$MANAGER" in
+    npm|pnpm|yarn|bun) ;;
+    *) fail "unsupported package manager: $MANAGER" ;;
+  esac
+  # test:e2e must be a non-empty string (owner command); run it in full.
+  if ! SHIP_TARGET_SHA="$candidate" SHIP_DEPLOYED_SHA="$candidate" "$MANAGER" run test:e2e; then
+    exit 1
+  fi
 fi
 
 # --- Re-validate HEAD and the clean checkout after deployment and test.
@@ -201,7 +292,7 @@ deploy_evidence="$RUN_DIR/deploy.json"
 [[ ! -e "$deploy_evidence" && ! -L "$deploy_evidence" ]] \
   || fail "deploy evidence already exists; refusing to overwrite"
 tmp_evidence="$(mktemp "$RUN_DIR/.tmp.XXXXXX")"
-python3 - "$tmp_evidence" "$RUN_ID" "$candidate" "$DEPLOYED_SHA" "$COMMIT_REMOTE" "$REMOTE_REF" "$MANAGER" <<'PYEOF' || fail "cannot write deploy evidence"
+python3 - "$tmp_evidence" "$RUN_ID" "$candidate" "$DEPLOYED_SHA" "$COMMIT_REMOTE" "$REMOTE_REF" "$MANAGER" "$E2E_MODE" "$E2E_IMAGE" "$E2E_IMAGE_ID" "$E2E_CONTRACT_SHA256" <<'PYEOF' || fail "cannot write deploy evidence"
 import json
 import sys
 
@@ -213,9 +304,14 @@ payload = {
     "remote": sys.argv[5],
     "ref": sys.argv[6],
     "manager": sys.argv[7],
+    "e2e_mode": sys.argv[8],
     "e2e": "test:e2e",
     "type": "deploy",
 }
+if payload["e2e_mode"] == "isolated_oci":
+    payload["e2e_image"] = sys.argv[9]
+    payload["e2e_image_id"] = sys.argv[10]
+    payload["e2e_contract_sha256"] = sys.argv[11]
 with open(out_path, "w", encoding="utf-8") as handle:
     handle.write(json.dumps(payload, indent=2) + "\n")
 PYEOF
