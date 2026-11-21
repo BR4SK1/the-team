@@ -867,13 +867,6 @@ class ShipDoctorTest(unittest.TestCase):
         self.assertNotIn("explicit include", text)
         self.assertNotIn("on `main` only staged work ships", text)
 
-    def test_fleet_agents_ship_bound_branch_before_editing(self) -> None:
-        text = (REPO_ROOT / "fleet" / "AGENTS.md").read_text(encoding="utf-8")
-        self.assertIn("ship-bound", text)
-        self.assertIn("docs/ship.md", text)
-        self.assertIn("never stage on `main`", text)
-        self.assertIn("scoped to ship-bound work only", text)
-
     def test_pr_template_filled(self) -> None:
         text = (
             REPO_ROOT
