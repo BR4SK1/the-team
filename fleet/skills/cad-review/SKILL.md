@@ -14,21 +14,14 @@ anything. This skill does not grant tool permissions or authorize changes.
 
 - **Safe read-only inspection** (review scope): reading source files, project
   instructions, generated artifacts, manifests, build logs, and check reports;
-  the exact hardened Git inspection invocations permitted by the agent
-  definition (`git --no-optional-locks -c core.fsmonitor=false status`,
-  `git --no-pager diff/log --no-ext-diff --no-textconv` forms); textual
-  inspection of STEP files and similar formats where informative. These exact
-  forms disable the known command-execution paths git consults for inspection
-  (configured external diff, textconv, and pager helpers, optional locks, and
-  the fsmonitor hook), which wildcard shell rules would otherwise permit.
+  read-only Git inspection (`git status`, `git diff`, `git log`, `git show`,
+  `git branch`); textual inspection of STEP files and similar formats where
+  informative.
 - **Out of review scope**: builds, exports, tests, geometric recomputation, or
   any script that writes files, regenerates geometry, or operates a live CAD
-  application. These belong to Mark or Worker under user authorization. The
-  reviewer's permissions should exclude them; if a review cannot proceed
-  without an executed check, state the limit instead of working around it.
-- These exact forms constrain the allowlist; they are not a complete security
-  sandbox. Git still honors other configuration, and the permission match is
-  on the exact command text only.
+  application. These belong to Mark (or Build) under user authorization. The
+  reviewer's permissions exclude them; if a review cannot proceed without an
+  executed check, state the limit instead of working around it.
 - Do not control or save over a live CAD session, and do not propose
   destructive or difficult-to-reverse inspection of owner work.
 
@@ -84,5 +77,5 @@ removable, and source-level changes rather than repair layers.
   assumptions and physical uncertainty.
 - State verification limits explicitly: which checks were not run, which
   artifacts were not inspected, and who is authorized to run the missing
-  checks (Mark or Worker, with user approval).
+  checks (Mark or Build, with user approval).
 - If there are no findings, say so explicitly.

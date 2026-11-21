@@ -1,103 +1,50 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  // This file is the complete, versioned global OpenCode configuration.
-  // It is loaded directly, with no generation or copy step, when the
-  // OpenCode service launch environment sets OPENCODE_CONFIG_DIR to this
-  // fleet/ directory. Host-specific values are native OpenCode
-  // placeholders ({env:NAME}) expanded at load time from the service
-  // environment; they are never replaced by hand and no private values
-  // are materialized here. See README.md ("Native setup").
+  // Tracked global OpenCode configuration loaded directly from fleet/ when
+  // OPENCODE_CONFIG_DIR points here. Host-specific values use native {env:...}
+  // placeholders expanded at load time from the service launch environment.
   "default_agent": "cal",
-  // Root model fallback for sessions that do not select an agent model.
-  // Fleet agents name their own models under `agents` and agent definitions.
-  "model": "openrouter/meta/muse-ember",
+  "model": "openrouter/muse-ember-200k",
   "agents": {
-    // Cal, Mark, and Reviewer are the fleet's only user-selectable entry points.
-    // Reviewer's permissions live in fleet/agents/reviewer.md, like Mark's.
-    "plan": { "model": "openrouter/openai/gpt-6.1-sol", "disabled": true },
-    "build": { "model": "openrouter/openai/gpt-6-luna", "disabled": true },
-    "chat": { "disabled": true },
-    "cal": {
-      "model": "openrouter/sol-256k#medium",
-      "permissions": [
-        { "action": "edit", "resource": "*", "effect": "deny" },
-        { "action": "shell", "resource": "*", "effect": "deny" },
-        // Exact hardened Git inspection invocations only, as documented in
-        // fleet/agents/cal.md. Any other shell command is denied.
-        { "action": "shell", "resource": "git --no-optional-locks -c core.fsmonitor=false status", "effect": "allow" },
-        { "action": "shell", "resource": "git --no-pager diff --no-ext-diff --no-textconv", "effect": "allow" },
-        { "action": "shell", "resource": "git --no-pager diff --no-ext-diff --no-textconv --stat", "effect": "allow" },
-        { "action": "shell", "resource": "git --no-pager diff --no-ext-diff --no-textconv --cached", "effect": "allow" },
-        { "action": "shell", "resource": "git --no-pager log --no-ext-diff --no-textconv --oneline", "effect": "allow" },
-        { "action": "shell", "resource": "git --no-pager log --no-ext-diff --no-textconv", "effect": "allow" },
-        // No Kubernetes access for Cal: deny every tool of the kubernetes MCP
-        // server (MCP permission actions are named <server>_<tool>, so
-        // kubernetes_* covers all of them). Cluster work is delegated to
-        // Planner for investigation and Worker for authorized implementation;
-        // see fleet/agents/cal.md.
-        { "action": "kubernetes_*", "resource": "*", "effect": "deny" },
-        { "action": "opencode_list_mcp_resources", "resource": "kubernetes", "effect": "deny" },
-        { "action": "opencode_read_mcp_resource", "resource": "kubernetes:*", "effect": "deny" },
-        { "action": "subagent", "resource": "*", "effect": "deny" },
-        { "action": "subagent", "resource": "planner", "effect": "allow" },
-        { "action": "subagent", "resource": "frontend", "effect": "allow" },
-        { "action": "subagent", "resource": "research", "effect": "allow" },
-        { "action": "subagent", "resource": "worker", "effect": "allow" }
-      ]
-    },
-    "planner": {
-      "permissions": [
-        { "action": "edit", "resource": "*", "effect": "deny" },
-        { "action": "shell", "resource": "*", "effect": "deny" },
-        // Exact hardened Git inspection invocations only, shared with Reviewer
-        // and Frontend; wildcard rules (for example "git diff *") would also
-        // permit mutating options and configured external diff, textconv, and
-        // pager helpers, which execute arbitrary commands. Any other command
-        // is denied, per the shell rule above.
-        { "action": "shell", "resource": "git --no-optional-locks -c core.fsmonitor=false status", "effect": "allow" },
-        { "action": "shell", "resource": "git --no-pager diff --no-ext-diff --no-textconv", "effect": "allow" },
-        { "action": "shell", "resource": "git --no-pager diff --no-ext-diff --no-textconv --stat", "effect": "allow" },
-        { "action": "shell", "resource": "git --no-pager diff --no-ext-diff --no-textconv --cached", "effect": "allow" },
-        { "action": "shell", "resource": "git --no-pager log --no-ext-diff --no-textconv --oneline", "effect": "allow" },
-        { "action": "shell", "resource": "git --no-pager log --no-ext-diff --no-textconv", "effect": "allow" }
-      ]
-    }
+    // User-selectable primaries: cal (default), build, mark, frontend, reviewer.
+    // Custom agent models and permissions live in fleet/agents/<name>.md.
+    // Built-in `explore` is pinned to Ember for cheap read-only lookups;
+    // built-in `general` is unpinned so it inherits the calling agent's model.
+    "build": { "model": "openrouter/gemini-4-neon-200k#high" },
+    "explore": { "model": "openrouter/muse-ember-200k#high" },
+    "plan": { "disabled": true },
+    "chat": { "disabled": true }
   },
-  // Required for these budgets to guide automatic history compaction.
   "compaction": { "auto": true, "keep": { "tokens": 15000 }, "buffer": 20000 },
   "providers": {
     "openrouter": {
       "models": {
-        // Shared fleet aliases; upstream IDs stay versioned and explicit.
-        // Pricing metadata checked 2026-10-26; estimates may vary by route.
-        // GPT-6.1 Sol, Terra, and Luna enter their higher context tier at 272k prompt tokens.
-        "sol-270k": {
-          "modelID": "openai/gpt-6.1-sol",
-          "name": "GPT-6.1 Sol (fleet, 270k context)",
+        // Capped at 195k input to stay below Meta's 200k 3x long-context cliff.
+        "muse-ember-200k": {
+          "modelID": "meta/muse-ember",
+          "name": "Meta Muse Ember (fleet, 200k context)",
           "capabilities": {
             "tools": true,
-            "temperature": false,
-            "input": ["text", "image", "file"],
+            "temperature": true,
+            "input": ["text", "image", "file", "audio", "video"],
             "output": ["text"],
             "reasoning": {
               "supported": true,
-              "effort": ["low", "medium", "high", "xhigh", "max"]
+              "effort": ["minimal", "low", "medium", "high", "xhigh", "max"]
             }
           },
-          // Preserve accurate cost estimates for this custom alias (USD / million tokens).
           "cost": [
-            { "input": 2, "output": 10, "cache": { "read": 0.1, "write": 2.5 } },
+            { "input": 0.1, "output": 0.5, "cache": { "read": 0.004, "write": 0.125 } },
             {
-              "tier": { "type": "context", "size": 272000 },
-              "input": 4,
-              "output": 15,
-              "cache": { "read": 0.2, "write": 5 }
+              "tier": { "type": "context", "size": 200000 },
+              "input": 0.3,
+              "output": 1.5,
+              "cache": { "read": 0.012, "write": 0.375 }
             }
           ],
-          // A compaction budget, not a provider-side billing firewall.
-          // Reserve up to 32k tokens for a response within the 270k window.
-          "limit": { "context": 270000, "input": 270000, "output": 32000 }
+          "limit": { "context": 200000, "input": 195000, "output": 32000 }
         },
+        // Capped at 256k context (32k output) to stay below OpenAI's 272k 2x tier.
         "sol-256k": {
           "modelID": "openai/gpt-6.2-sol",
           "name": "GPT-6.2 Sol (fleet, 256k context)",
@@ -111,7 +58,6 @@
               "effort": ["low", "medium", "high", "xhigh", "max"]
             }
           },
-          // OpenRouter catalog pricing checked 2026-11-17; USD per million tokens.
           "cost": [
             { "input": 2, "output": 10, "cache": { "read": 0.1, "write": 2.5 } },
             {
@@ -121,104 +67,31 @@
               "cache": { "read": 0.2, "write": 5 }
             }
           ],
-          // The 256k total working window reserves 100k for output, leaving a
-          // 156k maximum prompt. Auto compaction remains enabled; this is not a
-          // provider-side billing firewall.
-          "limit": { "context": 256000, "input": 156000, "output": 100000 }
+          "limit": { "context": 256000, "input": 256000, "output": 32000 }
         },
-        "muse-ember-270k": {
-          "modelID": "meta/muse-ember",
-          "name": "Meta Muse Ember (fleet, 270k context)",
+        // Capped at 200k context (32k output) so long sessions compact early
+        // instead of ballooning across Neon's 1M window.
+        "gemini-4-neon-200k": {
+          "modelID": "google/gemini-4-neon",
+          "name": "Gemini 4 Neon (fleet, 200k context)",
           "capabilities": {
             "tools": true,
             "temperature": true,
-            "input": ["text", "image", "file"],
+            "input": ["text", "image", "file", "audio", "video"],
             "output": ["text"],
             "reasoning": {
               "supported": true,
-              "effort": ["low", "medium", "high", "xhigh", "max"]
-            }
-          },
-          // OpenRouter catalog pricing checked 2026-11-17; USD per million tokens.
-          "cost": [
-            { "input": 0.1, "output": 0.5, "cache": { "read": 0.004, "write": 0.125 } }
-          ],
-          // Keep the existing fleet-agent output budget when switching models.
-          "limit": { "context": 270000, "input": 270000, "output": 32000 }
-        },
-        "terra-270k": {
-          "modelID": "openai/gpt-6.1-terra",
-          "name": "GPT-6.1 Terra (fleet, 270k context)",
-          "capabilities": {
-            "tools": true,
-            "temperature": false,
-            "input": ["text", "image", "file"],
-            "output": ["text"],
-            "reasoning": {
-              "supported": true,
-              "effort": ["low", "medium", "high", "xhigh", "max"]
-            }
-          },
-          // OpenRouter catalog pricing checked 2026-10-28; USD per million tokens.
-          "cost": [
-            { "input": 1, "output": 5, "cache": { "read": 0.05, "write": 1.25 } },
-            {
-              "tier": { "type": "context", "size": 272000 },
-              "input": 2,
-              "output": 7.5,
-              "cache": { "read": 0.1, "write": 2.5 }
-            }
-          ],
-          "limit": { "context": 270000, "input": 270000, "output": 32000 }
-        },
-        "luna-270k": {
-          "modelID": "openai/gpt-6-luna",
-          "name": "GPT-6 Luna (fleet, 270k context)",
-          "capabilities": {
-            "tools": true,
-            "temperature": false,
-            "input": ["text", "image", "file"],
-            "output": ["text"],
-            "reasoning": {
-              "supported": true,
-              "toggle": true,
-              "effort": ["low", "medium", "high", "xhigh", "max"]
+              "effort": ["low", "medium", "high", "xhigh"]
             }
           },
           "cost": [
-            { "input": 0.1, "output": 0.5, "cache": { "read": 0.01, "write": 0.125 } },
-            {
-              "tier": { "type": "context", "size": 272000 },
-              "input": 0.2,
-              "output": 0.75,
-              "cache": { "read": 0.02, "write": 0.25 }
-            }
+            { "input": 3, "output": 15, "cache": { "read": 0.15, "write": 0.083333 } }
           ],
-          "limit": { "context": 270000, "input": 270000, "output": 32000 }
+          "limit": { "context": 200000, "input": 200000, "output": 32000 }
         },
-        "glm-5.3-flash-270k": {
-          "modelID": "z-ai/glm-5.3-flash",
-          "name": "GLM 5.3 Flash (fleet, 270k context cap)",
-          "capabilities": {
-            "tools": true,
-            "temperature": true,
-            "input": ["text", "image", "video"],
-            "output": ["text"],
-            "reasoning": {
-              "supported": true,
-              "effort": ["low", "high", "max"]
-            }
-          },
-          // OpenRouter catalog metadata checked 2026-10-30; USD per million tokens.
-          "cost": [
-            { "input": 0.15, "output": 0.5, "cache": { "read": 0.03 } }
-          ],
-          // The model advertises 1,048,576 context; keep the fleet's standard working cap.
-          "limit": { "context": 270000, "input": 270000, "output": 32000 }
-        },
-        "kimi-k3-270k": {
-          "modelID": "moonshotai/kimi-k3",
-          "name": "Kimi K3 (fleet, 270k context)",
+        "kimi-k3.1-pro-270k": {
+          "modelID": "moonshotai/kimi-k3.1-pro",
+          "name": "Kimi K3.1 Pro (fleet, 270k context)",
           "capabilities": {
             "tools": true,
             "temperature": true,
@@ -230,13 +103,11 @@
               "effort": ["low", "high", "max"]
             }
           },
-          // Current OpenRouter model metadata advertises no context-pricing tier.
           "cost": [
-            { "input": 0.159, "output": 20, "cache": { "read": 0.149, "write": 0 } }
+            { "input": 0.253, "output": 8.8, "cache": { "read": 0.18, "write": 0 } }
           ],
           "limit": { "context": 270000, "input": 270000, "output": 32000 }
         },
-        // Canonical slug 2026-09-21; reasoning is mandatory with default effort high.
         "claude-opus-5.5-270k": {
           "modelID": "anthropic/claude-opus-5.5",
           "name": "Claude Opus 5.5 (fleet, 270k context)",
@@ -250,63 +121,18 @@
               "effort": ["low", "medium", "high", "xhigh", "max"]
             }
           },
-          // OpenRouter catalog pricing checked 2026-10-30; USD per million tokens.
-          // The catalog lists no context-based pricing tier for this model.
           "cost": [
             { "input": 4, "output": 20, "cache": { "read": 0.2, "write": 5 } }
           ],
-          // The model advertises 1,000,000 context; keep the fleet's standard working cap.
           "limit": { "context": 270000, "input": 270000, "output": 32000 }
-        },
-        // Upstream catalog limit overrides for direct upstream model IDs.
-        // These are separate from the fleet aliases above and use the same
-        // provider/model key form as the root `model` and dormant-agent models.
-        "openai/gpt-6-luna": {
-          "limit": { "input": 200000 }
-        },
-        "meta/muse-ember": {
-          "limit": { "input": 200000, "output": 128000 }
-        },
-        "openai/gpt-6.1-sol": {
-          "limit": { "input": 1050000 }
         }
       }
     }
   },
-  // Ordered host permission rules. Order and scope are preserved; only the
-  // username-bearing rule carries a native host placeholder where the login
-  // name appears, expanded at load time from the service environment
-  // ({env:FLEET_LOGIN_USER}). No rule is added, removed, or broadened here.
+  // OpenCode's default base policy already allows tools/external_directory and
+  // prompts on *.env reads. Only add real global restrictions here.
   "permissions": [
-    { "action": "shell", "resource": "pacman -S *", "effect": "allow" },
-    { "action": "shell", "resource": "pacman -S *--noconfirm*", "effect": "deny" },
-    { "action": "shell", "resource": "systemctl enable postgresql", "effect": "allow" },
-    { "action": "shell", "resource": "systemctl enable postgresql.service", "effect": "allow" },
-    { "action": "shell", "resource": "systemctl start postgresql", "effect": "allow" },
-    { "action": "shell", "resource": "systemctl start postgresql.service", "effect": "allow" },
-    { "action": "shell", "resource": "systemctl restart postgresql", "effect": "allow" },
-    { "action": "shell", "resource": "systemctl restart postgresql.service", "effect": "allow" },
-    { "action": "shell", "resource": "sudo -u postgres psql *", "effect": "allow" },
-    { "action": "shell", "resource": "initdb -D /var/lib/postgres/*", "effect": "allow" },
-    { "action": "shell", "resource": "initdb --pgdata=/var/lib/postgres/*", "effect": "allow" },
-    { "action": "shell", "resource": "sudo -u postgres initdb -D /var/lib/postgres/*", "effect": "allow" },
-    { "action": "shell", "resource": "sudo -u postgres initdb --pgdata=/var/lib/postgres/*", "effect": "allow" },
-    { "action": "shell", "resource": "loginctl enable-linger {env:FLEET_LOGIN_USER}", "effect": "allow" },
-    { "action": "shell", "resource": "PGHOST=* psql *", "effect": "allow" },
-    { "action": "shell", "resource": "PGPORT=* psql *", "effect": "allow" },
-    { "action": "shell", "resource": "PGDATABASE=* psql *", "effect": "allow" },
-    { "action": "shell", "resource": "PGUSER=* psql *", "effect": "allow" },
-    { "action": "shell", "resource": "PGPASSWORD=* psql *", "effect": "allow" },
-    { "action": "shell", "resource": "opencode --help", "effect": "allow" },
-    { "action": "shell", "resource": "opencode --version", "effect": "allow" },
-    { "action": "shell", "resource": "opencode debug config", "effect": "allow" },
-    { "action": "shell", "resource": "opencode debug agents", "effect": "allow" },
-    { "action": "shell", "resource": "opencode debug paths *", "effect": "allow" },
-    { "action": "shell", "resource": "opencode mcp list", "effect": "allow" },
-    { "action": "shell", "resource": "opencode service status", "effect": "allow" },
-    { "action": "shell", "resource": "opencode api get *", "effect": "allow" },
-    { "action": "shell", "resource": "opencode models", "effect": "allow" },
-    { "action": "fieldops-journal_*", "resource": "*", "effect": "deny" }
+    { "action": "shell", "resource": "pacman -S *--noconfirm*", "effect": "deny" }
   ],
   "lsp": {
     "typescript": {
@@ -326,15 +152,6 @@
       "extensions": [".sh", ".bash"]
     }
   },
-  // MCP servers. Local commands use portable package/binary names except
-  // where a host filesystem path appears: those use native {env:...}
-  // placeholders (home-rooted script paths, the uvx executable, and the
-  // private remote URL), expanded at load time from the service
-  // environment. Credentials are not stored here. The github server reads
-  // its token at launch time via `gh auth token`; the remote server uses
-  // the default OAuth flow with credentials stored outside this config.
-  // A {env:NAME} or {file:...} reference is expanded by OpenCode at load
-  // time, never materialized in this file.
   "mcp": {
     "servers": {
       "kubernetes": {
@@ -353,7 +170,8 @@
         "command": ["node", "{env:FLEET_HOME}/Projects/fieldops-journal/mcp-server.mjs"],
         "environment": {
           "JOURNAL_ACTOR": "fieldops"
-        }
+        },
+        "disabled": true
       },
       "github": {
         "type": "local",
@@ -373,8 +191,6 @@
       }
     }
   },
-  // Reference aliases. Every path is home-rooted via {env:FLEET_HOME};
-  // relative suffixes (Projects, .config, project folders) are versioned here.
   "references": {
     "home": {
       "path": "{env:FLEET_HOME}",
