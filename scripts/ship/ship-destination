@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""Read-only ship destination selection (Step 2 helper).
+
+Resolves the ship destination (remote, topic branch, ref, GitHub
+identity) from verified repository state
+only, so Worker never has to guess or ask the user for a routine
+git-derived value. The /ship invocation itself authorizes the routine
+staged-only workflow; this helper only decides whether a destination
+is verified and unambiguous, and blocks otherwise.
+
+Usage:
+  ship-destination <repo> [--remote <name>] [--branch <topic>]
+
+- --remote / --branch carry explicit prior instructions only. Cal
+  passes them when the user already named them; otherwise they are
+  omitted and the destination is derived below. They are never
+  invented here.
+- Off main: the topic is the current branch. The remote is the
+  current branch's configured upstream remote when that upstream is
+  appropriate (its merge ref names the same branch), otherwise the
+  single configured remote.
+- On main: the topic is derived deterministically from the staged
+  change (ship/<staged-path slug>, suffixed -2, -3, ... until free
+  locally and in the selected remote's tracking refs). The remote is
+  main's configured tracking remote when set, otherwise the single
+  configured remote.
+- A multiple-remote repository with no explicit, upstream, or
+  main-tracking resolution is ambiguous and blocks. A selected remote
+  that would divert or add refs (pushurl, mirror, tagOpt --tags),
+  or whose URL does not parse to one GitHub owner/repository, blocks.
+  Nothing is inferred from an unverified default.
+
+Read-only by construction: only allowlisted read-only Git
+invocations (with --no-optional-locks), no writes, no fetch, no
+push, no network, and no target-code execution. Output is versioned
+JSON on stdout and never emits a raw remote URL (which could carry
+credentials); only the parsed GitHub owner/repository is emitted.
+Exit codes: 0 selected, 1 blocked, 2 indeterminate.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+SCHEMA_VERSION = 1
+TOOL = "ship-destination"
+MAIN = "main"
+SAFE_BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9/_-]*$")
+GITHUB_PATTERNS = (
+    re.compile(r"^(?:https?|ssh)://(?:[^@/]+@)?github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?$"),
+    re.compile(r"^git@github\.com:([^/\s]+)/([^/\s]+?)(?:\.git)?$"),
+)
+
+
+def emit(payload, code):
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return code
+
+
+def base_payload():
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "tool": TOOL,
+        "status": "blocked",
+        "reason": "indeterminate",
+        "branch": None,
+        "on_main": False,
+        "remote": None,
+        "topic": None,
+        "ref": None,
+        "github": None,
+        "staged_files": [],
+        "outgoing_commits": [],
+        "suggested_message": None,
+        "selection": None,
+        "scope": {"staged_empty": False, "unstaged": [], "untracked": []},
+    }
+
+
+def git(repo, *args):
+    """Run one allowlisted read-only Git invocation, return (rc, text)."""
+    proc = subprocess.run(
+        ["git", "--no-optional-locks", "-C", repo, *args],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    return proc.returncode, proc.stdout.strip()
+
+
+def config_get(repo, key):
+    rc, out = git(repo, "config", "--get", key)
+    return out if rc == 0 else ""
+
+
+def config_get_all(repo, key):
+    rc, out = git(repo, "config", "--get-all", key)
+    if rc != 0 or not out:
+        return []
+    return [line for line in out.splitlines() if line]
+
+
+def slugify(part):
+    slug = re.sub(r"[^a-z0-9]+", "-", part.lower()).strip("-")
+    return slug
+
+
+def slug_from_path(path_str):
+    path = Path(path_str)
+    parts = list(path.parent.parts) + [path.stem]
+    slugs = [slugify(part) for part in parts]
+    slugs = [slug for slug in slugs if slug]
+    return "-".join(slugs)[:40].strip("-") or "change"
+
+
+def parse_github(url):
+    for pattern in GITHUB_PATTERNS:
+        match = pattern.match(url.strip())
+        if match:
+            owner, repo = match.group(1), match.group(2)
+            if owner and repo and ".." not in owner and ".." not in repo:
+                return {"owner": owner, "repo": repo}
+    return None
+
+
+def main(argv):
+    payload = base_payload()
+    if not argv or argv[0].startswith("-"):
+        payload["reason"] = "usage"
+        return emit(payload, 2)
+    repo_arg = argv[0]
+    rest = argv[1:]
+    explicit_remote = ""
+    explicit_branch = ""
+    index = 0
+    while index < len(rest):
+        if rest[index] == "--remote" and index + 1 < len(rest):
+            explicit_remote = rest[index + 1]
+            index += 2
+        elif rest[index] == "--branch" and index + 1 < len(rest):
+            explicit_branch = rest[index + 1]
+            index += 2
+        else:
+            payload["reason"] = "usage"
+            return emit(payload, 2)
+
+    repo_path = Path(repo_arg)
+    if repo_path.is_symlink() or not repo_path.is_dir():
+        payload["reason"] = "not_a_repository"
+        return emit(payload, 2)
+    repo = os.path.abspath(repo_arg)
+
+    rc, toplevel = git(repo, "rev-parse", "--show-toplevel")
+    if rc != 0:
+        payload["reason"] = "not_a_repository"
+        return emit(payload, 2)
+    if toplevel != repo:
+        payload["reason"] = "not_repository_root"
+        return emit(payload, 2)
+    rc, git_dir = git(repo, "rev-parse", "--absolute-git-dir")
+    if rc != 0 or not git_dir or Path(git_dir).is_symlink() or not Path(git_dir).is_dir():
+        payload["reason"] = "unsafe_git_layout"
+        return emit(payload, 2)
+
+    rc, branch = git(repo, "branch", "--show-current")
+    if rc != 0:
+        payload["reason"] = "indeterminate"
+        return emit(payload, 2)
+    payload["branch"] = branch or None
+    if not branch:
+        payload["reason"] = "detached_head"
+        return emit(payload, 1)
+    payload["on_main"] = branch == MAIN
+
+    rc, _ = git(repo, "show-ref", "--verify", "-q", f"refs/heads/{MAIN}")
+    if rc != 0:
+        payload["reason"] = "missing_local_main"
+        return emit(payload, 1)
+
+    _, staged_text = git(repo, "diff", "--cached", "--name-only")
+    staged = [line for line in staged_text.splitlines() if line] if staged_text else []
+    _, unstaged_text = git(repo, "diff", "--name-only")
+    unstaged = [line for line in unstaged_text.splitlines() if line] if unstaged_text else []
+    _, untracked_text = git(repo, "ls-files", "--others", "--exclude-standard")
+    untracked = [line for line in untracked_text.splitlines() if line] if untracked_text else []
+    payload["staged_files"] = staged
+    payload["scope"] = {
+        "staged_empty": not staged,
+        "unstaged": unstaged,
+        "untracked": untracked,
+    }
+    _, outgoing_text = git(repo, "log", "--oneline", f"{MAIN}..HEAD")
+    payload["outgoing_commits"] = (
+        [line for line in outgoing_text.splitlines() if line] if outgoing_text else []
+    )
+
+    if not staged:
+        payload["reason"] = "staged_empty"
+        return emit(payload, 1)
+    if unstaged or untracked:
+        payload["reason"] = "scope_unclean"
+        return emit(payload, 1)
+
+    # --- Topic branch.
+    if payload["on_main"]:
+        if explicit_branch:
+            topic = explicit_branch
+            if (
+                topic == MAIN
+                or not SAFE_BRANCH.match(topic)
+                or ".." in topic
+            ):
+                payload["reason"] = "unsafe_branch_name"
+                return emit(payload, 1)
+            rc, _ = git(repo, "show-ref", "--verify", "-q", f"refs/heads/{topic}")
+            if rc == 0:
+                payload["reason"] = "explicit_branch_exists"
+                return emit(payload, 1)
+            selection_topic = "explicit"
+        else:
+            base_topic = f"ship/{slug_from_path(sorted(staged)[0])}"
+            topic = base_topic
+            suffix = 2
+            while True:
+                rc_local, _ = git(repo, "show-ref", "--verify", "-q", f"refs/heads/{topic}")
+                # Remote-tracking existence needs the remote, resolved
+                # below; local existence alone drives suffixing here and
+                # the tracking check runs after remote selection.
+                if rc_local != 0:
+                    break
+                topic = f"{base_topic}-{suffix}"
+                suffix += 1
+            selection_topic = "derived_on_main"
+    else:
+        if explicit_branch and explicit_branch != branch:
+            payload["reason"] = "explicit_branch_conflict"
+            return emit(payload, 1)
+        topic = branch
+        selection_topic = "explicit" if explicit_branch else "current_branch"
+
+    # --- Remote selection (verified and unambiguous only).
+    _, remotes_text = git(repo, "remote")
+    remotes = [line for line in remotes_text.splitlines() if line] if remotes_text else []
+    remote = ""
+    selection = ""
+    if explicit_remote:
+        remote = explicit_remote
+        selection = "explicit"
+        if remote not in remotes:
+            payload["reason"] = "explicit_remote_missing"
+            return emit(payload, 1)
+    elif not payload["on_main"]:
+        upstream_remote = config_get(repo, f"branch.{branch}.remote")
+        upstream_merge = config_get(repo, f"branch.{branch}.merge")
+        if upstream_remote:
+            if upstream_remote == "." or upstream_remote not in remotes:
+                payload["reason"] = "upstream_remote_missing"
+                return emit(payload, 1)
+            if upstream_merge and upstream_merge != f"refs/heads/{topic}":
+                payload["reason"] = "upstream_mismatch"
+                return emit(payload, 1)
+            remote = upstream_remote
+            selection = "upstream"
+        elif len(remotes) == 1:
+            remote = remotes[0]
+            selection = "single_remote"
+        elif not remotes:
+            payload["reason"] = "no_remote"
+            return emit(payload, 1)
+        else:
+            payload["reason"] = "ambiguous_remote"
+            return emit(payload, 1)
+    else:
+        main_remote = config_get(repo, f"branch.{MAIN}.remote")
+        if main_remote:
+            if main_remote == "." or main_remote not in remotes:
+                payload["reason"] = "upstream_remote_missing"
+                return emit(payload, 1)
+            remote = main_remote
+            selection = "main_tracking"
+        elif len(remotes) == 1:
+            remote = remotes[0]
+            selection = "single_remote"
+        elif not remotes:
+            payload["reason"] = "no_remote"
+            return emit(payload, 1)
+        else:
+            payload["reason"] = "ambiguous_remote"
+            return emit(payload, 1)
+
+    # --- Selected remote must not divert or add refs, and must carry
+    # a URL that parses to one GitHub owner/repository.
+    rc, url = git(repo, "remote", "get-url", remote)
+    if rc != 0 or not url:
+        payload["reason"] = "ineligible_remote"
+        return emit(payload, 1)
+    if config_get_all(repo, f"remote.{remote}.pushurl"):
+        payload["reason"] = "ineligible_remote"
+        return emit(payload, 1)
+    if config_get(repo, f"remote.{remote}.mirror").lower() in ("true", "yes", "on", "1"):
+        payload["reason"] = "ineligible_remote"
+        return emit(payload, 1)
+    if config_get(repo, f"remote.{remote}.tagOpt") == "--tags":
+        payload["reason"] = "ineligible_remote"
+        return emit(payload, 1)
+    github = parse_github(url)
+    if github is None:
+        payload["reason"] = "github_identity_unverified"
+        return emit(payload, 1)
+
+    # On-main derived topics must also be free in the selected
+    # remote's tracking refs; an explicit topic that already tracks
+    # remotely is a conflict, not something to silently rename.
+    if payload["on_main"]:
+        rc_track, _ = git(repo, "show-ref", "--verify", "-q", f"refs/remotes/{remote}/{topic}")
+        if rc_track == 0:
+            if explicit_branch:
+                payload["reason"] = "explicit_branch_exists"
+                return emit(payload, 1)
+            base_topic = f"ship/{slug_from_path(sorted(staged)[0])}"
+            # Re-derive with tracking awareness (local loop above
+            # already ensured local freedom for the current topic).
+            suffix = 2
+            while True:
+                rc_local, _ = git(repo, "show-ref", "--verify", "-q", f"refs/heads/{topic}")
+                rc_track, _ = git(repo, "show-ref", "--verify", "-q", f"refs/remotes/{remote}/{topic}")
+                if rc_local != 0 and rc_track != 0:
+                    break
+                topic = f"{base_topic}-{suffix}"
+                suffix += 1
+
+    payload["status"] = "selected"
+    payload["reason"] = "selected"
+    payload["remote"] = remote
+    payload["topic"] = topic
+    payload["ref"] = f"refs/heads/{topic}"
+    payload["github"] = github
+    payload["selection"] = f"{selection_topic}/{selection}"
+    # No commit message is suggested here: the skill (Step 3) requires a
+    # meaningful Conventional Commit crafted from the staged scope and
+    # the repo Commitlint policy. The field stays null for schema
+    # stability, so no competing `ship:` hint is ever emitted.
+    return emit(payload, 0)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -100,7 +100,7 @@
         },
         "sol-256k": {
           "modelID": "openai/gpt-6.2-sol",
-          "name": "GPT-6.2 Sol (fleet, 256k context; 100k output cap)",
+          "name": "GPT-6.2 Sol (fleet, 256k context)",
           "capabilities": {
             "tools": true,
             "temperature": false,
