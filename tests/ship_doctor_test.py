@@ -40,6 +40,7 @@ EXPECTED_CHECK_IDS = [
     "scripts.lint",
     "scripts.test_unit",
     "scripts.test_e2e",
+    "e2e.runner_contract",
     "structure.wiring",
 ]
 
@@ -278,6 +279,122 @@ class ShipDoctorTest(unittest.TestCase):
         self.assertEqual(
             (entry["status"], entry["reason"]),
             ("fail", "husky_dependency_missing"),
+        )
+
+    # --- Isolated E2E runner contract ---
+
+    def write_contract(self, contract) -> None:
+        write_text(
+            self.root / ".ship" / "e2e-runner.json",
+            json.dumps(contract, indent=2),
+        )
+
+    def valid_contract(self) -> dict:
+        return {
+            "schema_version": 1,
+            "runner": {
+                "kind": "oci",
+                "image": "node:26.13.1-alpine@sha256:" + "a" * 64,
+                "command": ["pnpm", "run", "test:e2e"],
+            },
+        }
+
+    def test_runner_contract_missing_is_legacy(self) -> None:
+        code, _, payload = run_doctor(self.root)
+        self.assertEqual(code, 0)
+        entry = self.check_map(payload)["e2e.runner_contract"]
+        self.assertEqual(
+            (entry["status"], entry["reason"]), ("pass", "legacy_host_e2e")
+        )
+
+    def test_runner_contract_valid_is_isolated(self) -> None:
+        self.write_contract(self.valid_contract())
+        code, _, payload = run_doctor(self.root)
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["result"], "local_pass")
+        entry = self.check_map(payload)["e2e.runner_contract"]
+        self.assertEqual(
+            (entry["status"], entry["reason"]), ("pass", "isolated_oci")
+        )
+
+    def test_runner_contract_tag_only_image_blocked(self) -> None:
+        contract = self.valid_contract()
+        contract["runner"]["image"] = "node:26.13.1-alpine"
+        self.write_contract(contract)
+        code, _, payload = run_doctor(self.root)
+        self.assertEqual(code, 1)
+        entry = self.check_map(payload)["e2e.runner_contract"]
+        self.assertEqual(
+            (entry["status"], entry["reason"]),
+            ("fail", "runner_contract_invalid"),
+        )
+
+    def test_runner_contract_extra_key_blocked(self) -> None:
+        contract = self.valid_contract()
+        contract["runner"]["privileged"] = True
+        self.write_contract(contract)
+        code, _, payload = run_doctor(self.root)
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            self.check_map(payload)["e2e.runner_contract"]["reason"],
+            "runner_contract_invalid",
+        )
+
+    def test_runner_contract_manager_mismatch_blocked(self) -> None:
+        contract = self.valid_contract()
+        contract["runner"]["command"] = ["npm", "run", "test:e2e"]
+        self.write_contract(contract)
+        code, _, payload = run_doctor(self.root)
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            self.check_map(payload)["e2e.runner_contract"]["reason"],
+            "runner_contract_invalid",
+        )
+
+    def test_runner_contract_extra_args_blocked(self) -> None:
+        contract = self.valid_contract()
+        contract["runner"]["command"] = ["pnpm", "run", "test:e2e", "--filter", "x"]
+        self.write_contract(contract)
+        code, _, payload = run_doctor(self.root)
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            self.check_map(payload)["e2e.runner_contract"]["reason"],
+            "runner_contract_invalid",
+        )
+
+    def test_runner_contract_wrong_schema_blocked(self) -> None:
+        contract = self.valid_contract()
+        contract["schema_version"] = 2
+        self.write_contract(contract)
+        code, _, payload = run_doctor(self.root)
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            self.check_map(payload)["e2e.runner_contract"]["reason"],
+            "runner_contract_invalid",
+        )
+
+    def test_runner_contract_malformed_indeterminate(self) -> None:
+        write_text(self.root / ".ship" / "e2e-runner.json", "{not json")
+        code, _, payload = run_doctor(self.root)
+        self.assertEqual(code, 2)
+        entry = self.check_map(payload)["e2e.runner_contract"]
+        self.assertEqual(
+            (entry["status"], entry["reason"]),
+            ("unknown", "malformed_metadata"),
+        )
+
+    def test_runner_contract_symlink_indeterminate(self) -> None:
+        write_text(
+            self.root / ".ship" / "real.json",
+            json.dumps(self.valid_contract()),
+        )
+        os.symlink("real.json", self.root / ".ship" / "e2e-runner.json")
+        code, _, payload = run_doctor(self.root)
+        self.assertEqual(code, 2)
+        entry = self.check_map(payload)["e2e.runner_contract"]
+        self.assertEqual(
+            (entry["status"], entry["reason"]),
+            ("unknown", "symlink_not_allowed"),
         )
 
     # --- Git layout / declared hooks path ---

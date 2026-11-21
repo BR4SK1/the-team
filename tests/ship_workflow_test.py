@@ -8,6 +8,7 @@ in the OS temp area, never in the working repo.
 """
 
 import json
+import os
 import shutil
 import stat
 import subprocess
@@ -36,10 +37,10 @@ PASSING_PACKAGE = {
 }
 
 
-def run(args, cwd=None, input_text=None, check=False, timeout=30):
+def run(args, cwd=None, input_text=None, check=False, timeout=30, env=None):
     proc = subprocess.run(
         args, cwd=cwd, input=input_text, capture_output=True, text=True,
-        check=False, timeout=timeout,
+        check=False, timeout=timeout, env=env,
     )
     if check and proc.returncode != 0:
         raise AssertionError(
@@ -94,10 +95,16 @@ HUSKY_H = (
 HUSKY_SHIM = '#!/usr/bin/env sh\n. "$(dirname "$0")/h"\n'
 
 
+ISOLATED_IMAGE = "node:26.13.1-alpine@sha256:" + "a" * 64
+FAKE_IMAGE_ID = "sha256:" + "b" * 64
+
+
 def build_fixture(base: Path, *, e2e_ok: bool = True, deploy_ok: bool = True,
                   wrong_wiring: bool = False, deploy_wrong_sha: bool = False,
                   deploy_moves_head: bool = False,
-                  deploy_busy_lease: bool = False) -> tuple[Path, Path]:
+                  deploy_busy_lease: bool = False,
+                  isolated: bool = False,
+                  isolated_image: str | None = None) -> tuple[Path, Path]:
     """Create bare remote + working repo that passes the doctor."""
     remote = base / "remote.git"
     work = base / "work"
@@ -156,6 +163,7 @@ def build_fixture(base: Path, *, e2e_ok: bool = True, deploy_ok: bool = True,
         write(
             work / "scripts" / "ship-deploy",
             '#!/bin/sh\nmkdir -p .ship\nprintf "%s\\n" "$1" > .ship/deploy-sha\n'
+            'if [ -n "${FAKE_DOCKER_LOG:-}" ]; then printf "deploy\\n" >> "$FAKE_DOCKER_LOG"; fi\n'
             'echo "deployed $1"\n'
             'printf "SHIP_DEPLOYED_SHA=%s\\n" "$1"\n',
             executable=True,
@@ -167,20 +175,51 @@ def build_fixture(base: Path, *, e2e_ok: bool = True, deploy_ok: bool = True,
             executable=True,
         )
     e2e_flag = "true" if e2e_ok else "false"
-    write(
-        work / "scripts" / "e2e.js",
-        "const fs = require('fs');\n"
-        "const target = process.env.SHIP_TARGET_SHA || '';\n"
-        "if (!/^[0-9a-f]{40}$/.test(target)) { console.error('SHIP_TARGET_SHA missing/invalid'); process.exit(1); }\n"
-        "let deployed = '';\n"
-        "try { deployed = fs.readFileSync('.ship/deploy-sha','utf8').trim(); } catch (e) { console.error('deploy artifact missing'); process.exit(1); }\n"
-        "if (deployed !== target) { console.error('e2e target mismatch'); process.exit(1); }\n"
-        f"const ok = {e2e_flag};\n"
-        "if (!ok) process.exit(1);\n"
-        "console.log('e2e ok');\n",
-    )
+    if isolated:
+        # In the isolated workspace (a candidate-tree export) the
+        # host deploy artifact is not present; the candidate is
+        # carried by the explicit environment the runner passes.
+        write(
+            work / "scripts" / "e2e.js",
+            "const target = process.env.SHIP_TARGET_SHA || '';\n"
+            "const deployed = process.env.SHIP_DEPLOYED_SHA || '';\n"
+            "if (!/^[0-9a-f]{40}$/.test(target)) { console.error('SHIP_TARGET_SHA missing/invalid'); process.exit(1); }\n"
+            "if (deployed !== target) { console.error('e2e target mismatch'); process.exit(1); }\n"
+            f"const ok = {e2e_flag};\n"
+            "if (!ok) process.exit(1);\n"
+            "console.log('e2e ok');\n",
+        )
+    else:
+        write(
+            work / "scripts" / "e2e.js",
+            "const fs = require('fs');\n"
+            "const target = process.env.SHIP_TARGET_SHA || '';\n"
+            "if (!/^[0-9a-f]{40}$/.test(target)) { console.error('SHIP_TARGET_SHA missing/invalid'); process.exit(1); }\n"
+            "let deployed = '';\n"
+            "try { deployed = fs.readFileSync('.ship/deploy-sha','utf8').trim(); } catch (e) { console.error('deploy artifact missing'); process.exit(1); }\n"
+            "if (deployed !== target) { console.error('e2e target mismatch'); process.exit(1); }\n"
+            f"const ok = {e2e_flag};\n"
+            "if (!ok) process.exit(1);\n"
+            "console.log('e2e ok');\n",
+        )
+    if isolated:
+        contract = {
+            "schema_version": 1,
+            "runner": {
+                "kind": "oci",
+                "image": isolated_image or ISOLATED_IMAGE,
+                "command": ["npm", "run", "test:e2e"],
+            },
+        }
+        write(
+            work / ".ship" / "e2e-runner.json",
+            json.dumps(contract, indent=2) + "\n",
+        )
     write(work / "file.txt", "initial\n")
-    write(work / ".gitignore", ".ship/\n.husky/\nnode_modules/\n")
+    if isolated:
+        write(work / ".gitignore", ".ship/deploy-sha\n.husky/\nnode_modules/\n")
+    else:
+        write(work / ".gitignore", ".ship/\n.husky/\nnode_modules/\n")
     git(work, "add", "-A")
     git(work, "commit", "-q", "-m", "initial")
     git(work, "push", "-q", "origin", "HEAD:main")
@@ -203,14 +242,117 @@ def build_fixture(base: Path, *, e2e_ok: bool = True, deploy_ok: bool = True,
     )
     write(work / "node_modules" / "husky" / "husky", HUSKY_H)
     # Baseline commit must not be treated as a ship candidate; ensure
-    # no stale evidence exists for it.
-    shutil.rmtree(work / ".ship", ignore_errors=True)
+    # no stale evidence exists for it. The isolated contract file
+    # itself is tracked and must stay on disk.
+    deploy_sha = work / ".ship" / "deploy-sha"
+    if deploy_sha.exists():
+        deploy_sha.unlink()
+    if not isolated:
+        shutil.rmtree(work / ".ship", ignore_errors=True)
     return work, remote
+
+
+FAKE_DOCKER_SOURCE = '''#!/usr/bin/env python3
+import os
+import sys
+
+args = sys.argv[1:]
+log = os.environ.get("FAKE_DOCKER_LOG", "")
+if log:
+    with open(log, "a", encoding="utf-8") as handle:
+        handle.write("docker " + " ".join(args) + "\\n")
+mode = os.environ.get("FAKE_DOCKER_MODE", "ok")
+if args[:2] == ["image", "inspect"]:
+    if mode == "missing-image":
+        print("fake docker: image not found", file=sys.stderr)
+        sys.exit(1)
+    image_id = "b" * 64
+    if mode == "image-changed":
+        state = os.environ.get("FAKE_DOCKER_STATE", "")
+        count = 0
+        if state and os.path.exists(state):
+            with open(state, encoding="utf-8") as handle:
+                count = int(handle.read().strip() or "0")
+        count += 1
+        if state:
+            with open(state, "w", encoding="utf-8") as handle:
+                handle.write(str(count))
+        if count > 1:
+            image_id = "c" * 64
+    print("sha256:" + image_id)
+    sys.exit(0)
+if args and args[0] == "run":
+    # The command is the last three arguments; the image is the
+    # argument before it. Verify the workspace mount exists.
+    if len(args) < 4:
+        print("fake docker: run missing command", file=sys.stderr)
+        sys.exit(1)
+    workspace = ""
+    envs = {}
+    index = 1
+    while index < len(args):
+        if args[index] == "--volume":
+            workspace = args[index + 1].split(":", 1)[0]
+            index += 2
+        elif args[index] == "--env":
+            key, _, value = args[index + 1].partition("=")
+            envs[key] = value
+            index += 2
+        elif args[index].startswith("--env="):
+            key, _, value = args[index][6:].partition("=")
+            envs[key] = value
+            index += 1
+        elif args[index].startswith("-"):
+            if args[index] in ("--tmpfs", "--pids-limit", "--user", "--workdir", "--network", "--cap-drop", "--security-opt", "--pull"):
+                index += 2
+            else:
+                index += 1
+        else:
+            break
+    if not workspace or not os.path.isdir(workspace):
+        print("fake docker: workspace mount missing", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.isfile(os.path.join(workspace, "package.json")):
+        print("fake docker: candidate package.json missing in workspace", file=sys.stderr)
+        sys.exit(1)
+    target = envs.get("SHIP_TARGET_SHA", "")
+    if len(target) != 40 or envs.get("SHIP_DEPLOYED_SHA") != target:
+        print("fake docker: SHIP_TARGET_SHA/SHIP_DEPLOYED_SHA mismatch", file=sys.stderr)
+        sys.exit(1)
+    if mode == "e2e-fail":
+        print("e2e failed (fake docker)", file=sys.stderr)
+        sys.exit(1)
+    print("e2e ok (isolated fake docker)")
+    sys.exit(0)
+print("fake docker: unsupported invocation", file=sys.stderr)
+sys.exit(1)
+'''
+
+
+def make_fake_docker(base: Path) -> Path:
+    bin_dir = base / "fake-bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    docker = bin_dir / "docker"
+    write(docker, FAKE_DOCKER_SOURCE, executable=True)
+    return bin_dir
+
+
+def isolated_env(base: Path, *, mode: str = "ok") -> tuple[dict, Path]:
+    bin_dir = make_fake_docker(base)
+    log = base / "fake-docker.log"
+    log.write_text("", encoding="utf-8")
+    env = dict(os.environ)
+    env["PATH"] = f"{bin_dir}:{env.get('PATH', '')}"
+    env["FAKE_DOCKER_LOG"] = str(log)
+    env["FAKE_DOCKER_MODE"] = mode
+    env["FAKE_DOCKER_STATE"] = str(base / "fake-docker-state")
+    return env, log
 
 
 def run_ship_build(work: Path, *, branch: str = "ship/topic-test",
                    message: str = "test: ship fixture change",
-                   remote: str = "origin", with_branch: bool = True):
+                   remote: str = "origin", with_branch: bool = True,
+                   env=None):
     args = [
         str(SHIP_BUILD), str(work),
         "--remote", remote,
@@ -219,7 +361,7 @@ def run_ship_build(work: Path, *, branch: str = "ship/topic-test",
     ]
     if with_branch:
         args.extend(["--branch", branch])
-    return run(args)
+    return run(args, env=env)
 
 
 def remote_sha(remote: Path, ref: str) -> str:
@@ -286,6 +428,7 @@ class ShipWorkflowTest(unittest.TestCase):
         self.assertEqual(deploy_receipt["run_id"], run_dir.name)
         self.assertEqual(deploy_receipt["sha"], head)
         self.assertEqual(deploy_receipt["deployed_sha"], head)
+        self.assertEqual(deploy_receipt["e2e_mode"], "legacy_host")
         self.assertEqual(remote_sha(remote, "refs/heads/ship/topic-test"), head)
         # Topic branch was created and left intact.
         self.assertEqual(git(work, "branch", "--show-current"), "ship/topic-test")
@@ -504,6 +647,171 @@ class ShipWorkflowTest(unittest.TestCase):
         # No stdin / no commit evidence: wrapper fails before deploy.
         proc = run([str(SHIP_DEPLOY)], cwd=work, input_text="")
         self.assertNotEqual(proc.returncode, 0)
+
+    # --- Isolated (digest-pinned OCI) E2E ---
+
+    def setup_candidate(self, work: Path, branch: str = "ship/topic-direct"):
+        git(work, "switch", "-c", branch)
+        write(work / "file.txt", "candidate change\n")
+        git(work, "add", "file.txt")
+        git(work, "commit", "-q", "-m", "test: direct candidate")
+        candidate = git(work, "rev-parse", "HEAD")
+        parent = git(work, "rev-parse", "HEAD^")
+        tree = git(work, "rev-parse", "HEAD^{tree}")
+        run_dir = work / ".git" / "ship-runs" / "run-direct-1"
+        run_dir.mkdir(parents=True)
+        (run_dir / "commit.json").write_text(json.dumps({
+            "run_id": "run-direct-1",
+            "sha": candidate,
+            "remote": "origin",
+            "ref": f"refs/heads/{branch}",
+            "branch": branch,
+            "parent": parent,
+            "tree": tree,
+            "type": "commit",
+        }, indent=2) + "\n", encoding="utf-8")
+        return candidate, run_dir
+
+    def invoke_ship_deploy(self, work: Path, candidate: str, branch: str, env):
+        zero = "0" * 40
+        line = f"{candidate} {candidate} refs/heads/{branch} {zero}\n"
+        return run([str(SHIP_DEPLOY)], cwd=work, input_text=line, env=env)
+
+    def make_clean_path(self, fake_docker_bin: Path) -> str:
+        clean = self.base / "clean-bin"
+        clean.mkdir(parents=True, exist_ok=True)
+        for tool in ("git", "python3", "bash", "grep", "cut", "cat", "rm",
+                     "mkdir", "mv", "tr", "dirname", "basename", "mktemp"):
+            found = shutil.which(tool)
+            self.assertIsNotNone(found, f"host tool {tool} required for clean PATH")
+            (clean / tool).symlink_to(found)
+        (clean / "docker").symlink_to(fake_docker_bin / "docker")
+        clean_path = str(clean)
+        self.assertIsNone(shutil.which("node", path=clean_path))
+        self.assertIsNone(shutil.which("npm", path=clean_path))
+        self.assertIsNone(shutil.which("pnpm", path=clean_path))
+        self.assertIsNone(shutil.which("yarn", path=clean_path))
+        self.assertIsNone(shutil.which("bun", path=clean_path))
+        return clean_path
+
+    def test_isolated_success_exact_sha(self) -> None:
+        work, remote = build_fixture(self.base, isolated=True)
+        write(work / "file.txt", "changed\n")
+        git(work, "add", "file.txt")
+        env, log = isolated_env(self.base)
+        proc = run_ship_build(work, branch="ship/isolated-ok", env=env)
+        self.assertEqual(proc.returncode, 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}")
+        head = git(work, "rev-parse", "HEAD")
+        self.assertEqual((work / ".ship" / "deploy-sha").read_text().strip(), head)
+        run_dir = parse_run_dir(proc.stdout, work)
+        deploy_receipt = json.loads((run_dir / "deploy.json").read_text())
+        preflight_receipt = json.loads((run_dir / "preflight.json").read_text())
+        self.assertEqual(deploy_receipt["e2e_mode"], "isolated_oci")
+        self.assertEqual(deploy_receipt["e2e_image"], ISOLATED_IMAGE)
+        self.assertEqual(deploy_receipt["e2e_image_id"], FAKE_IMAGE_ID)
+        self.assertEqual(preflight_receipt["e2e_image_id"], FAKE_IMAGE_ID)
+        self.assertEqual(preflight_receipt["sha"], head)
+        self.assertEqual(remote_sha(remote, "refs/heads/ship/isolated-ok"), head)
+        log_text = log.read_text(encoding="utf-8")
+        # Check before deploy before run, in that order.
+        inspect_at = log_text.find("docker image inspect")
+        deploy_at = log_text.find("deploy\n")
+        run_at = log_text.find("docker run")
+        self.assertTrue(0 <= inspect_at < deploy_at < run_at, log_text)
+        self.assertIn("--pull never", log_text)
+        self.assertIn("--network bridge", log_text)
+        self.assertIn("--cap-drop ALL", log_text)
+        self.assertIn("no-new-privileges", log_text)
+        self.assertIn("--read-only", log_text)
+        self.assertIn(ISOLATED_IMAGE, log_text)
+        self.assertIn("npm run test:e2e", log_text)
+        self.assertNotIn("--privileged", log_text)
+        self.assertNotIn("docker.sock", log_text)
+        self.assertNotIn("--network host", log_text)
+
+    def test_isolated_missing_image_blocks_before_deploy_no_fallback(self) -> None:
+        work, remote = build_fixture(self.base, isolated=True)
+        write(work / "file.txt", "changed\n")
+        git(work, "add", "file.txt")
+        env, log = isolated_env(self.base, mode="missing-image")
+        proc = run_ship_build(work, branch="ship/isolated-missing", env=env)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(remote_sha(remote, "refs/heads/ship/isolated-missing"), "")
+        # Preflight ran before rollout: the deploy entry never ran,
+        # and there was no host fallback that would have run e2e.
+        self.assertFalse((work / ".ship" / "deploy-sha").exists())
+        self.assertNotIn("docker run", log.read_text(encoding="utf-8"))
+        self.assertNotIn("e2e ok", proc.stdout + proc.stderr)
+
+    def test_isolated_e2e_failure_blocks_upload_no_fallback(self) -> None:
+        work, remote = build_fixture(self.base, isolated=True)
+        write(work / "file.txt", "changed\n")
+        git(work, "add", "file.txt")
+        env, _log = isolated_env(self.base, mode="e2e-fail")
+        proc = run_ship_build(work, branch="ship/isolated-e2e-fail", env=env)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("e2e failed", proc.stdout + proc.stderr)
+        self.assertEqual(remote_sha(remote, "refs/heads/ship/isolated-e2e-fail"), "")
+
+    def test_isolated_image_changed_after_preflight_blocks(self) -> None:
+        work, remote = build_fixture(self.base, isolated=True)
+        write(work / "file.txt", "changed\n")
+        git(work, "add", "file.txt")
+        env, log = isolated_env(self.base, mode="image-changed")
+        proc = run_ship_build(work, branch="ship/isolated-drift", env=env)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("drift", proc.stdout + proc.stderr)
+        self.assertEqual(remote_sha(remote, "refs/heads/ship/isolated-drift"), "")
+        # The drift was caught before the container run.
+        self.assertNotIn("docker run", log.read_text(encoding="utf-8"))
+
+    def test_isolated_tag_only_contract_blocks_before_mutation(self) -> None:
+        work, remote = build_fixture(
+            self.base, isolated=True, isolated_image="node:26.13.1-alpine"
+        )
+        before = git(work, "rev-parse", "HEAD")
+        write(work / "file.txt", "changed\n")
+        git(work, "add", "file.txt")
+        env, _log = isolated_env(self.base)
+        proc = run_ship_build(work, branch="ship/isolated-tag-only", env=env)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(git(work, "rev-parse", "HEAD"), before)
+        self.assertEqual(remote_sha(remote, "refs/heads/ship/isolated-tag-only"), "")
+
+    def test_isolated_candidate_contract_invalid_blocks_before_deploy(self) -> None:
+        work, _remote = build_fixture(self.base, isolated=True)
+        # Bypass the doctor by committing an invalid contract
+        # directly; ship-deploy must validate the candidate
+        # contract itself and block before rollout, with no
+        # host fallback.
+        contract_path = work / ".ship" / "e2e-runner.json"
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        contract["runner"]["image"] = "node:26.13.1-alpine"
+        contract_path.write_text(json.dumps(contract, indent=2) + "\n", encoding="utf-8")
+        git(work, "add", ".ship/e2e-runner.json")
+        # setup_candidate stages file.txt too; commit both together
+        # by using it after staging the contract change.
+        candidate, _run_dir = self.setup_candidate(work, branch="ship/topic-direct")
+        env, log = isolated_env(self.base)
+        proc = self.invoke_ship_deploy(work, candidate, "ship/topic-direct", env)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse((work / ".ship" / "deploy-sha").exists())
+        self.assertNotIn("docker run", log.read_text(encoding="utf-8"))
+
+    def test_isolated_clean_host_path_without_node(self) -> None:
+        work, _remote = build_fixture(self.base, isolated=True)
+        candidate, run_dir = self.setup_candidate(work, branch="ship/topic-clean")
+        env, log = isolated_env(self.base)
+        clean_path = self.make_clean_path(self.base / "fake-bin")
+        env["PATH"] = clean_path
+        # The isolated E2E path must succeed with no host Node or
+        # package manager in PATH at all.
+        proc = self.invoke_ship_deploy(work, candidate, "ship/topic-clean", env)
+        self.assertEqual(proc.returncode, 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}")
+        deploy_receipt = json.loads((run_dir / "deploy.json").read_text())
+        self.assertEqual(deploy_receipt["e2e_mode"], "isolated_oci")
+        self.assertEqual(deploy_receipt["sha"], candidate)
+        self.assertIn("docker run", log.read_text(encoding="utf-8"))
 
     def test_ship_skill_invocation_without_plugin(self) -> None:
         # Ship is invoked by loading the skill (ID `ship`) as `@ship`

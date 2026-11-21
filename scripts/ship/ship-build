@@ -18,6 +18,7 @@ ME="${BASH_SOURCE[0]}"
 FLEET_ROOT="$(cd -- "$(dirname -- "$ME")/../.." && pwd)"
 DOCTOR="$FLEET_ROOT/scripts/ship/ship-doctor"
 SHIP_DEPLOY_WRAPPER="$FLEET_ROOT/scripts/ship/ship-deploy"
+E2E_RUNNER="$FLEET_ROOT/scripts/ship/ship-e2e-runner"
 
 [[ $# -ge 1 ]] || fail "usage: ship-build <repo> --remote <name> --ref <ref> [--branch <topic>] --message <msg>"
 REPO="$1"; shift
@@ -41,6 +42,11 @@ REF_BRANCH="${REF#refs/heads/}"
 REPO_ABS="$(cd -- "$REPO" && pwd)"
 [[ -x "$DOCTOR" ]] || fail "fleet doctor missing or not executable: $DOCTOR"
 [[ -x "$SHIP_DEPLOY_WRAPPER" ]] || fail "fleet ship-deploy wrapper missing or not executable: $SHIP_DEPLOY_WRAPPER"
+# An isolated opt-in needs the fleet runner present before any
+# mutation; a missing runner blocks now, never falls back later.
+if [[ -f "$REPO_ABS/.ship/e2e-runner.json" ]]; then
+  [[ -x "$E2E_RUNNER" ]] || fail "fleet isolated E2E runner missing or not executable: $E2E_RUNNER"
+fi
 
 # Husky disable risk: an inherited HUSKY=0 would silently skip every gate
 # via the helper ([ "${HUSKY-}" = "0" ] && exit 0). Refuse it, then set
@@ -517,6 +523,25 @@ if commit.get("remote") != remote or commit.get("ref") != ref:
 if deploy.get("run_id") != run_id or deploy.get("sha") != candidate:
     print("ship-build: post-push deploy evidence does not match run/candidate", file=sys.stderr)
     sys.exit(1)
+if deploy.get("e2e_mode") not in ("isolated_oci", "legacy_host"):
+    print("ship-build: post-push deploy evidence e2e_mode is missing or unknown", file=sys.stderr)
+    sys.exit(1)
+if deploy.get("e2e_mode") == "isolated_oci":
+    for field in ("e2e_image", "e2e_image_id", "e2e_contract_sha256"):
+        if not isinstance(deploy.get(field), str) or not deploy.get(field):
+            print(f"ship-build: post-push isolated deploy evidence missing {field}", file=sys.stderr)
+            sys.exit(1)
+    try:
+        preflight = json.loads((run_dir / "preflight.json").read_text())
+    except (OSError, ValueError) as error:
+        print(f"ship-build: post-push preflight evidence unreadable: {error}", file=sys.stderr)
+        sys.exit(1)
+    if preflight.get("run_id") != run_id or preflight.get("sha") != candidate:
+        print("ship-build: post-push preflight evidence does not match run/candidate", file=sys.stderr)
+        sys.exit(1)
+    if preflight.get("e2e_image_id") != deploy.get("e2e_image_id"):
+        print("ship-build: post-push preflight image does not match deploy image", file=sys.stderr)
+        sys.exit(1)
 PYEOF
 printf 'pushed: %s -> %s:%s\n' "$candidate" "$REMOTE" "$REF"
 printf 'verified: remote SHA matches candidate; commit and deploy evidence present\n'

@@ -30,6 +30,15 @@ together.
 - `scripts/ship/ship-deploy` — fleet pre-push wrapper that runs the
   non-prod rollout and the full E2E suite for the exact outgoing SHA
   before upload (Step 4, nested in the push).
+- `scripts/ship/ship-e2e-runner` — fleet-owned isolated E2E runner
+  (the only supported isolated backend: a digest-pinned OCI image).
+  It reads the versioned candidate contract from the candidate
+  commit, verifies readiness in a read-only preflight with no
+  implicit pull, and runs the full suite inside the same verified
+  image after rollout. No host Node or package manager is used in
+  the isolated path, and there is no host fallback. A candidate
+  without the contract stays on the legacy host invocation: that
+  is explicit migration debt, not isolation.
 - `scripts/ship/check` — relocated check runner (former
   `scripts/check`), wired from the still-active `.githooks/pre-commit`
   hook. Run it with `./scripts/ship/check`.
@@ -106,6 +115,7 @@ A conforming repository has, at its root:
 | `test:unit` script | Present, a non-empty string |
 | `test:e2e` script | Present, a non-empty string — the standard E2E entry point |
 | Non-prod entry | `scripts/ship-deploy`, an executable regular file taking exactly one SHA argument |
+| Isolated E2E contract (opt-in to isolation) | `.ship/e2e-runner.json`, a versioned digest-pinned OCI contract (see below). When present it opts the repository into the fleet isolated path with no host fallback; when absent the repository stays on the legacy host invocation as explicit migration debt, never claimed as isolated |
 
 Visible disable or override indicators in allowlisted files are a
 known mismatch: `--no-verify`, `HUSKY=0`, `core.hooksPath` in
@@ -177,7 +187,13 @@ target code. The invocation shape is:
 `husky.shim_pre_push`, `husky.helper`, `husky.dependency`,
 `toolchain.pinned`, `toolchain.lockfile`, `disable_indicators`,
 `scripts.prepare`, `scripts.format_check`, `scripts.lint`,
-`scripts.test_unit`, `scripts.test_e2e`, `structure.wiring`.
+`scripts.test_unit`, `scripts.test_e2e`, `e2e.runner_contract`,
+`structure.wiring`. The `e2e.runner_contract` check is structural
+only: a missing contract passes as `legacy_host_e2e` (migration
+debt, not isolation), a valid digest-pinned contract passes as
+`isolated_oci`, and a present but invalid contract fails. The
+doctor never checks that a runner image is present locally and
+never runs a container.
 
 ### Safety properties (by construction, not by policy)
 
@@ -195,7 +211,8 @@ target code. The invocation shape is:
   the affected checks `unknown` (indeterminate) rather than being
   trusted.
 - Only allowlisted files are read (`package.json`, the user hook
-  files, and lockfile metadata by descriptor stat only). The single
+  files, the isolated E2E contract when present, and lockfile
+  metadata by descriptor stat only). The single
   authorised exception is a bounded, no-follow, narrowly parsed read
   of the local declared Git hooks path in an ordinary `.git`
   directory: only `core.hooksPath` and `core.bare` are interpreted,
@@ -215,7 +232,8 @@ target code. The invocation shape is:
 
 `not_checked` always lists: `effective_runtime`, `hook_execution`,
 `test_suite_execution`, `git_state_and_remotes`,
-`environment_and_endpoints`, and `deployment`. In particular the
+`environment_and_endpoints`, `deployment`, `isolated_e2e_execution`,
+and `runner_image_presence`. In particular the
 doctor does not verify the effective runtime (installed Node or
 package-manager versions), does not execute hooks or any suite, does
 not know the suite contents or environment, and does not look at
@@ -393,10 +411,20 @@ pinned candidate SHA itself, which Git records in both local fields),
 requires that SHA's fresh commit receipt to exist with content matching
 the candidate, remote ref, parent, and tree, requires the candidate to
 equal the current `HEAD` with a clean checkout whose tree tracks the
-deploy entry and package manifest, then runs the two fixed inputs in
-order:
+deploy entry and package manifest, then runs the fixed inputs in
+check, deploy, run order:
 
-1. Non-production rollout: `<repo>/scripts/ship-deploy <SHA>` with
+1. Isolated preflight (only when the candidate carries the isolated
+   contract): the fleet `scripts/ship/ship-e2e-runner` reads the
+   contract and package manifest from the candidate commit only,
+   verifies the digest-pinned image is already present locally by
+   digest, and records the resolved image id and contract hash in
+   `.git/ship-runs/<run-id>/preflight.json`. Preflight is read-only
+   with no implicit pull, no install, and no live mutation, and it
+   runs before any rollout so readiness is verified before rollout.
+   A missing image, a missing runner, or any contract mismatch
+   blocks here, before the deploy entry runs, with no host fallback.
+2. Non-production rollout: `<repo>/scripts/ship-deploy <SHA>` with
    the exact outgoing SHA as the sole argument. The script must be a
    regular executable, not a symlink. Success is the single
    deterministic stdout line `SHIP_DEPLOYED_SHA=<SHA>` naming that
@@ -404,19 +432,89 @@ order:
    mismatched value blocks the push. The wrapper never infers a
    staging endpoint, never guesses from log keywords, and never runs
    arbitrary user shell snippets; there are no Companion-specific adapters.
-2. Full test run: `<manager> run test:e2e` derived from the pinned
-   `packageManager`, with `SHIP_TARGET_SHA` and `SHIP_DEPLOYED_SHA`
-   set to the exact candidate in the environment. The suite always
-   runs in full with no arguments, no filtering, and no skipping. The
-   requirement is **the repository’s E2E suite must finish successfully**
-   against the deployment of the exact outgoing SHA.
+3. Full test run: the full `test:e2e` suite with `SHIP_TARGET_SHA`
+   and `SHIP_DEPLOYED_SHA` set to the exact candidate in the
+   environment. The suite always runs in full with no arguments, no
+   filtering, and no skipping. The requirement is **the repository’s E2E suite must finish successfully**
+   against the deployment of the exact outgoing SHA. In isolated mode the fleet runner
+   re-verifies the same contract hash and the same image id from
+   preflight, then runs `<manager> run test:e2e` inside that exact
+   digest-pinned image with no host Node or package manager and no
+   host fallback. In legacy mode (no contract in the candidate)
+   the suite runs on the host as `<manager> run test:e2e` derived
+   from the pinned `packageManager`; legacy is explicit migration
+   debt and is never reported as isolated.
+
+### Isolated E2E runner contract
+
+The candidate contract is `.ship/e2e-runner.json` at the repository
+root, tracked in the candidate tree. It is versioned and immutable
+for a candidate: the runner and the wrapper always read it from
+the candidate commit, never from the working tree, and evidence
+records its SHA-256 hash so drift between preflight and run is
+caught. The exact shape is:
+
+```json
+{
+  "schema_version": 1,
+  "runner": {
+    "kind": "oci",
+    "image": "node:26.13.1-alpine@sha256:<64 hex>",
+    "command": ["npm", "run", "test:e2e"]
+  }
+}
+```
+
+Only `schema_version` and `runner` are allowed at the top level,
+and only `kind`, `image`, and `command` inside `runner`. `kind`
+must be `oci`, the only supported backend. `image` must be
+digest-pinned as a repository reference with an `@sha256:<64 hex>`
+digest; a tag-only reference is invalid. `command` must be
+exactly the pinned manager, `run`, and `test:e2e` with no extra
+arguments and no shell, and the manager must match the candidate
+`packageManager` pin. The test image and toolchain are independent
+of the application image: the owner chooses an image that provides
+the pinned toolchain and whose entrypoint executes the command.
+The fleet never installs dependencies implicitly; a suite that
+needs dependencies must provide them through its own script or
+through the runner image.
+
+The fleet runner enforces isolation rather than advising it. It
+runs the suite as an OCI container with `--pull never`, bridge
+network only, all capabilities dropped, no-new-privileges, a
+read-only root filesystem with a bounded tmpfs for `/tmp`, a
+fixed non-root user, and a single mount: an owned temporary
+export of exactly the candidate tree at `/workspace`. No `.git`
+directory, no untracked files, no host secrets, no host socket,
+and no host namespace are mounted, and only `SHIP_TARGET_SHA`,
+`SHIP_DEPLOYED_SHA`, and `HOME` are passed into the container.
+The suite reaches the non-production target over the default
+bridge network; host networking is not supported in this first
+backend and is a blocker to report, not a flag to enable. That
+also means a suite whose target is only reachable as host
+localhost cannot use this backend yet, because localhost inside
+the container is the container itself. If a repository's E2E
+needs host networking, host localhost, privileged access, or a
+host socket, that repository cannot use the isolated path yet:
+report the blocker instead of widening permissions.
+
+Legacy repositories without the contract keep the current host
+invocation until migration. That compatibility is migration debt:
+legacy evidence records `e2e_mode` as `legacy_host`, the doctor
+reports `legacy_host_e2e`, and Companion in particular is not
+fixed by this change and must not be claimed as isolated until it
+migrates by adding a valid contract. New repositories opting into
+isolation get no host fallback: once the contract is present, a
+missing runner, a missing image, or a drifted image blocks the
+push.
 
 The wrapper also re-validates `HEAD` and the clean checkout after
 deployment and test, and writes `.git/ship-runs/<run-id>/deploy.json`
-(with the run, candidate, deployed SHA, remote, ref, and manager) on
-success, then exits zero, allowing upload. On any failure it exits
-non-zero and Git uploads nothing. Run evidence is owned and per-run
-under `.git`; owners never commit it.
+(with the run, candidate, deployed SHA, remote, ref, manager, and
+`e2e_mode`, plus the image, image id, and contract hash when
+isolated) on success, then exits zero, allowing upload. On any
+failure it exits non-zero and Git uploads nothing. Run evidence is
+owned and per-run under `.git`; owners never commit it.
 
 Race limit stated honestly: the wrapper holds no distributed lock. If
 `HEAD` moves during the rollout, upload is still blocked (and the
@@ -555,7 +653,14 @@ and the single-line pre-push delegation; adds executable
 `scripts/ship/ship-deploy` wrapper above; keeps run evidence under
 `.git` and never commits it; and runs the realistic fixtures in
 `tests/ship_workflow_test.py` until a real push of an exact candidate
-succeeds. Production deployment stays separate (see below).
+succeeds. To migrate from legacy to isolation, the owner adds a
+valid `.ship/e2e-runner.json` (digest-pinned image present locally
+before rollout, suite passing inside that image with no host Node),
+keeps the same fixtures green in isolated mode, and only then
+claims isolation; until then the repository is legacy migration
+debt, and Companion remains legacy and is not claimed as fixed
+by this standard alone. Production deployment stays separate
+(see below).
 
 ## Web/native dispatch and permissions
 
@@ -592,7 +697,17 @@ standard described here. The skill
 contains no OpenCode shell interpolation marker (the
 exclamation-and-backtick marker), no other interpolation, and no
 repository-relative doctor execution. Run it with
-`./scripts/ship/check`.
+`./scripts/ship/check`. The workflow fixtures cover both E2E
+modes: legacy success, isolated success with exact SHA and
+check, deploy, run ordering, missing-image and drift blocks
+before rollout or before the container run, candidate contract
+invalidity, and an isolated run with a clean host PATH that
+contains no Node or package manager at all (Husky setup itself
+may still need host tooling; only the isolated E2E path is
+host-Node-free). A real local OCI run against an already-present
+digest-pinned image was also verified manually; fixtures use a
+strict fake OCI runner so no daemon, pull, or live cluster is
+needed in tests.
 
 Untested areas stated honestly: the ambiguous-transport reconcile
 (a push that fails after the remote has accepted the ref) has no

@@ -7,8 +7,8 @@ set -euo pipefail
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$repo_root"
 
-shellcheck .githooks/pre-commit scripts/ship/check scripts/ship/ship-build scripts/ship/ship-deploy
-bash -n .githooks/pre-commit scripts/ship/check scripts/ship/ship-build scripts/ship/ship-deploy
+shellcheck .githooks/pre-commit scripts/ship/check scripts/ship/ship-build scripts/ship/ship-deploy scripts/ship/ship-e2e-runner
+bash -n .githooks/pre-commit scripts/ship/check scripts/ship/ship-build scripts/ship/ship-deploy scripts/ship/ship-e2e-runner
 
 python3 -m unittest discover -s tests -p "*_test.py"
 
@@ -176,6 +176,60 @@ for required in ("O_NOFOLLOW", "dir_fd", "O_NONBLOCK", "fstat"):
         raise ValueError(
             f"scripts/ship/ship-doctor: missing no-follow traversal {required!r}"
         )
+for required in (
+    "e2e.runner_contract",
+    "legacy_host_e2e",
+    "isolated_oci",
+    "runner_contract_invalid",
+    ".ship",
+    "e2e-runner.json",
+    "isolated_e2e_execution",
+    "runner_image_presence",
+):
+    if required not in ship_doctor_source:
+        raise ValueError(
+            f"scripts/ship/ship-doctor: missing runner contract check {required!r}"
+        )
+
+# Fleet isolated E2E runner must stay narrow and least-privilege by
+# construction: digest-pinned OCI only, no pull, no privileged or
+# host-wide access, and no host Node invocation.
+ship_e2e_runner = Path("scripts/ship/ship-e2e-runner")
+if not (ship_e2e_runner.stat().st_mode & 0o111):
+    raise ValueError("scripts/ship/ship-e2e-runner: must be executable")
+ship_e2e_runner_source = ship_e2e_runner.read_text(encoding="utf-8")
+for banned in (
+    "--privileged",
+    "docker.sock",
+    "--network host",
+    "--pid host",
+    "docker pull",
+):
+    if banned in ship_e2e_runner_source:
+        raise ValueError(
+            f"scripts/ship/ship-e2e-runner: forbidden mechanism {banned!r}"
+        )
+for required in (
+    "preflight",
+    "image inspect",
+    "--pull never",
+    "--network bridge",
+    "--cap-drop ALL",
+    "no-new-privileges",
+    "--read-only",
+    "SHIP_E2E_MODE=isolated_oci",
+    "SHIP_E2E_IMAGE_ID=",
+    "SHIP_E2E_CONTRACT_SHA256=",
+    ".ship/e2e-runner.json",
+    "candidate commit",
+    "no host fallback",
+):
+    if required not in ship_e2e_runner_source:
+        raise ValueError(
+            f"scripts/ship/ship-e2e-runner: missing required snippet {required!r}"
+        )
+if ship_e2e_runner_source.count("test:e2e") < 1:
+    raise ValueError("scripts/ship/ship-e2e-runner: must run test:e2e")
 
 # Ship destination helper must stay read-only by construction: it may
 # run only allowlisted read-only Git invocations with
@@ -287,6 +341,15 @@ for required in (
     "branches before editing",
     "Conventional Commit",
     "Commitlint",
+    "scripts/ship/ship-e2e-runner",
+    "isolated_oci",
+    "legacy_host",
+    "digest-pinned",
+    "no host fallback",
+    "migration debt",
+    "preflight",
+    "check, deploy, run",
+    ".ship/e2e-runner.json",
 ):
     if required not in ship_skill_text:
         raise ValueError(f"{ship_skill}: missing required phrase {required!r}")
@@ -331,8 +394,9 @@ for stale in ("fleet/plugins/ship.ts", "fleet.ship"):
 # must not become a bypass invocation. The commit invocation itself is
 # checked to carry the message and nothing else.
 for script_name, required_snippets in (
-    ("scripts/ship/ship-build", ("--remote", "--ref", "--message", "diff --cached", "ls-remote")),
-    ("scripts/ship/ship-deploy", ("scripts/ship-deploy", "test:e2e", "commit.json")),
+    ("scripts/ship/ship-build", ("--remote", "--ref", "--message", "diff --cached", "ls-remote", "ship-e2e-runner", "e2e_mode")),
+    ("scripts/ship/ship-deploy", ("scripts/ship-deploy", "test:e2e", "commit.json", "ship-e2e-runner", "preflight", "e2e_mode", "isolated_oci", "legacy_host")),
+    ("scripts/ship/ship-e2e-runner", ("preflight", "image inspect", "--pull never", "test:e2e", ".ship/e2e-runner.json")),
 ):
     script_path = Path(script_name)
     if not (script_path.stat().st_mode & 0o111):
@@ -413,6 +477,17 @@ for required in (
     "branches before editing",
     "Conventional Commit",
     "Commitlint",
+    "scripts/ship/ship-e2e-runner",
+    "isolated_oci",
+    "legacy_host",
+    "digest-pinned",
+    "no host fallback",
+    "migration debt",
+    "preflight",
+    "check, deploy, run",
+    ".ship/e2e-runner.json",
+    "e2e.runner_contract",
+    "no implicit pull",
 ):
     if required not in ship_doc_text:
         raise ValueError(f"{ship_doc}: missing required phrase {required!r}")
