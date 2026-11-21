@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Fleet ship pipeline: deterministic git, gate, deploy, and push procedure.
+#
+# Usage:
+#   ship <repo> [--branch <topic>] [--message <msg>] [--remote <name>] [--stage <path>...]
+#
+# - Runs ship-doctor first; exits immediately if the repository is not ship-ready.
+# - Syncs local main if behind-only (fails if ahead or diverged).
+# - Branches off main before any staging or commit (using --branch).
+# - Stages any explicit --stage paths, then commits staged changes via plain
+#   `git commit` (running Husky pre-commit and commit-msg gates).
+# - If the working tree is already clean on a topic branch ahead of main (for
+#   example, retrying after a failed deploy/E2E), skips commit and pushes HEAD.
+# - Pushes <sha>:refs/heads/<topic>, triggering .husky/pre-push (ship-deploy).
+# - Verifies the remote ref, returns cleanly to main, and prints a JSON summary
+#   prefixed with SHIP_RESULT_JSON= for the PR step.
+
+err() { printf 'ship: %s\n' "$*" >&2; }
+fail() { err "$*"; exit 1; }
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DOCTOR="$SCRIPT_DIR/ship-doctor"
+# shellcheck source=./_node-env.sh
+source "$SCRIPT_DIR/_node-env.sh"
+
+[[ $# -ge 1 ]] || fail "usage: ship <repo> [--branch <topic>] [--message <msg>] [--remote <name>] [--stage <path>...]"
+REPO="$1"; shift
+
+BRANCH=""
+MESSAGE=""
+REMOTE=""
+STAGE_PATHS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --branch)  [[ $# -ge 2 ]] || fail "--branch requires a value";  BRANCH="$2";  shift 2 ;;
+    --message) [[ $# -ge 2 ]] || fail "--message requires a value"; MESSAGE="$2"; shift 2 ;;
+    --remote)  [[ $# -ge 2 ]] || fail "--remote requires a value";  REMOTE="$2";  shift 2 ;;
+    --stage)   [[ $# -ge 2 ]] || fail "--stage requires a path";    STAGE_PATHS+=("$2"); shift 2 ;;
+    *) fail "unknown argument: $1" ;;
+  esac
+done
+
+[[ -d "$REPO" ]] || fail "not a directory: $REPO"
+REPO_ABS="$(cd -- "$REPO" && pwd)"
+
+if [[ "${HUSKY:-}" == "0" ]]; then
+  fail "HUSKY=0 is not allowed"
+fi
+export HUSKY=1
+
+# 1. Verify repository opt-in compatibility.
+if ! DOCTOR_OUT="$("$DOCTOR" "$REPO_ABS")"; then
+  printf '%s\n' "$DOCTOR_OUT" >&2
+  fail "repository is not ship-ready (see ship-doctor output above)"
+fi
+
+# 2. Activate pinned Node version (.nvmrc / .node-version) if present.
+activate_node_version "$REPO_ABS"
+
+# 3. Verify branch state and resolve GitHub remote.
+CURRENT_BRANCH="$(git -C "$REPO_ABS" branch --show-current)"
+[[ -n "$CURRENT_BRANCH" ]] || fail "detached HEAD is not shippable; check out a branch"
+
+if [[ -z "$REMOTE" ]]; then
+  if [[ "$CURRENT_BRANCH" != "main" ]]; then
+    REMOTE="$(git -C "$REPO_ABS" config --get "branch.$CURRENT_BRANCH.remote" 2>/dev/null || true)"
+  else
+    REMOTE="$(git -C "$REPO_ABS" config --get "branch.main.remote" 2>/dev/null || true)"
+  fi
+  if [[ -z "$REMOTE" ]]; then
+    mapfile -t REMOTES < <(git -C "$REPO_ABS" remote)
+    if [[ ${#REMOTES[@]} -eq 1 ]]; then
+      REMOTE="${REMOTES[0]}"
+    elif [[ ${#REMOTES[@]} -eq 0 ]]; then
+      fail "no git remote configured"
+    else
+      fail "multiple remotes configured (${REMOTES[*]}); pass --remote <name>"
+    fi
+  fi
+fi
+
+REMOTE_CFG_URL="$(git -C "$REPO_ABS" config --get "remote.$REMOTE.url" 2>/dev/null || true)"
+REMOTE_EFF_URL="$(git -C "$REPO_ABS" remote get-url "$REMOTE" 2>/dev/null)" \
+  || fail "remote not configured: $REMOTE"
+
+# Guard against remotes that mirror, push tags, or divert pushurl.
+if [[ -n "$(git -C "$REPO_ABS" config --get-all "remote.$REMOTE.pushurl" 2>/dev/null || true)" ]]; then
+  fail "remote.$REMOTE.pushurl is set; refusing to push to a diverted destination"
+fi
+MIRROR_VAL="$(git -C "$REPO_ABS" config --get "remote.$REMOTE.mirror" 2>/dev/null || true)"
+case "$(printf '%s' "$MIRROR_VAL" | tr '[:upper:]' '[:lower:]')" in
+  true|yes|on|1) fail "remote.$REMOTE.mirror is enabled" ;;
+esac
+if [[ "$(git -C "$REPO_ABS" config --get "remote.$REMOTE.tagOpt" 2>/dev/null || true)" == "--tags" ]]; then
+  fail "remote.$REMOTE.tagOpt=--tags is not allowed"
+fi
+
+GITHUB_ID="$(python3 - "$REMOTE_CFG_URL" "$REMOTE_EFF_URL" <<'PY'
+import re, sys
+patterns = (
+    r"^(?:https?|ssh)://(?:[^@/]+@)?github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?$",
+    r"^git@github\.com:([^/\s]+)/([^/\s]+?)(?:\.git)?$",
+)
+for url in (u.strip() for u in sys.argv[1:] if u.strip()):
+    for pat in patterns:
+        m = re.match(pat, url)
+        if m:
+            print(f"{m.group(1)}\t{m.group(2)}")
+            sys.exit(0)
+sys.exit(1)
+PY
+)" || fail "remote '$REMOTE' URL does not parse to a GitHub owner/repo"
+GH_OWNER="$(printf '%s' "$GITHUB_ID" | cut -f1)"
+GH_REPO="$(printf '%s' "$GITHUB_ID" | cut -f2)"
+
+# 4. Sync local main against remote main (fail if ahead or diverged; ff if behind-only).
+git -C "$REPO_ABS" fetch "$REMOTE" main
+LOCAL_MAIN="$(git -C "$REPO_ABS" rev-parse refs/heads/main)"
+REMOTE_MAIN="$(git -C "$REPO_ABS" rev-parse "refs/remotes/$REMOTE/main")"
+COUNTS="$(git -C "$REPO_ABS" rev-list --left-right --count "refs/heads/main...refs/remotes/$REMOTE/main")"
+AHEAD="$(printf '%s' "$COUNTS" | cut -f1)"
+BEHIND="$(printf '%s' "$COUNTS" | cut -f2)"
+
+if [[ "$AHEAD" != "0" ]]; then
+  fail "local main is ahead of $REMOTE/main (ahead $AHEAD, behind $BEHIND); reconcile main first"
+fi
+if [[ "$BEHIND" != "0" ]]; then
+  if [[ "$CURRENT_BRANCH" == "main" ]]; then
+    # Ensure upstream changes do not collide with local edits.
+    UPSTREAM_FILES="$(git -C "$REPO_ABS" diff --name-only "$LOCAL_MAIN" "$REMOTE_MAIN")"
+    DIRTY_FILES="$(
+      {
+        git -C "$REPO_ABS" diff --name-only
+        git -C "$REPO_ABS" diff --cached --name-only
+        git -C "$REPO_ABS" ls-files --others --exclude-standard
+      } | sort -u
+    )"
+    if [[ -n "$UPSTREAM_FILES" && -n "$DIRTY_FILES" ]]; then
+      while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        if printf '%s\n' "$UPSTREAM_FILES" | grep -Fxq -- "$f"; then
+          fail "fast-forwarding main would conflict with local changes in $f"
+        fi
+      done <<< "$DIRTY_FILES"
+    fi
+    git -C "$REPO_ABS" merge --ff-only "$REMOTE_MAIN"
+  else
+    git -C "$REPO_ABS" update-ref refs/heads/main "$REMOTE_MAIN" "$LOCAL_MAIN"
+  fi
+fi
+
+# 5. Pre-validate staging & commit arguments before mutating branches or index.
+PRE_STAGED="$(git -C "$REPO_ABS" diff --cached --name-only)"
+WILL_COMMIT=0
+if [[ ${#STAGE_PATHS[@]} -gt 0 || -n "$PRE_STAGED" ]]; then
+  WILL_COMMIT=1
+  [[ -n "$MESSAGE" ]] || fail "uncommitted changes require --message <conventional-commit>"
+  if [[ "$MESSAGE" == ship:* ]]; then
+    fail "commit message must use a real Conventional Commit type, not 'ship:'"
+  fi
+  for p in "${STAGE_PATHS[@]}"; do
+    if git -C "$REPO_ABS" check-ignore -q -- "$p" 2>/dev/null; then
+      fail "refusing to stage gitignored path: $p"
+    fi
+  done
+fi
+
+# 6. Branch handling (never stage or commit directly on main).
+if [[ "$CURRENT_BRANCH" == "main" ]]; then
+  [[ "$WILL_COMMIT" == "1" ]] \
+    || fail "nothing to ship on main (pass --stage <path>... or stage files on a topic branch)"
+  [[ -n "$BRANCH" ]] || fail "on main: --branch <topic> is required"
+  [[ "$BRANCH" != "main" ]] || fail "topic branch must not be main"
+  [[ "$BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9/_.-]*$ && "$BRANCH" != *".."* ]] \
+    || fail "invalid branch name: $BRANCH"
+  if git -C "$REPO_ABS" show-ref --verify -q "refs/heads/$BRANCH"; then
+    fail "local branch already exists: $BRANCH"
+  fi
+  if git -C "$REPO_ABS" show-ref --verify -q "refs/remotes/$REMOTE/$BRANCH"; then
+    fail "remote tracking branch already exists: $REMOTE/$BRANCH"
+  fi
+  git -C "$REPO_ABS" switch -c "$BRANCH"
+  TOPIC="$BRANCH"
+else
+  if [[ -n "$BRANCH" && "$BRANCH" != "$CURRENT_BRANCH" ]]; then
+    fail "already on branch '$CURRENT_BRANCH'; --branch '$BRANCH' conflicts"
+  fi
+  TOPIC="$CURRENT_BRANCH"
+fi
+
+# 7. Stage explicit paths (if provided), then commit or reuse clean ahead topic branch.
+if [[ ${#STAGE_PATHS[@]} -gt 0 ]]; then
+  git -C "$REPO_ABS" add -- "${STAGE_PATHS[@]}"
+fi
+
+STAGED="$(git -C "$REPO_ABS" diff --cached --name-only)"
+UNSTAGED="$(git -C "$REPO_ABS" diff --name-only)"
+UNTRACKED="$(git -C "$REPO_ABS" ls-files --others --exclude-standard)"
+
+if [[ -n "$UNSTAGED" || -n "$UNTRACKED" ]]; then
+  err "working tree is not clean after staging:"
+  [[ -n "$UNSTAGED" ]] && printf '  unstaged:\n%s\n' "$UNSTAGED" >&2
+  [[ -n "$UNTRACKED" ]] && printf '  untracked:\n%s\n' "$UNTRACKED" >&2
+  fail "stage all intended files or remove stray files before shipping"
+fi
+
+if [[ -n "$STAGED" ]]; then
+  git -C "$REPO_ABS" commit -m "$MESSAGE"
+else
+  AHEAD_OF_MAIN="$(git -C "$REPO_ABS" rev-list --count "refs/heads/main..HEAD")"
+  if [[ "$AHEAD_OF_MAIN" == "0" ]]; then
+    fail "nothing to ship: working tree is clean and '$TOPIC' has no commits ahead of main"
+  fi
+  printf 'ship: working tree clean with %s commit(s) ahead of main on %s; pushing HEAD\n' "$AHEAD_OF_MAIN" "$TOPIC"
+fi
+
+# 8. Push pinned candidate SHA (triggers .husky/pre-push -> ship-deploy -> test:e2e).
+CANDIDATE="$(git -C "$REPO_ABS" rev-parse HEAD)"
+REMOTE_BEFORE="$(git -C "$REPO_ABS" ls-remote "$REMOTE" "refs/heads/$TOPIC" | cut -f1 || true)"
+if [[ "$REMOTE_BEFORE" == "$CANDIDATE" ]]; then
+  fail "remote $REMOTE refs/heads/$TOPIC is already at $CANDIDATE; skip push and check/open the PR"
+fi
+
+git -C "$REPO_ABS" push "$REMOTE" "$CANDIDATE:refs/heads/$TOPIC"
+
+# 9. Verify remote ref and return cleanly to main.
+REMOTE_AFTER="$(git -C "$REPO_ABS" ls-remote "$REMOTE" "refs/heads/$TOPIC" | cut -f1 || true)"
+[[ "$REMOTE_AFTER" == "$CANDIDATE" ]] \
+  || fail "post-push check failed: remote ref ($REMOTE_AFTER) != candidate ($CANDIDATE)"
+
+git -C "$REPO_ABS" switch main
+
+# 10. Emit structured summary for PR creation.
+COMMITS="$(git -C "$REPO_ABS" log --oneline "refs/heads/main..$CANDIDATE")"
+RESULT_JSON="$(python3 - "$REPO_ABS" "$GH_OWNER" "$GH_REPO" "$REMOTE" "$TOPIC" "$CANDIDATE" "$COMMITS" <<'PY'
+import json, sys
+repo, owner, name, remote, branch, sha, commits_raw = sys.argv[1:8]
+print(json.dumps({
+    "status": "pushed",
+    "repo": repo,
+    "owner": owner,
+    "name": name,
+    "remote": remote,
+    "branch": branch,
+    "base": "main",
+    "sha": sha,
+    "commits": [line for line in commits_raw.splitlines() if line],
+}))
+PY
+)"
+printf 'SHIP_RESULT_JSON=%s\n' "$RESULT_JSON"

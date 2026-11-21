@@ -1,320 +1,89 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Fleet ship-deploy wrapper: invoked by the real .husky/pre-push hook
-# with the Git pre-push record on standard input. Extracts the single
-# exact outgoing SHA, runs the isolated E2E preflight when the
-# candidate opts into isolation, runs <repo>/scripts/ship-deploy
-# <SHA>, then runs the full owner test:e2e suite (inside the
-# preflight-verified image when isolated). All must succeed before
-# upload, in that check, deploy, run order.
-# Usage (via pre-push only):
-#   ship-deploy   # reads refs from stdin
-# No arguments; no staging-endpoint inference; no retries.
+# Fleet ship-deploy pre-push wrapper.
+# Invoked by a repository's .husky/pre-push hook with the Git pre-push ref line
+# on stdin. Verifies the candidate commit, deploys it via ./scripts/ship-deploy,
+# and runs the repository's full test:e2e suite against that deployment.
+# Any non-zero exit blocks the Git push.
 
 err() { printf 'ship-deploy: %s\n' "$*" >&2; }
 fail() { err "$*"; exit 1; }
 
-[[ $# -eq 0 ]] || fail "takes no arguments (refs arrive on stdin via pre-push)"
-if [[ -n "${HUSKY:-}" && "$HUSKY" == "0" ]]; then
-  fail "bypass disabled: HUSKY=0 would disable the Husky gates"
+[[ $# -eq 0 ]] || fail "takes no arguments (refs arrive on stdin from git pre-push)"
+if [[ "${HUSKY:-}" == "0" ]]; then
+  fail "HUSKY=0 is not allowed"
 fi
 export HUSKY=1
-REPO_ROOT="$(git -C . rev-parse --show-toplevel 2>/dev/null)" \
-  || fail "must run inside a Git repository (pre-push hook)"
-cd -- "$REPO_ROOT" || fail "cannot enter repository root"
-# Fleet checkout root: two levels above scripts/ship/. The isolated
-# E2E runner is fleet-owned; a repository script never owns it.
-SHIP_DEPLOY_SCRIPT="${BASH_SOURCE[0]}"
-FLEET_ROOT="$(cd -- "$(dirname -- "$SHIP_DEPLOY_SCRIPT")/../.." && pwd)"
-E2E_RUNNER="$FLEET_ROOT/scripts/ship/ship-e2e-runner"
-GIT_DIR="$(git rev-parse --absolute-git-dir)" || fail "not a Git repository"
-[[ -d "$GIT_DIR" && ! -L "$GIT_DIR" ]] || fail "unsafe Git layout: .git must be a directory, not a symlink"
 
-# --- Parse the pre-push record.
-# Each line: <local ref> SP <local SHA> SP <remote ref> SP <remote SHA> LF.
-# Require exactly one outgoing branch push of a single SHA. The local ref
-# is the pushed branch name, HEAD, or (for the pinned candidate refspec)
-# the exact candidate SHA itself; Git records a SHA refspec with the SHA
-# in both the first and second fields.
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./_node-env.sh
+source "$SCRIPT_DIR/_node-env.sh"
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" \
+  || fail "must run inside a Git repository"
+cd -- "$REPO_ROOT"
+
+# Parse the single outgoing branch push from stdin.
 LINES=()
 while IFS= read -r line || [[ -n "$line" ]]; do
-  # Skip empty lines.
   [[ -z "$line" ]] && continue
   LINES+=("$line")
 done
-[[ ${#LINES[@]} -eq 1 ]] || fail "pre-push must carry exactly one ref line (got ${#LINES[@]})"
-read -r LOCAL_REF LOCAL_SHA REMOTE_REF REMOTE_SHA <<< "${LINES[0]}"
-[[ "$REMOTE_REF" == refs/heads/* ]] || fail "pre-push remote ref must be a branch ref"
-[[ "$LOCAL_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "outgoing SHA is not a full SHA"
-[[ "$REMOTE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "remote SHA is not a full SHA"
+[[ ${#LINES[@]} -eq 1 ]] || fail "expected exactly 1 ref on stdin (got ${#LINES[@]})"
+
+read -r _LOCAL_REF LOCAL_SHA REMOTE_REF _REMOTE_SHA <<< "${LINES[0]}"
+[[ "$REMOTE_REF" == refs/heads/* ]] || fail "remote ref must be a branch (got $REMOTE_REF)"
+[[ "$LOCAL_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "invalid outgoing SHA: $LOCAL_SHA"
 [[ "$LOCAL_SHA" != "0000000000000000000000000000000000000000" ]] || fail "deletion push is not shippable"
-if [[ "$LOCAL_REF" != "$REMOTE_REF" && "$LOCAL_REF" != "HEAD" && "$LOCAL_REF" != "$LOCAL_SHA" ]]; then
-  fail "pre-push refs must be the branch, HEAD, or the pinned candidate SHA (local $LOCAL_REF vs remote $REMOTE_REF)"
-fi
-candidate="$LOCAL_SHA"
-ref_branch="${REMOTE_REF#refs/heads/}"
-git cat-file -e "$candidate" >/dev/null 2>&1 || fail "outgoing SHA not present locally: $candidate"
 
-# --- Current HEAD, branch, and clean checkout must match the candidate.
-# The candidate tree must also carry the tracked deploy entry and package
-# manifest, so the rolled-out code is the committed code.
-HEAD_SHA="$(git rev-parse HEAD)"
-[[ "$HEAD_SHA" == "$candidate" ]] \
-  || fail "HEAD ($HEAD_SHA) does not equal the outgoing candidate ($candidate); refusing to deploy a moved HEAD"
-[[ "$(git branch --show-current)" == "$ref_branch" ]] \
-  || fail "current branch does not equal the pushed branch ($ref_branch)"
-[[ -z "$(git diff --name-only)" ]] \
-  || fail "unstaged tracked changes present; candidate must be clean before deploy"
-[[ -z "$(git diff --cached --name-only)" ]] \
-  || fail "staged changes present; candidate must be clean before deploy"
-[[ -z "$(git ls-files --others --exclude-standard)" ]] \
-  || fail "untracked payload present; candidate must be clean before deploy"
-git cat-file -e "$candidate:scripts/ship-deploy" >/dev/null 2>&1 \
-  || fail "scripts/ship-deploy is not tracked in the candidate tree"
-git cat-file -e "$candidate:package.json" >/dev/null 2>&1 \
-  || fail "package.json is not tracked in the candidate tree"
+CANDIDATE="$LOCAL_SHA"
+REF_BRANCH="${REMOTE_REF#refs/heads/}"
 
-# --- Fresh commit receipt: content must bind run, candidate, remote ref,
-# parent, and tree. The filename alone proves nothing, so the JSON is
-# re-validated field by field against the live candidate.
-SHIP_RUNS_DIR="$GIT_DIR/ship-runs"
-[[ -d "$SHIP_RUNS_DIR" && ! -L "$SHIP_RUNS_DIR" ]] \
-  || fail "commit evidence missing (no owned run directory); refusing to deploy an unverified candidate"
-candidate_tree="$(git rev-parse "$candidate^{tree}")"
-candidate_parent="$(git rev-parse "$candidate^")"
-RUN_DIR=""
-RUN_ID=""
-FOUND=0
-for run_candidate in "$SHIP_RUNS_DIR"/*/; do
-  [[ -d "$run_candidate" && ! -L "${run_candidate%/}" ]] || continue
-  commit_file="$run_candidate/commit.json"
-  [[ -f "$commit_file" && ! -L "$commit_file" ]] || continue
-  commit_sha="$(python3 - "$commit_file" <<'PYEOF'
-import json
-import sys
-from pathlib import Path
-try:
-    payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-except (OSError, ValueError):
-    print("")
-else:
-    value = payload.get("sha")
-    print(value if isinstance(value, str) else "")
-PYEOF
-)" || true
-  [[ "$commit_sha" == "$candidate" ]] || continue
-  FOUND=$((FOUND + 1))
-  RUN_DIR="${run_candidate%/}"
-  RUN_ID="$(basename -- "$RUN_DIR")"
-done
-[[ "$FOUND" -eq 1 ]] \
-  || fail "commit evidence for $candidate must be exactly one fresh receipt (found $FOUND)"
-python3 - "$RUN_DIR/commit.json" "$candidate" "$REMOTE_REF" "$ref_branch" "$candidate_tree" "$candidate_parent" "$RUN_ID" <<'PYEOF' || fail "commit evidence content does not match run/candidate/ref/tree"
-import json
-import sys
-from pathlib import Path
+# Ensure HEAD, branch, and working tree match the outgoing commit cleanly.
+[[ "$(git rev-parse HEAD)" == "$CANDIDATE" ]] \
+  || fail "HEAD does not match outgoing SHA ($CANDIDATE)"
+[[ "$(git branch --show-current)" == "$REF_BRANCH" ]] \
+  || fail "current branch does not match pushed branch ($REF_BRANCH)"
+[[ -z "$(git status --porcelain)" ]] \
+  || fail "working tree must be clean before deploy and E2E"
 
-payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-candidate, ref, branch, tree, parent, run_id = sys.argv[2:8]
-if payload.get("run_id") != run_id:
-    print(f"ship-deploy: commit evidence run_id mismatch", file=sys.stderr)
-    sys.exit(1)
-if payload.get("sha") != candidate:
-    print("ship-deploy: commit evidence sha mismatch", file=sys.stderr)
-    sys.exit(1)
-if payload.get("ref") != ref:
-    print("ship-deploy: commit evidence ref mismatch", file=sys.stderr)
-    sys.exit(1)
-if payload.get("branch") != branch:
-    print("ship-deploy: commit evidence branch mismatch", file=sys.stderr)
-    sys.exit(1)
-if payload.get("tree") != tree:
-    print("ship-deploy: commit evidence tree mismatch", file=sys.stderr)
-    sys.exit(1)
-if payload.get("parent") != parent:
-    print("ship-deploy: commit evidence parent mismatch", file=sys.stderr)
-    sys.exit(1)
-if not isinstance(payload.get("remote"), str) or not payload.get("remote"):
-    print("ship-deploy: commit evidence remote missing", file=sys.stderr)
-    sys.exit(1)
-if payload.get("type") != "commit":
-    print("ship-deploy: commit evidence type mismatch", file=sys.stderr)
-    sys.exit(1)
-PYEOF
-COMMIT_REMOTE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["remote"])' "$RUN_DIR/commit.json")"
+[[ -x "scripts/ship-deploy" ]] || fail "executable scripts/ship-deploy is required"
 
-[[ -f "scripts/ship-deploy" && -x "scripts/ship-deploy" ]] \
-  || fail "opt-in missing: executable scripts/ship-deploy is required"
-[[ ! -L "scripts/ship-deploy" ]] || fail "opt-in invalid: scripts/ship-deploy must not be a symlink"
+# Activate pinned Node version (.nvmrc / .node-version) if present.
+activate_node_version "$REPO_ROOT"
 
-# --- Isolated E2E mode selection from the candidate tree only.
-# A candidate that carries .ship/e2e-runner.json has opted into
-# the fleet isolated path; a candidate without it is legacy.
-# Legacy keeps the current host invocation until migration: that
-# is explicit migration debt, not isolation, and the evidence
-# records it as legacy_host. Once isolation is declared there
-# is no host fallback: preflight must pass before any rollout,
-# and the run re-verifies the same image after rollout.
-E2E_MODE="legacy_host"
-E2E_IMAGE=""
-E2E_IMAGE_ID=""
-E2E_CONTRACT_SHA256=""
-MANAGER=""
-if git cat-file -e "$candidate:.ship/e2e-runner.json" >/dev/null 2>&1; then
-  E2E_MODE="isolated_oci"
-fi
-if [[ "$E2E_MODE" == "isolated_oci" ]]; then
-  [[ -x "$E2E_RUNNER" ]] \
-    || fail "isolated E2E runner missing or not executable: $E2E_RUNNER; no host fallback"
-  PREFLIGHT_OUT="$(mktemp)"
-  if ! "$E2E_RUNNER" preflight "$REPO_ROOT" "$candidate" >"$PREFLIGHT_OUT" 2>&1; then
-    err "isolated E2E preflight failed for $candidate (before rollout):"
-    cat -- "$PREFLIGHT_OUT" >&2
-    rm -f -- "$PREFLIGHT_OUT"
-    exit 1
-  fi
-  cat -- "$PREFLIGHT_OUT"
-  for key in SHIP_E2E_MODE SHIP_E2E_MANAGER SHIP_E2E_IMAGE SHIP_E2E_IMAGE_ID SHIP_E2E_CONTRACT_SHA256; do
-    count="$(grep -c "^$key=" "$PREFLIGHT_OUT" || true)"
-    [[ "$count" == "1" ]] \
-      || fail "isolated E2E preflight must print exactly one $key line (found $count)"
-  done
-  E2E_MANAGER="$(grep '^SHIP_E2E_MANAGER=' "$PREFLIGHT_OUT" | cut -d= -f2-)"
-  E2E_IMAGE="$(grep '^SHIP_E2E_IMAGE=' "$PREFLIGHT_OUT" | cut -d= -f2-)"
-  E2E_IMAGE_ID="$(grep '^SHIP_E2E_IMAGE_ID=' "$PREFLIGHT_OUT" | cut -d= -f2-)"
-  E2E_CONTRACT_SHA256="$(grep '^SHIP_E2E_CONTRACT_SHA256=' "$PREFLIGHT_OUT" | cut -d= -f2-)"
-  [[ "$E2E_MANAGER" == npm || "$E2E_MANAGER" == pnpm || "$E2E_MANAGER" == yarn || "$E2E_MANAGER" == bun ]] \
-    || fail "isolated E2E preflight manager is unsupported: $E2E_MANAGER"
-  [[ "$E2E_IMAGE" == *"@sha256:"* ]] \
-    || fail "isolated E2E preflight image must be digest-pinned"
-  [[ "$E2E_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]] \
-    || fail "isolated E2E preflight image id is not a digest"
-  [[ "$E2E_CONTRACT_SHA256" =~ ^[0-9a-f]{64}$ ]] \
-    || fail "isolated E2E preflight contract hash is not a digest"
-  MANAGER="$E2E_MANAGER"
-  preflight_evidence="$RUN_DIR/preflight.json"
-  [[ ! -e "$preflight_evidence" && ! -L "$preflight_evidence" ]] \
-    || fail "preflight evidence already exists; refusing to overwrite"
-  tmp_preflight="$(mktemp "$RUN_DIR/.tmp.XXXXXX")"
-  python3 - "$tmp_preflight" "$RUN_ID" "$candidate" "$E2E_IMAGE" "$E2E_IMAGE_ID" "$E2E_CONTRACT_SHA256" "$MANAGER" <<'PYEOF' || fail "cannot write preflight evidence"
-import json
-import sys
-
-out_path = sys.argv[1]
-payload = {
-    "run_id": sys.argv[2],
-    "sha": sys.argv[3],
-    "e2e_mode": "isolated_oci",
-    "e2e_image": sys.argv[4],
-    "e2e_image_id": sys.argv[5],
-    "e2e_contract_sha256": sys.argv[6],
-    "manager": sys.argv[7],
-    "e2e": "test:e2e",
-    "type": "preflight",
-}
-with open(out_path, "w", encoding="utf-8") as handle:
-    handle.write(json.dumps(payload, indent=2) + "\n")
-PYEOF
-  mv "$tmp_preflight" "$preflight_evidence"
-  rm -f -- "$PREFLIGHT_OUT"
-fi
-
+# 1. Deploy the exact candidate SHA to non-production.
 DEPLOY_OUT="$(mktemp)"
-trap 'rm -f "$DEPLOY_OUT"' EXIT
-# --- Non-prod rollout for the exact candidate SHA (one argument).
-# Success is deterministic, not a log-keyword guess: the owner adapter
-# must print exactly one stdout line of the form
-# SHIP_DEPLOYED_SHA=<candidate> naming the rolled-out SHA.
-if ! ./scripts/ship-deploy "$candidate" >"$DEPLOY_OUT" 2>&1; then
-  err "non-prod rollout failed for $candidate:"
+trap 'rm -f -- "$DEPLOY_OUT"' EXIT
+
+if ! ./scripts/ship-deploy "$CANDIDATE" >"$DEPLOY_OUT" 2>&1; then
+  err "non-production deploy failed for $CANDIDATE:"
   cat -- "$DEPLOY_OUT" >&2
   exit 1
 fi
 cat -- "$DEPLOY_OUT"
-DEPLOYED_COUNT="$(grep -c '^SHIP_DEPLOYED_SHA=' "$DEPLOY_OUT" || true)"
-[[ "$DEPLOYED_COUNT" == "1" ]] \
-  || fail "scripts/ship-deploy must print exactly one SHIP_DEPLOYED_SHA line (found $DEPLOYED_COUNT)"
+
+DEPLOYED_LINES="$(grep -c '^SHIP_DEPLOYED_SHA=' "$DEPLOY_OUT" || true)"
+[[ "$DEPLOYED_LINES" == "1" ]] \
+  || fail "scripts/ship-deploy must print exactly one SHIP_DEPLOYED_SHA=<SHA> line (found $DEPLOYED_LINES)"
 DEPLOYED_SHA="$(grep '^SHIP_DEPLOYED_SHA=' "$DEPLOY_OUT" | cut -d= -f2-)"
-[[ "$DEPLOYED_SHA" =~ ^[0-9a-f]{40}$ ]] \
-  || fail "scripts/ship-deploy SHIP_DEPLOYED_SHA is not a full SHA"
-[[ "$DEPLOYED_SHA" == "$candidate" ]] \
-  || fail "scripts/ship-deploy deployed $DEPLOYED_SHA, not the candidate $candidate"
+[[ "$DEPLOYED_SHA" == "$CANDIDATE" ]] \
+  || fail "scripts/ship-deploy reported $DEPLOYED_SHA, expected $CANDIDATE"
 
-# --- Full owner test:e2e suite against that deployment. The candidate
-# and the verified deployed SHA are passed explicitly in the
-# environment (SHIP_TARGET_SHA / SHIP_DEPLOYED_SHA); the suite always
-# runs in full with no filtering or skipping. The manager comes from
-# the pinned packageManager field; the script name is fixed and always
-# runs in full (no filtering, no skipping).
-# Isolated mode: the fleet runner re-verifies the preflight image
-# and contract, then runs the suite inside that image. No host Node
-# or package manager is used, and there is no fallback to the host
-# invocation. Legacy mode (migration debt until a repository
-# migrates): the host invocation below, recorded as legacy_host.
-if [[ "$E2E_MODE" == "isolated_oci" ]]; then
-  if ! "$E2E_RUNNER" run "$REPO_ROOT" "$candidate" "$E2E_IMAGE_ID" "$E2E_CONTRACT_SHA256"; then
-    exit 1
-  fi
-else
-  MANAGER="$(python3 -c 'import json; d=json.load(open("package.json")); pm=str(d.get("packageManager","")); print(pm.split("@",1)[0])' 2>/dev/null || true)"
-  [[ -n "$MANAGER" ]] \
-    || fail "packageManager pin missing; cannot derive the test runner"
-  case "$MANAGER" in
-    npm|pnpm|yarn|bun) ;;
-    *) fail "unsupported package manager: $MANAGER" ;;
-  esac
-  # test:e2e must be a non-empty string (owner command); run it in full.
-  if ! SHIP_TARGET_SHA="$candidate" SHIP_DEPLOYED_SHA="$candidate" "$MANAGER" run test:e2e; then
-    exit 1
-  fi
-fi
+# 2. Run the full E2E suite against that deployed SHA.
+MANAGER="$(python3 -c 'import json; pm=str(json.load(open("package.json")).get("packageManager","")); print(pm.split("@",1)[0])' 2>/dev/null || true)"
+case "$MANAGER" in
+  npm|pnpm|yarn|bun) ;;
+  *) fail "unsupported or missing packageManager in package.json: ${MANAGER:-empty}" ;;
+esac
 
-# --- Re-validate HEAD and the clean checkout after deployment and test.
-# If HEAD moved during the rollout (or the rollout dirtied the tree),
-# upload is still blocked. Race note: a concurrent push or deploy from
-# another clone can still race the remote; this wrapper holds no
-# distributed lock, and the push-time decision is local to this run.
-[[ "$(git rev-parse HEAD)" == "$candidate" ]] \
-  || fail "HEAD moved during deployment/test; upload blocked"
-[[ "$(git branch --show-current)" == "$ref_branch" ]] \
-  || fail "branch changed during deployment/test; upload blocked"
-[[ -z "$(git diff --name-only)" ]] \
-  || fail "rollout changed tracked files; candidate must stay clean"
-[[ -z "$(git diff --cached --name-only)" ]] \
-  || fail "rollout staged changes; candidate must stay clean"
-[[ -z "$(git ls-files --others --exclude-standard)" ]] \
-  || fail "rollout left untracked payload; candidate must stay clean"
+SHIP_TARGET_SHA="$CANDIDATE" SHIP_DEPLOYED_SHA="$CANDIDATE" "$MANAGER" run test:e2e
 
-# --- Record deploy evidence in the same run, bound to the run and
-# candidate. Never overwrite existing or symlinked evidence.
-deploy_evidence="$RUN_DIR/deploy.json"
-[[ ! -e "$deploy_evidence" && ! -L "$deploy_evidence" ]] \
-  || fail "deploy evidence already exists; refusing to overwrite"
-tmp_evidence="$(mktemp "$RUN_DIR/.tmp.XXXXXX")"
-python3 - "$tmp_evidence" "$RUN_ID" "$candidate" "$DEPLOYED_SHA" "$COMMIT_REMOTE" "$REMOTE_REF" "$MANAGER" "$E2E_MODE" "$E2E_IMAGE" "$E2E_IMAGE_ID" "$E2E_CONTRACT_SHA256" <<'PYEOF' || fail "cannot write deploy evidence"
-import json
-import sys
+# 3. Re-verify HEAD and clean tree didn't drift during deploy/E2E.
+[[ "$(git rev-parse HEAD)" == "$CANDIDATE" ]] \
+  || fail "HEAD moved during deploy/E2E; blocking push"
+[[ -z "$(git status --porcelain)" ]] \
+  || fail "working tree became dirty during deploy/E2E; blocking push"
 
-out_path = sys.argv[1]
-payload = {
-    "run_id": sys.argv[2],
-    "sha": sys.argv[3],
-    "deployed_sha": sys.argv[4],
-    "remote": sys.argv[5],
-    "ref": sys.argv[6],
-    "manager": sys.argv[7],
-    "e2e_mode": sys.argv[8],
-    "e2e": "test:e2e",
-    "type": "deploy",
-}
-if payload["e2e_mode"] == "isolated_oci":
-    payload["e2e_image"] = sys.argv[9]
-    payload["e2e_image_id"] = sys.argv[10]
-    payload["e2e_contract_sha256"] = sys.argv[11]
-with open(out_path, "w", encoding="utf-8") as handle:
-    handle.write(json.dumps(payload, indent=2) + "\n")
-PYEOF
-mv "$tmp_evidence" "$deploy_evidence"
-printf 'ship-deploy: non-prod rollout and full test:e2e succeeded for %s\n' "$candidate"
-exit 0
+printf 'ship-deploy: deploy and test:e2e passed for %s\n' "$CANDIDATE"

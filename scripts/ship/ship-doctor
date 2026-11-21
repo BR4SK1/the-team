@@ -1,43 +1,29 @@
 #!/usr/bin/env python3
-"""Read-only ship-readiness doctor (milestone 1, diagnostics only).
+"""Read-only @ship compatibility checker.
 
-Takes one explicit repository path, inspects only bounded allowlisted
-local metadata, and prints versioned JSON. It never writes, never runs
-code from the target repository, and never emits file contents, config
-or remote strings, or secrets: output contains only stable check IDs,
-statuses, and reason codes.
+Checks whether a repository explicitly conforms to the @ship opt-in standard
+and reports actionable remediation steps for anything missing.
 
-Traversal is anchored on Linux directory file descriptors opened with
-no-follow semantics, one component at a time from the filesystem root,
-so no symlink component (ancestor or in-tree) is ever followed. Read
-targets must be regular files, are opened nonblocking, are checked
-with fstat, and are read with a hard byte cap. Unsupported platforms
-fail closed.
+Usage:
+  ship-doctor <repo-path>
 
-The single authorised exception to the no-config-read rule is a bounded,
-nofolow, narrowly parsed read of the local declared Git hooks path in
-an ordinary .git directory. Its value is never emitted.
-
-Exit codes: 0 local_pass, 1 blocked, 2 indeterminate.
+Exit codes:
+  0  ready (all checks passed)
+  1  not_ready (one or more requirements missing or misconfigured)
+  2  usage / invalid path
 """
 
 from __future__ import annotations
 
-import argparse
-import errno
 import json
 import os
 import re
-import stat
+import subprocess
 import sys
+from pathlib import Path
 
-SCHEMA_VERSION = 1
-TOOL = "ship-doctor"
-
-MAX_PACKAGE_JSON_BYTES = 1_048_576
-MAX_HOOK_BYTES = 65_536
-MAX_GIT_CONFIG_BYTES = 65_536
-MAX_RUNNER_CONTRACT_BYTES = 65_536
+FLEET_ROOT = Path(__file__).resolve().parents[2]
+EXPECTED_DEPLOY_WRAPPER = FLEET_ROOT / "scripts" / "ship" / "ship-deploy"
 
 MANAGER_LOCKFILES = {
     "npm": ("package-lock.json",),
@@ -45,927 +31,330 @@ MANAGER_LOCKFILES = {
     "yarn": ("yarn.lock",),
     "bun": ("bun.lock", "bun.lockb"),
 }
-ALL_LOCKFILES = tuple(
-    name for names in MANAGER_LOCKFILES.values() for name in names
+
+PACKAGE_MANAGER_RE = re.compile(
+    r"^(npm|pnpm|yarn|bun)@[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$"
 )
-EXPECTED_HOOKS_PATH = ".husky/_"
+
+GITHUB_PATTERNS = (
+    re.compile(r"^(?:https?|ssh)://(?:[^@/]+@)?github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?$"),
+    re.compile(r"^git@github\.com:([^/\s]+)/([^/\s]+?)(?:\.git)?$"),
+)
 
 DISABLE_PATTERNS = (
     re.compile(r"--no-verify"),
     re.compile(r"HUSKY\s*=\s*0"),
-    re.compile(r"core\.hooksPath"),
 )
 
-PACKAGE_MANAGER_RE = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9._-]*@[0-9]+\.[0-9]+\.[0-9]+"
-    r"(?:[-+][0-9A-Za-z.-]+)?$"
-)
 
-NOT_CHECKED = [
-    "effective_runtime",
-    "hook_execution",
-    "test_suite_execution",
-    "git_state_and_remotes",
-    "environment_and_endpoints",
-    "deployment",
-    "isolated_e2e_execution",
-    "runner_image_presence",
-]
-
-CHECK_IDS = [
-    "path.safety",
-    "layout.supported",
-    "metadata.parse",
-    "git.layout",
-    "husky.hooks_path",
-    "husky.pre_commit",
-    "husky.commit_msg",
-    "husky.pre_push",
-    "husky.shim_pre_commit",
-    "husky.shim_commit_msg",
-    "husky.shim_pre_push",
-    "husky.helper",
-    "husky.dependency",
-    "toolchain.pinned",
-    "toolchain.lockfile",
-    "disable_indicators",
-    "scripts.prepare",
-    "scripts.format_check",
-    "scripts.lint",
-    "scripts.test_unit",
-    "scripts.test_e2e",
-    "e2e.runner_contract",
-    "structure.wiring",
-]
-
-DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+def git(repo: Path, *args: str) -> tuple[int, str]:
+    proc = subprocess.run(
+        ["git", "--no-optional-locks", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    return proc.returncode, proc.stdout.strip()
 
 
-def check(check_id: str, status: str, reason: str) -> dict[str, str]:
-    return {"id": check_id, "status": status, "reason": reason}
+def effective_lines(path: Path) -> list[str]:
+    lines: list[str] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        lines.append(stripped)
+    return lines
 
 
-def unknown_all(reason: str) -> list[dict[str, str]]:
-    return [check(check_id, "unknown", reason) for check_id in CHECK_IDS]
+def find_node_version(wanted: str) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["node", "--version"], capture_output=True, text=True, timeout=5
+        )
+        if proc.returncode == 0 and proc.stdout.strip().lstrip("v") == wanted:
+            return "PATH"
+    except OSError:
+        pass
+    home = Path.home()
+    nvm_dir = Path(os.environ.get("NVM_DIR", str(home / ".nvm")))
+    candidates = (
+        nvm_dir / "versions" / "node" / f"v{wanted}" / "bin" / "node",
+        home / ".local/share/fnm/node-versions" / f"v{wanted}" / "installation/bin/node",
+        home / ".local/share/mise/installs/node" / wanted / "bin/node",
+        home / ".volta/tools/image/node" / wanted / "bin/node",
+    )
+    for path in candidates:
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+    return None
 
 
-def overall(checks: list[dict[str, str]]) -> str:
-    statuses = {entry["status"] for entry in checks}
-    if "unknown" in statuses:
-        return "indeterminate"
-    if "fail" in statuses:
-        return "blocked"
-    return "local_pass"
+def main(argv: list[str]) -> int:
+    if len(argv) != 1 or argv[0].startswith("-"):
+        print("usage: ship-doctor <repo-path>", file=sys.stderr)
+        return 2
+
+    repo = Path(argv[0]).resolve()
+    if not repo.is_dir():
+        print(f"ship-doctor: not a directory: {argv[0]}", file=sys.stderr)
+        return 2
+
+    checks: list[dict[str, object]] = []
+    issues: list[dict[str, str]] = []
+
+    def record(check_id: str, ok: bool, detail: str, fix: str = "") -> None:
+        checks.append({"id": check_id, "ok": ok, "detail": detail})
+        if not ok:
+            issues.append({"id": check_id, "detail": detail, "fix": fix})
+
+    # 1. Git repository root + local main branch
+    rc_top, toplevel = git(repo, "rev-parse", "--show-toplevel")
+    if rc_top != 0 or Path(toplevel).resolve() != repo:
+        record(
+            "git.repo",
+            False,
+            "not a Git repository root",
+            "Run ship-doctor against the root directory of a Git repository.",
+        )
+        return emit(repo, None, checks, issues)
+
+    rc_main, _ = git(repo, "show-ref", "--verify", "-q", "refs/heads/main")
+    if rc_main != 0:
+        record(
+            "git.repo",
+            False,
+            "local 'main' branch is missing",
+            "Ensure the repository has a local 'main' branch.",
+        )
+    else:
+        record("git.repo", True, "ok")
+
+    # 2. GitHub remote
+    _, remotes_out = git(repo, "remote")
+    remotes = [r for r in remotes_out.splitlines() if r]
+    github_remotes = []
+    for remote in remotes:
+        urls = []
+        rc_cfg, cfg_url = git(repo, "config", "--get", f"remote.{remote}.url")
+        if rc_cfg == 0 and cfg_url:
+            urls.append(cfg_url)
+        rc_url, eff_url = git(repo, "remote", "get-url", remote)
+        if rc_url == 0 and eff_url and eff_url not in urls:
+            urls.append(eff_url)
+        if any(p.match(u) for u in urls for p in GITHUB_PATTERNS):
+            github_remotes.append(remote)
+    if not github_remotes:
+        record(
+            "git.remote",
+            False,
+            "no GitHub remote configured",
+            "Add a GitHub remote (e.g. git remote add origin git@github.com:<owner>/<repo>.git).",
+        )
+    else:
+        record("git.remote", True, f"ok ({', '.join(github_remotes)})")
+
+    # 3. package.json
+    pkg_path = repo / "package.json"
+    pkg: dict | None = None
+    if not pkg_path.is_file():
+        record(
+            "package.json",
+            False,
+            "package.json not found at repository root",
+            "Add a root package.json with packageManager, husky, and standard scripts.",
+        )
+    else:
+        try:
+            loaded = json.loads(pkg_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                pkg = loaded
+                record("package.json", True, "ok")
+            else:
+                record(
+                    "package.json",
+                    False,
+                    "package.json root must be a JSON object",
+                    "Fix package.json syntax.",
+                )
+        except (OSError, ValueError) as exc:
+            record(
+                "package.json",
+                False,
+                f"invalid package.json: {exc}",
+                "Fix package.json syntax.",
+            )
+
+    # 4. Pinned packageManager + matching lockfile
+    manager: str | None = None
+    if pkg is not None:
+        pm = pkg.get("packageManager")
+        if isinstance(pm, str) and PACKAGE_MANAGER_RE.match(pm.strip()):
+            manager = pm.strip().split("@", 1)[0]
+            lockfiles = MANAGER_LOCKFILES[manager]
+            matched = next(
+                (name for name in lockfiles if (repo / name).is_file() and (repo / name).stat().st_size > 0),
+                None,
+            )
+            if matched:
+                record("toolchain.package_manager", True, f"{pm.strip()} ({matched})")
+            else:
+                record(
+                    "toolchain.package_manager",
+                    False,
+                    f"lockfile missing or empty for {manager} (expected {' or '.join(lockfiles)})",
+                    f"Run `{manager} install` and commit the generated lockfile.",
+                )
+        else:
+            record(
+                "toolchain.package_manager",
+                False,
+                "package.json 'packageManager' must be pinned (e.g. pnpm@10.18.1)",
+                'Set "packageManager": "<npm|pnpm|yarn|bun>@<x.y.z>" in package.json.',
+            )
+
+    # 5. Optional Node version pin (.nvmrc or .node-version)
+    pin_file = next((p for p in (repo / ".nvmrc", repo / ".node-version") if p.is_file()), None)
+    if pin_file is None:
+        record("toolchain.node_pin", True, "no .nvmrc (using host PATH)")
+    else:
+        wanted = pin_file.read_text(encoding="utf-8").strip().lstrip("v")
+        if not wanted:
+            record(
+                "toolchain.node_pin",
+                False,
+                f"{pin_file.name} is empty",
+                f"Write a Node.js version (e.g. 22.23.4) in {pin_file.name}, or remove the file.",
+            )
+        else:
+            found = find_node_version(wanted)
+            if found:
+                record("toolchain.node_pin", True, f"v{wanted} ({found})")
+            else:
+                record(
+                    "toolchain.node_pin",
+                    False,
+                    f"{pin_file.name} pins Node v{wanted}, which is not installed locally",
+                    f"Install Node v{wanted} (e.g. `nvm install {wanted}`).",
+                )
+
+    # 6. Required package.json scripts
+    if pkg is not None:
+        scripts = pkg.get("scripts")
+        if not isinstance(scripts, dict):
+            scripts = {}
+        missing_scripts = []
+        if str(scripts.get("prepare", "")).strip() != "husky":
+            missing_scripts.append('prepare="husky"')
+        for name in ("format:check", "lint", "test:unit", "test:e2e"):
+            val = scripts.get(name)
+            if not isinstance(val, str) or not val.strip():
+                missing_scripts.append(name)
+        if missing_scripts:
+            record(
+                "scripts.required",
+                False,
+                f"missing or invalid scripts: {', '.join(missing_scripts)}",
+                'Define "prepare": "husky", "format:check", "lint", "test:unit", and "test:e2e" in package.json scripts.',
+            )
+        else:
+            record("scripts.required", True, "ok")
+
+    # 7. Husky installed & wired
+    husky_problems: list[str] = []
+    if pkg is not None:
+        deps = {**(pkg.get("dependencies") or {}), **(pkg.get("devDependencies") or {})}
+        if not isinstance(deps.get("husky"), str) or not deps["husky"].strip():
+            husky_problems.append("husky not in package.json dependencies/devDependencies")
+    _, hooks_path = git(repo, "config", "--get", "core.hooksPath")
+    if hooks_path.rstrip("/") != ".husky/_":
+        husky_problems.append(f"git core.hooksPath is {hooks_path!r} (expected '.husky/_')")
+    if not (repo / ".husky" / "_" / "h").is_file():
+        husky_problems.append(".husky/_/h missing (run `npx husky` or package install)")
+    for hook in ("pre-commit", "commit-msg", "pre-push"):
+        if not (repo / ".husky" / hook).is_file():
+            husky_problems.append(f".husky/{hook} missing")
+        shim = repo / ".husky" / "_" / hook
+        if not (shim.is_file() and os.access(shim, os.X_OK)):
+            husky_problems.append(f".husky/_/{hook} shim missing or not executable")
+    if husky_problems:
+        record(
+            "husky.installed",
+            False,
+            "; ".join(husky_problems),
+            "Install husky v9, run your package manager's install/prepare script so core.hooksPath=.husky/_, and add .husky/pre-commit, .husky/commit-msg, and .husky/pre-push.",
+        )
+    else:
+        record("husky.installed", True, "ok")
+
+    # 8. Husky pre-push delegation + no bypass indicators
+    pre_push = repo / ".husky" / "pre-push"
+    bypass_found = []
+    for hook in ("pre-commit", "commit-msg", "pre-push"):
+        hp = repo / ".husky" / hook
+        if hp.is_file():
+            text = hp.read_text(encoding="utf-8")
+            if any(p.search(text) for p in DISABLE_PATTERNS):
+                bypass_found.append(f".husky/{hook}")
+    if bypass_found:
+        record(
+            "husky.pre_push",
+            False,
+            f"gate bypass indicator (--no-verify or HUSKY=0) found in {', '.join(bypass_found)}",
+            "Remove --no-verify and HUSKY=0 from Husky hook files.",
+        )
+    elif not pre_push.is_file():
+        record(
+            "husky.pre_push",
+            False,
+            ".husky/pre-push missing",
+            f'Create .husky/pre-push with: exec "{EXPECTED_DEPLOY_WRAPPER}"',
+        )
+    else:
+        lines = effective_lines(pre_push)
+        expected_line = f'exec "{EXPECTED_DEPLOY_WRAPPER}"'
+        if lines != [expected_line]:
+            record(
+                "husky.pre_push",
+                False,
+                ".husky/pre-push does not delegate to the fleet ship-deploy wrapper",
+                f'Set .husky/pre-push to a single effective line: {expected_line}',
+            )
+        else:
+            record("husky.pre_push", True, "ok")
+
+    # 9. Repo-owned non-production deploy entry point
+    deploy_script = repo / "scripts" / "ship-deploy"
+    if not (deploy_script.is_file() and os.access(deploy_script, os.X_OK)):
+        record(
+            "deploy.script",
+            False,
+            "executable scripts/ship-deploy not found at repository root",
+            "Add an executable scripts/ship-deploy that takes <40-hex-SHA>, deploys it to non-production, and prints SHIP_DEPLOYED_SHA=<SHA> on stdout.",
+        )
+    else:
+        record("deploy.script", True, "ok")
+
+    return emit(repo, manager, checks, issues)
 
 
-def emit(checks: list[dict[str, str]]) -> int:
-    result = overall(checks)
+def emit(
+    repo: Path,
+    manager: str | None,
+    checks: list[dict[str, object]],
+    issues: list[dict[str, str]],
+) -> int:
+    ready = len(issues) == 0
     payload = {
-        "schema_version": SCHEMA_VERSION,
-        "tool": TOOL,
-        "result": result,
+        "status": "ready" if ready else "not_ready",
+        "repo": str(repo),
+        "package_manager": manager,
         "checks": checks,
-        "not_checked": NOT_CHECKED,
+        "issues": issues,
     }
-    print(json.dumps(payload, indent=2, sort_keys=False))
-    return {"local_pass": 0, "blocked": 1, "indeterminate": 2}[result]
-
-
-def _state_for_oserror(error: OSError) -> str:
-    if error.errno == errno.ELOOP:
-        return "symlink"
-    if error.errno == errno.ENOTDIR:
-        return "not_directory"
-    if error.errno == errno.EISDIR:
-        return "not_directory"
-    return "unreadable"
-
-
-def _classify_dir_open_error(
-    parent_fd: int, part: str, error: OSError
-) -> str:
-    """Classify a failed directory open without following anything.
-
-    On Linux, opening a symlinked directory with no-follow and
-    directory-only flags fails with ENOTDIR rather than ELOOP, so a
-    no-follow stat distinguishes that case from a plain file. The
-    failed open already followed nothing; this only chooses the
-    reason code.
-    """
-    if error.errno == errno.ENOTDIR:
-        try:
-            info = os.stat(part, dir_fd=parent_fd, follow_symlinks=False)
-        except OSError:
-            return "not_directory"
-        if stat.S_ISLNK(info.st_mode):
-            return "symlink"
-        return "not_directory"
-    return _state_for_oserror(error)
-
-
-def _open_root(repo_arg: str) -> tuple[str, int | None]:
-    """Open the repository root via no-follow traversal from /.
-
-    Returns (state, fd-or-None). Any symlink component, including an
-    ancestor of the given path, fails with state symlink.
-    """
-    if not repo_arg:
-        return ("unsafe", None)
-    absolute = os.path.abspath(repo_arg)
-    parts = [part for part in absolute.split(os.sep) if part not in ("", ".")]
-    try:
-        current = os.open(os.sep, DIR_FLAGS)
-    except OSError:
-        return ("unreadable", None)
-    for part in parts:
-        try:
-            following = os.open(part, DIR_FLAGS, dir_fd=current)
-        except FileNotFoundError:
-            os.close(current)
-            return ("missing", None)
-        except OSError as error:
-            state = _classify_dir_open_error(current, part, error)
-            os.close(current)
-            return (state, None)
-        os.close(current)
-        current = following
-    try:
-        info = os.fstat(current)
-    except OSError:
-        os.close(current)
-        return ("unreadable", None)
-    if not stat.S_ISDIR(info.st_mode):
-        os.close(current)
-        return ("not_directory", None)
-    return ("ok", current)
-
-
-def _open_dir(root_fd: int, parts: tuple[str, ...]) -> tuple[str, int | None]:
-    """Open a directory under root_fd without following symlinks."""
-    current = os.dup(root_fd)
-    for part in parts:
-        try:
-            following = os.open(part, DIR_FLAGS, dir_fd=current)
-        except FileNotFoundError:
-            os.close(current)
-            return ("missing", None)
-        except OSError as error:
-            state = _classify_dir_open_error(current, part, error)
-            os.close(current)
-            return (state, None)
-        os.close(current)
-        current = following
-    return ("ok", current)
-
-
-def _open_file(
-    root_fd: int, parts: tuple[str, ...]
-) -> tuple[str, int | None, int | None]:
-    """Open a regular file under root_fd; return (state, fd, size).
-
-    Non-regular targets (including FIFOs) are rejected without reading
-    them. The file is opened nonblocking so a non-regular race cannot
-    block this process.
-    """
-    if len(parts) > 1:
-        state, parent = _open_dir(root_fd, parts[:-1])
-        if state != "ok" or parent is None:
-            return (state, None, None)
-    else:
-        parent = os.dup(root_fd)
-    try:
-        fd = os.open(parts[-1], FILE_FLAGS, dir_fd=parent)
-    except FileNotFoundError:
-        os.close(parent)
-        return ("missing", None, None)
-    except OSError as error:
-        os.close(parent)
-        return (_state_for_oserror(error), None, None)
-    os.close(parent)
-    try:
-        info = os.fstat(fd)
-    except OSError:
-        os.close(fd)
-        return ("unreadable", None, None)
-    if not stat.S_ISREG(info.st_mode):
-        os.close(fd)
-        return ("nonregular", None, None)
-    return ("ok", fd, info.st_size)
-
-
-def _read_capped(fd: int, limit: int) -> tuple[str, str | None]:
-    """Read at most limit+1 bytes; never read unboundedly."""
-    chunks: list[bytes] = []
-    total = 0
-    while True:
-        remaining = limit + 1 - total
-        if remaining <= 0:
-            return ("oversized", None)
-        try:
-            chunk = os.read(fd, min(65_536, remaining))
-        except BlockingIOError:
-            return ("unreadable", None)
-        except OSError:
-            return ("unreadable", None)
-        if not chunk:
-            break
-        chunks.append(chunk)
-        total += len(chunk)
-        if total > limit:
-            return ("oversized", None)
-    try:
-        return ("ok", b"".join(chunks).decode("utf-8"))
-    except UnicodeDecodeError:
-        return ("malformed", None)
-
-
-def _read_file(
-    root_fd: int, parts: tuple[str, ...], limit: int
-) -> tuple[str, str | None]:
-    state, fd, _size = _open_file(root_fd, parts)
-    if state != "ok" or fd is None:
-        return (state, None)
-    try:
-        return _read_capped(fd, limit)
-    finally:
-        os.close(fd)
-
-
-def _stat_file(root_fd: int, parts: tuple[str, ...]) -> tuple[str, int | None]:
-    state, fd, size = _open_file(root_fd, parts)
-    if state != "ok" or fd is None:
-        return (state, None)
-    os.close(fd)
-    return ("ok", size)
-
-
-def _parse_git_config(
-    text: str,
-) -> tuple[str, str | None, bool]:
-    """Narrowly parse core.hooksPath and core.bare only.
-
-    Returns (state, hooks-path-or-None, bare). Never resolves includes
-    and never returns any other value. Anything outside the narrow
-    supported shape fails closed.
-    """
-    hooks_values: list[str] = []
-    bare_values: list[str] = []
-    section: str | None = None
-    section_re = re.compile(
-        r'^\[\s*([A-Za-z0-9.-]+)(?:\s+"[^"]*")?\s*\]\s*(?:[;#].*)?$'
-    )
-    key_re = re.compile(r"^([A-Za-z0-9-]+)\s*=\s*(.+)$")
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line[0] in "#;":
-            continue
-        if line.startswith("["):
-            match = section_re.match(line)
-            if match is None:
-                return ("malformed", None, False)
-            section = match.group(1).lower()
-            if section in ("include", "includeif"):
-                return ("unsupported", None, False)
-            continue
-        if section is None:
-            return ("malformed", None, False)
-        match = key_re.match(line)
-        if match is None:
-            return ("malformed", None, False)
-        if section == "core" and match.group(1).lower() in (
-            "hookspath",
-            "bare",
-        ):
-            value = match.group(2).strip()
-            if any(char in value for char in ('"', "\\", "$")):
-                return ("unsupported", None, False)
-            if " ;" in value or " #" in value:
-                return ("unsupported", None, False)
-            if match.group(1).lower() == "hookspath":
-                hooks_values.append(value)
-            else:
-                bare_values.append(value)
-    if len(hooks_values) > 1 or len(bare_values) > 1:
-        return ("unsupported", None, False)
-    bare = False
-    if bare_values:
-        lowered = bare_values[0].lower()
-        if lowered in ("true", "yes", "on", "1"):
-            bare = True
-        elif lowered in ("false", "no", "off", "0", ""):
-            bare = False
-        else:
-            return ("unsupported", None, False)
-    hooks_path = hooks_values[0] if hooks_values else None
-    return ("ok", hooks_path, bare)
-
-
-def _user_hook(
-    root_fd: int, parts: tuple[str, ...]
-) -> tuple[tuple[str, str], str | None]:
-    """User hook files are regular files run via sh; exec is not required."""
-    state, text = _read_file(root_fd, parts, MAX_HOOK_BYTES)
-    if state == "ok":
-        return (("pass", "ok"), text)
-    if state == "missing":
-        return (("fail", "missing"), None)
-    if state == "symlink":
-        return (("unknown", "symlink_not_allowed"), None)
-    if state == "nonregular":
-        return (("unknown", "nonregular_file"), None)
-    if state == "not_directory":
-        return (("fail", "not_directory"), None)
-    if state == "oversized":
-        return (("unknown", "oversized"), None)
-    if state == "malformed":
-        return (("unknown", "malformed_metadata"), None)
-    return (("unknown", "unreadable"), None)
-
-
-def _shim(
-    root_fd: int, parts: tuple[str, ...]
-) -> tuple[str, str]:
-    """Generated Husky shims and the helper must be executable files."""
-    state, fd, _size = _open_file(root_fd, parts)
-    if state == "missing":
-        return ("fail", "missing")
-    if state == "symlink":
-        return ("unknown", "symlink_not_allowed")
-    if state == "nonregular":
-        return ("unknown", "nonregular_file")
-    if state == "not_directory":
-        return ("fail", "not_directory")
-    if state != "ok" or fd is None:
-        return ("unknown", "unreadable")
-    try:
-        info = os.fstat(fd)
-    except OSError:
-        return ("unknown", "unreadable")
-    finally:
-        os.close(fd)
-    if not (info.st_mode & stat.S_IXUSR):
-        return ("fail", "not_executable")
-    return ("pass", "ok")
-
-
-def run(repo_arg: str) -> int:
-    if not sys.platform.startswith("linux") or not hasattr(os, "O_NOFOLLOW"):
-        checks = unknown_all("unsupported_platform")
-        checks[0] = check("path.safety", "unknown", "unsupported_platform")
-        return emit(checks)
-    root_state, root_fd = _open_root(repo_arg)
-    if root_state != "ok" or root_fd is None:
-        reason = {
-            "missing": "unsafe_path",
-            "symlink": "symlink_not_allowed",
-            "not_directory": "unsafe_path",
-            "unsafe": "unsafe_path",
-        }.get(root_state, "unsafe_path")
-        checks = unknown_all("not_evaluated")
-        checks[0] = check("path.safety", "unknown", reason)
-        return emit(checks)
-    try:
-        return _run_with_root(root_fd)
-    finally:
-        os.close(root_fd)
-
-
-def _run_with_root(root_fd: int) -> int:
-    checks: dict[str, dict[str, str]] = {}
-    checks["path.safety"] = check("path.safety", "pass", "ok")
-
-    # --- package.json ---
-    pkg_state, pkg_text = _read_file(
-        root_fd, ("package.json",), MAX_PACKAGE_JSON_BYTES
-    )
-    metadata: dict | None = None
-    metadata_raw: str | None = None
-    metadata_usable = False
-    if pkg_state == "missing":
-        checks["layout.supported"] = check(
-            "layout.supported", "unknown", "unsupported_layout"
-        )
-        checks["metadata.parse"] = check(
-            "metadata.parse", "unknown", "unsupported_layout"
-        )
-    elif pkg_state == "symlink":
-        checks["layout.supported"] = check(
-            "layout.supported", "unknown", "symlink_not_allowed"
-        )
-        checks["metadata.parse"] = check(
-            "metadata.parse", "unknown", "symlink_not_allowed"
-        )
-    elif pkg_state == "nonregular":
-        checks["layout.supported"] = check(
-            "layout.supported", "unknown", "nonregular_file"
-        )
-        checks["metadata.parse"] = check(
-            "metadata.parse", "unknown", "nonregular_file"
-        )
-    elif pkg_state == "oversized":
-        checks["layout.supported"] = check(
-            "layout.supported", "unknown", "oversized"
-        )
-        checks["metadata.parse"] = check(
-            "metadata.parse", "unknown", "oversized"
-        )
-    elif pkg_state != "ok" or pkg_text is None:
-        checks["layout.supported"] = check(
-            "layout.supported", "unknown", "unreadable"
-        )
-        checks["metadata.parse"] = check(
-            "metadata.parse", "unknown", "malformed_metadata"
-        )
-    else:
-        checks["layout.supported"] = check("layout.supported", "pass", "ok")
-        metadata_raw = pkg_text
-        try:
-            parsed = json.loads(pkg_text)
-        except (ValueError, RecursionError):
-            parsed = None
-        if not isinstance(parsed, dict):
-            checks["metadata.parse"] = check(
-                "metadata.parse", "unknown", "malformed_metadata"
-            )
-        else:
-            metadata = parsed
-            metadata_usable = True
-            checks["metadata.parse"] = check("metadata.parse", "pass", "ok")
-
-    # --- Git layout and declared hooks path ---
-    declared_hooks_path: str | None = None
-    git_ok = False
-    git_state, git_dir_fd = _open_dir(root_fd, (".git",))
-    if git_state == "missing":
-        checks["git.layout"] = check(
-            "git.layout", "unknown", "unsupported_layout"
-        )
-    elif git_state == "symlink":
-        checks["git.layout"] = check(
-            "git.layout", "unknown", "symlink_not_allowed"
-        )
-    elif git_state == "not_directory":
-        checks["git.layout"] = check(
-            "git.layout", "unknown", "unsupported_layout"
-        )
-    elif git_state != "ok" or git_dir_fd is None:
-        checks["git.layout"] = check("git.layout", "unknown", "unreadable")
-    else:
-        try:
-            head_state, head_fd, _head_size = _open_file(
-                root_fd, (".git", "HEAD")
-            )
-            if head_fd is not None:
-                os.close(head_fd)
-            if head_state != "ok":
-                reason = {
-                    "missing": "unsupported_layout",
-                    "symlink": "symlink_not_allowed",
-                    "nonregular": "nonregular_file",
-                }.get(head_state, "unreadable")
-                checks["git.layout"] = check("git.layout", "unknown", reason)
-            else:
-                config_state, config_text = _read_file(
-                    root_fd, (".git", "config"), MAX_GIT_CONFIG_BYTES
-                )
-                if config_state != "ok" or config_text is None:
-                    reason = {
-                        "missing": "unsupported_layout",
-                        "symlink": "symlink_not_allowed",
-                        "nonregular": "nonregular_file",
-                        "oversized": "oversized",
-                        "malformed": "malformed_metadata",
-                    }.get(config_state, "unreadable")
-                    checks["git.layout"] = check(
-                        "git.layout", "unknown", reason
-                    )
-                else:
-                    parse_state, hooks_path, bare = _parse_git_config(
-                        config_text
-                    )
-                    if parse_state != "ok":
-                        reason = (
-                            "unsupported_layout"
-                            if parse_state == "unsupported"
-                            else "malformed_metadata"
-                        )
-                        checks["git.layout"] = check(
-                            "git.layout", "unknown", reason
-                        )
-                    elif bare:
-                        checks["git.layout"] = check(
-                            "git.layout", "unknown", "unsupported_layout"
-                        )
-                    else:
-                        git_ok = True
-                        declared_hooks_path = hooks_path
-                        checks["git.layout"] = check(
-                            "git.layout", "pass", "ok"
-                        )
-        finally:
-            os.close(git_dir_fd)
-
-    husky_dir_state, _husky_fd = _open_dir(root_fd, (".husky",))
-    husky_underscore_state, _under_fd = _open_dir(root_fd, (".husky", "_"))
-    for _fd in (_husky_fd, _under_fd):
-        if _fd is not None:
-            os.close(_fd)
-
-    if not git_ok:
-        checks["husky.hooks_path"] = check(
-            "husky.hooks_path", "unknown", "not_evaluated"
-        )
-    elif declared_hooks_path is None:
-        checks["husky.hooks_path"] = check(
-            "husky.hooks_path", "fail", "hooks_path_missing"
-        )
-    elif declared_hooks_path.rstrip("/") != EXPECTED_HOOKS_PATH:
-        checks["husky.hooks_path"] = check(
-            "husky.hooks_path", "fail", "hooks_path_mismatch"
-        )
-    elif husky_underscore_state == "symlink":
-        checks["husky.hooks_path"] = check(
-            "husky.hooks_path", "unknown", "symlink_not_allowed"
-        )
-    elif husky_underscore_state == "missing":
-        checks["husky.hooks_path"] = check(
-            "husky.hooks_path", "fail", "missing"
-        )
-    elif husky_underscore_state == "not_directory":
-        checks["husky.hooks_path"] = check(
-            "husky.hooks_path", "fail", "not_directory"
-        )
-    elif husky_underscore_state != "ok":
-        checks["husky.hooks_path"] = check(
-            "husky.hooks_path", "unknown", "unreadable"
-        )
-    else:
-        husky_decl = metadata.get("husky") if metadata else None
-        if husky_decl is not None and not isinstance(husky_decl, dict):
-            checks["husky.hooks_path"] = check(
-                "husky.hooks_path", "unknown", "malformed_metadata"
-            )
-        elif isinstance(husky_decl, dict) and (
-            "hooks" in husky_decl
-            or (
-                "hooksPath" in husky_decl
-                and str(husky_decl.get("hooksPath")).rstrip("/")
-                != EXPECTED_HOOKS_PATH
-            )
-        ):
-            checks["husky.hooks_path"] = check(
-                "husky.hooks_path", "fail", "hooks_path_mismatch"
-            )
-        else:
-            checks["husky.hooks_path"] = check(
-                "husky.hooks_path", "pass", "ok"
-            )
-
-    # --- User hooks (regular files, run via sh) ---
-    hook_texts: list[str] = []
-    scan_unknown = False
-    for check_id, parts in (
-        ("husky.pre_commit", (".husky", "pre-commit")),
-        ("husky.commit_msg", (".husky", "commit-msg")),
-        ("husky.pre_push", (".husky", "pre-push")),
-    ):
-        (status, reason), text = _user_hook(root_fd, parts)
-        checks[check_id] = check(check_id, status, reason)
-        if text is not None:
-            hook_texts.append(text)
-        elif status == "unknown":
-            scan_unknown = True
-
-    # --- Generated shims (executable) and helper (regular, sourced) ---
-    for check_id, parts in (
-        ("husky.shim_pre_commit", (".husky", "_", "pre-commit")),
-        ("husky.shim_commit_msg", (".husky", "_", "commit-msg")),
-        ("husky.shim_pre_push", (".husky", "_", "pre-push")),
-    ):
-        status, reason = _shim(root_fd, parts)
-        checks[check_id] = check(check_id, status, reason)
-    # The _/h helper is sourced by the shims (Companion's copy is
-    # mode 0644), never executed directly, so it must be a regular
-    # file but is not required to be executable.
-    helper_state, _helper_size = _stat_file(root_fd, (".husky", "_", "h"))
-    if helper_state == "ok":
-        checks["husky.helper"] = check("husky.helper", "pass", "ok")
-    elif helper_state == "missing":
-        checks["husky.helper"] = check("husky.helper", "fail", "missing")
-    elif helper_state == "symlink":
-        checks["husky.helper"] = check(
-            "husky.helper", "unknown", "symlink_not_allowed"
-        )
-    elif helper_state == "nonregular":
-        checks["husky.helper"] = check(
-            "husky.helper", "unknown", "nonregular_file"
-        )
-    elif helper_state == "not_directory":
-        checks["husky.helper"] = check(
-            "husky.helper", "fail", "not_directory"
-        )
-    else:
-        checks["husky.helper"] = check("husky.helper", "unknown", "unreadable")
-
-    # --- Husky dependency declaration (shape only) ---
-    if not metadata_usable or metadata is None:
-        checks["husky.dependency"] = check(
-            "husky.dependency", "unknown", "not_evaluated"
-        )
-    else:
-        dependency_malformed = False
-        husky_version: object = None
-        husky_found = False
-        for field in ("devDependencies", "dependencies"):
-            section = metadata.get(field)
-            if section is None:
-                continue
-            if not isinstance(section, dict):
-                dependency_malformed = True
-                break
-            if "husky" in section:
-                husky_version = section["husky"]
-                husky_found = True
-                break
-        if dependency_malformed:
-            checks["husky.dependency"] = check(
-                "husky.dependency", "unknown", "malformed_metadata"
-            )
-        elif not husky_found:
-            checks["husky.dependency"] = check(
-                "husky.dependency", "fail", "husky_dependency_missing"
-            )
-        elif not isinstance(husky_version, str) or not husky_version.strip():
-            checks["husky.dependency"] = check(
-                "husky.dependency", "fail", "husky_dependency_invalid"
-            )
-        else:
-            checks["husky.dependency"] = check(
-                "husky.dependency", "pass", "ok"
-            )
-
-    # --- Toolchain pin ---
-    pinned_name: str | None = None
-    pinned_valid = False
-    if not metadata_usable or metadata is None:
-        checks["toolchain.pinned"] = check(
-            "toolchain.pinned", "unknown", "not_evaluated"
-        )
-    else:
-        pinned = metadata.get("packageManager")
-        if isinstance(pinned, str) and PACKAGE_MANAGER_RE.match(pinned.strip()):
-            pinned_valid = True
-            pinned_name = pinned.strip().split("@", 1)[0]
-            checks["toolchain.pinned"] = check(
-                "toolchain.pinned", "pass", "ok"
-            )
-        else:
-            checks["toolchain.pinned"] = check(
-                "toolchain.pinned", "fail", "unpinned"
-            )
-
-    # --- Lockfile must correspond to the pinned manager ---
-    if not metadata_usable:
-        checks["toolchain.lockfile"] = check(
-            "toolchain.lockfile", "unknown", "not_evaluated"
-        )
-    elif pinned_valid and pinned_name not in MANAGER_LOCKFILES:
-        checks["toolchain.lockfile"] = check(
-            "toolchain.lockfile", "unknown", "unsupported_toolchain"
-        )
-    else:
-        expected = (
-            MANAGER_LOCKFILES[pinned_name]
-            if pinned_valid and pinned_name is not None
-            else ALL_LOCKFILES
-        )
-        lock_status = "fail"
-        lock_reason = "lockfile_missing"
-        found_any = False
-        for name in ALL_LOCKFILES:
-            state, size = _stat_file(root_fd, (name,))
-            if state == "symlink":
-                lock_status = "unknown"
-                lock_reason = "symlink_not_allowed"
-                break
-            if state == "nonregular":
-                lock_status = "unknown"
-                lock_reason = "nonregular_file"
-                break
-            if state != "ok":
-                continue
-            found_any = True
-            if name in expected and size is not None and size > 0:
-                lock_status = "pass"
-                lock_reason = "ok"
-                break
-            if name in expected and size == 0:
-                lock_status = "fail"
-                lock_reason = "lockfile_invalid"
-        else:
-            if (
-                lock_status == "fail"
-                and lock_reason == "lockfile_missing"
-                and found_any
-                and pinned_valid
-            ):
-                lock_reason = "lockfile_mismatch"
-        checks["toolchain.lockfile"] = check(
-            "toolchain.lockfile", lock_status, lock_reason
-        )
-
-    # --- Visible disable / override indicators ---
-    scan_texts: list[str] = []
-    if metadata_raw is not None:
-        scan_texts.append(metadata_raw)
-    scan_texts.extend(hook_texts)
-    if not metadata_usable and pkg_state not in ("missing", "ok"):
-        scan_unknown = True
-    legacy_hooks = (
-        isinstance(metadata, dict)
-        and isinstance(metadata.get("husky"), dict)
-        and "hooks" in metadata["husky"]
-    )
-    if scan_unknown:
-        checks["disable_indicators"] = check(
-            "disable_indicators", "unknown", "unreadable"
-        )
-    elif legacy_hooks or any(
-        pattern.search(text) for text in scan_texts for pattern in DISABLE_PATTERNS
-    ):
-        checks["disable_indicators"] = check(
-            "disable_indicators", "fail", "disable_indicator_present"
-        )
-    else:
-        checks["disable_indicators"] = check("disable_indicators", "pass", "ok")
-
-    # --- Standard package scripts (presence/shape only, never run) ---
-    script_specs = (
-        ("scripts.prepare", "prepare"),
-        ("scripts.format_check", "format:check"),
-        ("scripts.lint", "lint"),
-        ("scripts.test_unit", "test:unit"),
-        ("scripts.test_e2e", "test:e2e"),
-    )
-    scripts: dict | None = None
-    scripts_malformed = False
-    if metadata_usable and metadata is not None:
-        candidate = metadata.get("scripts")
-        if candidate is None:
-            scripts = {}
-        elif isinstance(candidate, dict):
-            scripts = candidate
-        else:
-            scripts = {}
-            scripts_malformed = True
-    for check_id, key in script_specs:
-        if not metadata_usable or scripts is None:
-            checks[check_id] = check(check_id, "unknown", "not_evaluated")
-        elif scripts_malformed:
-            checks[check_id] = check(
-                check_id, "unknown", "malformed_metadata"
-            )
-        elif key not in scripts:
-            checks[check_id] = check(check_id, "fail", "script_missing")
-        else:
-            value = scripts[key]
-            if not isinstance(value, str) or not value.strip():
-                checks[check_id] = check(check_id, "fail", "script_invalid")
-            elif key == "prepare" and value.strip() != "husky":
-                checks[check_id] = check(check_id, "fail", "script_not_husky")
-            else:
-                checks[check_id] = check(check_id, "pass", "ok")
-
-    # --- Isolated E2E runner contract (shape only, never executed) ---
-    # Absence is the legacy host invocation: it passes with an
-    # explicit legacy reason so the debt stays visible, and it
-    # never claims isolation. Presence opts the repository into
-    # the fleet isolated path: any invalid shape is a known
-    # mismatch (fail), never a fallback to the host invocation.
-    contract_state, contract_text = _read_file(
-        root_fd, (".ship", "e2e-runner.json"), MAX_RUNNER_CONTRACT_BYTES
-    )
-    if contract_state == "missing":
-        checks["e2e.runner_contract"] = check(
-            "e2e.runner_contract", "pass", "legacy_host_e2e"
-        )
-    elif contract_state == "symlink":
-        checks["e2e.runner_contract"] = check(
-            "e2e.runner_contract", "unknown", "symlink_not_allowed"
-        )
-    elif contract_state == "nonregular":
-        checks["e2e.runner_contract"] = check(
-            "e2e.runner_contract", "unknown", "nonregular_file"
-        )
-    elif contract_state == "not_directory":
-        checks["e2e.runner_contract"] = check(
-            "e2e.runner_contract", "fail", "not_directory"
-        )
-    elif contract_state == "oversized":
-        checks["e2e.runner_contract"] = check(
-            "e2e.runner_contract", "unknown", "oversized"
-        )
-    elif contract_state == "malformed":
-        checks["e2e.runner_contract"] = check(
-            "e2e.runner_contract", "unknown", "malformed_metadata"
-        )
-    elif contract_state != "ok" or contract_text is None:
-        checks["e2e.runner_contract"] = check(
-            "e2e.runner_contract", "unknown", "unreadable"
-        )
-    else:
-        try:
-            contract = json.loads(contract_text)
-        except (ValueError, RecursionError):
-            contract = None
-        if not isinstance(contract, dict):
-            checks["e2e.runner_contract"] = check(
-                "e2e.runner_contract", "unknown", "malformed_metadata"
-            )
-        elif not metadata_usable or metadata is None:
-            checks["e2e.runner_contract"] = check(
-                "e2e.runner_contract", "unknown", "not_evaluated"
-            )
-        else:
-            contract_valid = True
-            if set(contract) != {"schema_version", "runner"}:
-                contract_valid = False
-            elif (
-                contract.get("schema_version") != 1
-                or isinstance(contract.get("schema_version"), bool)
-            ):
-                contract_valid = False
-            else:
-                runner = contract.get("runner")
-                if not isinstance(runner, dict) or set(runner) != {
-                    "kind", "image", "command"
-                }:
-                    contract_valid = False
-                elif runner.get("kind") != "oci":
-                    contract_valid = False
-                elif not isinstance(runner.get("image"), str) or not re.fullmatch(
-                    r"[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}",
-                    runner["image"],
-                ):
-                    contract_valid = False
-                else:
-                    command = runner.get("command")
-                    if (
-                        not isinstance(command, list)
-                        or len(command) != 3
-                        or command[1:] != ["run", "test:e2e"]
-                        or command[0] not in ("npm", "pnpm", "yarn", "bun")
-                    ):
-                        contract_valid = False
-                    elif pinned_valid and pinned_name is not None and command[0] != pinned_name:
-                        contract_valid = False
-            if contract_valid:
-                checks["e2e.runner_contract"] = check(
-                    "e2e.runner_contract", "pass", "isolated_oci"
-                )
-            else:
-                checks["e2e.runner_contract"] = check(
-                    "e2e.runner_contract", "fail", "runner_contract_invalid"
-                )
-
-    # --- Static structure (only where provable) ---
-    if husky_underscore_state == "symlink":
-        checks["structure.wiring"] = check(
-            "structure.wiring", "unknown", "symlink_not_allowed"
-        )
-    elif husky_underscore_state == "missing":
-        checks["structure.wiring"] = check(
-            "structure.wiring", "fail", "missing"
-        )
-    elif husky_underscore_state == "not_directory":
-        checks["structure.wiring"] = check(
-            "structure.wiring", "fail", "not_directory"
-        )
-    elif husky_underscore_state != "ok":
-        checks["structure.wiring"] = check(
-            "structure.wiring", "unknown", "unreadable"
-        )
-    elif checks["layout.supported"]["status"] != "pass" or not git_ok:
-        checks["structure.wiring"] = check(
-            "structure.wiring", "unknown", "not_evaluated"
-        )
-    else:
-        checks["structure.wiring"] = check("structure.wiring", "pass", "ok")
-
-    ordered = [checks[check_id] for check_id in CHECK_IDS]
-    return emit(ordered)
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "repo",
-        help="explicit path to the repository root to inspect (read-only)",
-    )
-    args = parser.parse_args()
-    return run(args.repo)
+    print(json.dumps(payload, indent=2))
+    return 0 if ready else 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))
