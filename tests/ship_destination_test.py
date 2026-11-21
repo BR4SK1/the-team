@@ -65,6 +65,15 @@ def decide(work, *extra):
     return proc.returncode, payload
 
 
+def commit_candidate(work, path="file.txt", text="candidate\n"):
+    target = work / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    git(work, "add", path)
+    git(work, "commit", "-q", "-m", "test: candidate")
+    return git(work, "rev-parse", "HEAD")
+
+
 class ShipDestinationTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -346,6 +355,82 @@ class ShipDestinationTest(unittest.TestCase):
         rc, payload = decide(work)
         self.assertEqual(rc, 1)
         self.assertEqual(payload["reason"], "detached_head")
+
+    def test_candidate_resume_selects_exact_head(self):
+        work = make_repo(self.base, branch="feat/topic",
+                         remotes={"origin": GITHUB_URL})
+        candidate = commit_candidate(work)
+        rc, payload = decide(work, "--candidate", candidate)
+        self.assertEqual(rc, 0, payload)
+        self.assertEqual(payload["status"], "selected")
+        self.assertEqual(payload["candidate"], candidate)
+        self.assertEqual(payload["topic"], "feat/topic")
+        self.assertEqual(payload["ref"], "refs/heads/feat/topic")
+        self.assertEqual(payload["remote"], "origin")
+        self.assertTrue(payload["selection"].startswith("candidate_resume/"))
+        self.assertIsNone(payload["suggested_message"])
+
+    def test_candidate_plain_invocation_stays_staged_empty(self):
+        # A committed candidate with an empty index must never be
+        # selected for pushing by a plain (non-resume) invocation.
+        work = make_repo(self.base, branch="feat/topic",
+                         remotes={"origin": GITHUB_URL})
+        commit_candidate(work)
+        rc, payload = decide(work)
+        self.assertEqual(rc, 1)
+        self.assertEqual(payload["reason"], "staged_empty")
+        self.assertIsNone(payload["candidate"])
+
+    def test_candidate_wrong_head_blocks(self):
+        work = make_repo(self.base, branch="feat/topic",
+                         remotes={"origin": GITHUB_URL})
+        commit_candidate(work)
+        parent = git(work, "rev-parse", "HEAD^")
+        rc, payload = decide(work, "--candidate", parent)
+        self.assertEqual(rc, 1)
+        self.assertEqual(payload["reason"], "candidate_not_head")
+
+    def test_candidate_unknown_blocks(self):
+        work = make_repo(self.base, branch="feat/topic",
+                         remotes={"origin": GITHUB_URL})
+        commit_candidate(work)
+        rc, payload = decide(work, "--candidate", "f" * 40)
+        self.assertEqual(rc, 1)
+        self.assertEqual(payload["reason"], "candidate_unknown")
+
+    def test_candidate_invalid_format_blocks(self):
+        work = make_repo(self.base, branch="feat/topic",
+                         remotes={"origin": GITHUB_URL})
+        commit_candidate(work)
+        rc, payload = decide(work, "--candidate", "deadbeef")
+        self.assertEqual(rc, 1)
+        self.assertEqual(payload["reason"], "candidate_invalid")
+
+    def test_candidate_dirty_blocks(self):
+        work = make_repo(self.base, branch="feat/topic",
+                         remotes={"origin": GITHUB_URL})
+        candidate = commit_candidate(work)
+        (work / "untracked.txt").write_text("payload\n", encoding="utf-8")
+        rc, payload = decide(work, "--candidate", candidate)
+        self.assertEqual(rc, 1)
+        self.assertEqual(payload["reason"], "candidate_dirty")
+
+    def test_candidate_on_main_blocks(self):
+        work = make_repo(self.base, remotes={"origin": GITHUB_URL})
+        main_sha = git(work, "rev-parse", "HEAD")
+        rc, payload = decide(work, "--candidate", main_sha)
+        self.assertEqual(rc, 1)
+        self.assertEqual(payload["reason"], "candidate_on_main")
+
+    def test_candidate_already_in_main_blocks(self):
+        # Topic pointing at the main tip with no new commit has
+        # nothing to resume.
+        work = make_repo(self.base, branch="feat/topic",
+                         remotes={"origin": GITHUB_URL})
+        main_sha = git(work, "rev-parse", "refs/heads/main")
+        rc, payload = decide(work, "--candidate", main_sha)
+        self.assertEqual(rc, 1)
+        self.assertEqual(payload["reason"], "candidate_not_ahead")
 
     def test_helper_is_read_only_shape(self):
         text = HELPER.read_text(encoding="utf-8")

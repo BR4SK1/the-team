@@ -10,11 +10,22 @@ is verified and unambiguous, and blocks otherwise.
 
 Usage:
   ship-destination <repo> [--remote <name>] [--branch <topic>]
+                    [--candidate <full-sha>]
 
 - --remote / --branch carry explicit prior instructions only. Cal
   passes them when the user already named them; otherwise they are
   omitted and the destination is derived below. They are never
   invented here.
+- --candidate carries an explicit prior resume instruction only: the
+  full 40-hex SHA of a commit retained locally after a failed push.
+  With --candidate the checked-out topic branch must have HEAD
+  exactly at that SHA with a clean checkout (empty staged, unstaged,
+  and untracked sets), and the candidate must not already be in the
+  local main history. Only then is the destination selected, with
+  the same remote/ref/GitHub verification as a normal selection.
+  Without --candidate, a clean empty index stays a staged_empty
+  blocker even when outgoing commits exist: a plain invocation
+  never selects a bare HEAD for pushing.
 - Off main: the topic is the current branch. The remote is the
   current branch's configured upstream remote when that upstream is
   appropriate (its merge ref names the same branch), otherwise the
@@ -54,6 +65,7 @@ SCHEMA_VERSION = 1
 TOOL = "ship-destination"
 MAIN = "main"
 SAFE_BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9/_-]*$")
+FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 GITHUB_PATTERNS = (
     re.compile(r"^(?:https?|ssh)://(?:[^@/]+@)?github\.com/([^/\s]+)/([^/\s]+?)(?:\.git)?$"),
     re.compile(r"^git@github\.com:([^/\s]+)/([^/\s]+?)(?:\.git)?$"),
@@ -81,6 +93,7 @@ def base_payload():
         "outgoing_commits": [],
         "suggested_message": None,
         "selection": None,
+        "candidate": None,
         "scope": {"staged_empty": False, "unstaged": [], "untracked": []},
     }
 
@@ -140,6 +153,7 @@ def main(argv):
     rest = argv[1:]
     explicit_remote = ""
     explicit_branch = ""
+    explicit_candidate = ""
     index = 0
     while index < len(rest):
         if rest[index] == "--remote" and index + 1 < len(rest):
@@ -148,9 +162,15 @@ def main(argv):
         elif rest[index] == "--branch" and index + 1 < len(rest):
             explicit_branch = rest[index + 1]
             index += 2
+        elif rest[index] == "--candidate" and index + 1 < len(rest):
+            explicit_candidate = rest[index + 1]
+            index += 2
         else:
             payload["reason"] = "usage"
             return emit(payload, 2)
+    if explicit_candidate and not FULL_SHA.match(explicit_candidate):
+        payload["reason"] = "candidate_invalid"
+        return emit(payload, 1)
 
     repo_path = Path(repo_arg)
     if repo_path.is_symlink() or not repo_path.is_dir():
@@ -202,18 +222,60 @@ def main(argv):
         [line for line in outgoing_text.splitlines() if line] if outgoing_text else []
     )
 
+    # Explicit candidate (resume) mode: the user named one full SHA of
+    # a commit retained after a failed push. The destination may be
+    # selected only when HEAD is exactly that commit on a clean topic
+    # checkout and the commit is not already in local main history.
+    # Any mismatch blocks; HEAD is never substituted by inference.
+    # The resume script re-validates the same facts plus the prior
+    # commit receipt before anything is pushed.
+    resume_case = bool(explicit_candidate)
+    if resume_case:
+        payload["candidate"] = explicit_candidate
+        if payload["on_main"]:
+            payload["reason"] = "candidate_on_main"
+            return emit(payload, 1)
+        rc, candidate_type = git(repo, "cat-file", "-t", explicit_candidate)
+        if rc != 0 or candidate_type != "commit":
+            payload["reason"] = "candidate_unknown"
+            return emit(payload, 1)
+        rc, head_sha = git(repo, "rev-parse", "HEAD")
+        if rc != 0:
+            payload["reason"] = "indeterminate"
+            return emit(payload, 2)
+        if head_sha != explicit_candidate:
+            payload["reason"] = "candidate_not_head"
+            return emit(payload, 1)
+        if staged or unstaged or untracked:
+            payload["reason"] = "candidate_dirty"
+            return emit(payload, 1)
+        rc, main_sha = git(repo, "rev-parse", f"refs/heads/{MAIN}")
+        if rc != 0:
+            payload["reason"] = "missing_local_main"
+            return emit(payload, 1)
+        if explicit_candidate == main_sha:
+            payload["reason"] = "candidate_not_ahead"
+            return emit(payload, 1)
+        rc, _ = git(repo, "merge-base", "--is-ancestor", explicit_candidate, MAIN)
+        if rc == 0:
+            payload["reason"] = "candidate_not_ahead"
+            return emit(payload, 1)
+        if rc != 1:
+            payload["reason"] = "indeterminate"
+            return emit(payload, 2)
+
     # Empty index: blocked, but on main with work to ship the
     # blocked payload still carries a fully resolved topic proposal
     # (derived from the unstaged plus untracked paths) so the caller
     # can create/switch that branch before any staging and never
     # stage on main. Off main and clean-empty cases stay plain
     # staged_empty with no proposal.
-    staged_empty_case = not staged
+    staged_empty_case = (not staged) and not resume_case
     if staged_empty_case:
         if not payload["on_main"] or (not unstaged and not untracked):
             payload["reason"] = "staged_empty"
             return emit(payload, 1)
-    elif unstaged or untracked:
+    elif (unstaged or untracked) and not resume_case:
         payload["reason"] = "scope_unclean"
         return emit(payload, 1)
 
@@ -356,6 +418,8 @@ def main(argv):
     payload["ref"] = f"refs/heads/{topic}"
     payload["github"] = github
     payload["selection"] = f"{selection_topic}/{selection}"
+    if resume_case:
+        payload["selection"] = f"candidate_resume/{payload['selection']}"
     # No commit message is suggested here: the skill (Step 3) requires a
     # meaningful Conventional Commit crafted from the staged scope and
     # the repo Commitlint policy. The field stays null for schema

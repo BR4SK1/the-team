@@ -21,6 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 FLEET_ROOT = REPO_ROOT
 SHIP_BUILD = FLEET_ROOT / "scripts" / "ship" / "ship-build"
 SHIP_DEPLOY = FLEET_ROOT / "scripts" / "ship" / "ship-deploy"
+SHIP_RESUME = FLEET_ROOT / "scripts" / "ship" / "ship-resume"
 DOCTOR = FLEET_ROOT / "scripts" / "ship" / "ship-doctor"
 
 PASSING_PACKAGE = {
@@ -103,9 +104,22 @@ def build_fixture(base: Path, *, e2e_ok: bool = True, deploy_ok: bool = True,
                   wrong_wiring: bool = False, deploy_wrong_sha: bool = False,
                   deploy_moves_head: bool = False,
                   deploy_busy_lease: bool = False,
+                  deploy_fail_marker: bool = False,
                   isolated: bool = False,
                   isolated_image: str | None = None) -> tuple[Path, Path]:
-    """Create bare remote + working repo that passes the doctor."""
+    """Create bare remote + working repo that passes the doctor.
+
+    deploy_fail_marker: the non-prod deploy entry fails while the
+    marker file .git/fixture-fail-deploy exists and succeeds when it
+    is absent. The marker lives under .git, so toggling it never
+    dirties the worktree; resume tests use it to stage a retained
+    candidate after an initially failed pre-push gate.
+    """
+    fail_check = (
+        'if [ -f .git/fixture-fail-deploy ]; then '
+        'echo marker-deploy-failed >&2; exit 1; fi\n'
+        if deploy_fail_marker else ""
+    )
     remote = base / "remote.git"
     work = base / "work"
     work.mkdir(parents=True)
@@ -162,7 +176,9 @@ def build_fixture(base: Path, *, e2e_ok: bool = True, deploy_ok: bool = True,
     elif deploy_ok:
         write(
             work / "scripts" / "ship-deploy",
-            '#!/bin/sh\nmkdir -p .ship\nprintf "%s\\n" "$1" > .ship/deploy-sha\n'
+            '#!/bin/sh\n'
+            + fail_check +
+            'mkdir -p .ship\nprintf "%s\\n" "$1" > .ship/deploy-sha\n'
             'if [ -n "${FAKE_DOCKER_LOG:-}" ]; then printf "deploy\\n" >> "$FAKE_DOCKER_LOG"; fi\n'
             'echo "deployed $1"\n'
             'printf "SHIP_DEPLOYED_SHA=%s\\n" "$1"\n',
@@ -362,6 +378,24 @@ def run_ship_build(work: Path, *, branch: str = "ship/topic-test",
     if with_branch:
         args.extend(["--branch", branch])
     return run(args, env=env)
+
+
+def run_ship_resume(work: Path, *, sha: str, branch: str,
+                    remote: str = "origin", env=None):
+    return run([
+        str(SHIP_RESUME), str(work),
+        "--remote", remote,
+        "--ref", f"refs/heads/{branch}",
+        "--sha", sha,
+    ], env=env)
+
+
+def set_fail_marker(work: Path) -> None:
+    (work / ".git" / "fixture-fail-deploy").write_text("fail\n", encoding="utf-8")
+
+
+def clear_fail_marker(work: Path) -> None:
+    (work / ".git" / "fixture-fail-deploy").unlink(missing_ok=True)
 
 
 def remote_sha(remote: Path, ref: str) -> str:
@@ -647,6 +681,238 @@ class ShipWorkflowTest(unittest.TestCase):
         # No stdin / no commit evidence: wrapper fails before deploy.
         proc = run([str(SHIP_DEPLOY)], cwd=work, input_text="")
         self.assertNotEqual(proc.returncode, 0)
+
+    # --- Explicit resume of a retained candidate ---
+
+    def retained_candidate(self, *, branch: str, isolated: bool = False,
+                           env=None) -> tuple[Path, Path, str, Path]:
+        """Ship-build once with the deploy gate failing; the candidate
+        commit and its commit receipt are retained locally, the
+        destination branch is absent remotely."""
+        work, remote = build_fixture(
+            self.base, isolated=isolated, deploy_fail_marker=True
+        )
+        set_fail_marker(work)
+        write(work / "file.txt", "changed\n")
+        git(work, "add", "file.txt")
+        proc = run_ship_build(work, branch=branch, env=env)
+        self.assertNotEqual(proc.returncode, 0,
+                            f"stdout={proc.stdout!r} stderr={proc.stderr!r}")
+        self.assertIn("marker-deploy-failed", proc.stdout + proc.stderr)
+        candidate = git(work, "rev-parse", "HEAD")
+        self.assertEqual(remote_sha(remote, f"refs/heads/{branch}"), "")
+        self.assertEqual(git(work, "branch", "--show-current"), branch)
+        run_dir = parse_run_dir(proc.stdout, work)
+        self.assertFalse((run_dir / "deploy.json").exists())
+        return work, remote, candidate, run_dir
+
+    def test_resume_success_no_second_commit(self) -> None:
+        work, remote, candidate, run_dir = self.retained_candidate(
+            branch="ship/resume-ok"
+        )
+        parent = git(work, "rev-parse", "HEAD^")
+        tree = git(work, "rev-parse", "HEAD^{tree}")
+        receipt_before = json.loads((run_dir / "commit.json").read_text())
+        clear_fail_marker(work)
+        proc = run_ship_resume(work, sha=candidate, branch="ship/resume-ok")
+        self.assertEqual(proc.returncode, 0,
+                         f"stdout={proc.stdout!r} stderr={proc.stderr!r}")
+        self.assertIn("resumed:", proc.stdout)
+        # The same commit, same parent and tree: no second commit.
+        self.assertEqual(git(work, "rev-parse", "HEAD"), candidate)
+        self.assertEqual(git(work, "rev-parse", "HEAD^"), parent)
+        self.assertEqual(git(work, "rev-parse", "HEAD^{tree}"), tree)
+        self.assertEqual(
+            len([l for l in git(work, "log", "--oneline", "main..HEAD").splitlines() if l]),
+            1,
+        )
+        self.assertEqual(remote_sha(remote, "refs/heads/ship/resume-ok"), candidate)
+        self.assertEqual(
+            (work / ".ship" / "deploy-sha").read_text().strip(), candidate,
+        )
+        # The immutable commit receipt is unchanged; deploy evidence
+        # is fresh in the same run; the resume receipt is recorded.
+        self.assertEqual(json.loads((run_dir / "commit.json").read_text()), receipt_before)
+        deploy_receipt = json.loads((run_dir / "deploy.json").read_text())
+        self.assertEqual(deploy_receipt["sha"], candidate)
+        self.assertEqual(deploy_receipt["deployed_sha"], candidate)
+        self.assertEqual(deploy_receipt["run_id"], run_dir.name)
+        resume_receipt = json.loads((run_dir / "resume.json").read_text())
+        self.assertEqual(resume_receipt["type"], "resume")
+        self.assertEqual(resume_receipt["sha"], candidate)
+        self.assertEqual(resume_receipt["run_id"], run_dir.name)
+
+    def test_resume_gate_still_blocks(self) -> None:
+        work, remote, candidate, run_dir = self.retained_candidate(
+            branch="ship/resume-blocked"
+        )
+        # Marker still present: the resumed push's real pre-push gate
+        # fails again and uploads nothing.
+        proc = run_ship_resume(work, sha=candidate, branch="ship/resume-blocked")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("marker-deploy-failed", proc.stdout + proc.stderr)
+        self.assertEqual(remote_sha(remote, "refs/heads/ship/resume-blocked"), "")
+        self.assertEqual(git(work, "rev-parse", "HEAD"), candidate)
+        self.assertFalse((run_dir / "deploy.json").exists())
+        self.assertFalse((run_dir / "resume.json").exists())
+
+    def test_resume_wrong_sha_blocks(self) -> None:
+        work, remote, candidate, _run_dir = self.retained_candidate(
+            branch="ship/resume-wrong-sha"
+        )
+        parent = git(work, "rev-parse", "HEAD^")
+        clear_fail_marker(work)
+        proc = run_ship_resume(work, sha=parent, branch="ship/resume-wrong-sha")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("does not equal the requested candidate", proc.stdout + proc.stderr)
+        self.assertEqual(remote_sha(remote, "refs/heads/ship/resume-wrong-sha"), "")
+        self.assertEqual(git(work, "rev-parse", "HEAD"), candidate)
+
+    def test_resume_dirty_checkout_blocks(self) -> None:
+        work, remote, candidate, _run_dir = self.retained_candidate(
+            branch="ship/resume-dirty"
+        )
+        write(work / "untracked.txt", "payload\n")
+        clear_fail_marker(work)
+        proc = run_ship_resume(work, sha=candidate, branch="ship/resume-dirty")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("untracked", proc.stdout + proc.stderr)
+        self.assertEqual(remote_sha(remote, "refs/heads/ship/resume-dirty"), "")
+        self.assertEqual(git(work, "rev-parse", "HEAD"), candidate)
+        # Resume never cleans the tree.
+        self.assertTrue((work / "untracked.txt").exists())
+
+    def test_resume_wrong_remote_and_branch_block(self) -> None:
+        work, remote, candidate, _run_dir = self.retained_candidate(
+            branch="ship/resume-target"
+        )
+        other_remote = self.base / "other-remote.git"
+        run(["git", "init", "--bare", "-q", str(other_remote)], check=True)
+        git(work, "remote", "add", "other", str(other_remote))
+        clear_fail_marker(work)
+        proc = run_ship_resume(
+            work, sha=candidate, branch="ship/resume-target", remote="other"
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("prior commit evidence", proc.stdout + proc.stderr)
+        self.assertEqual(remote_sha(other_remote, "refs/heads/ship/resume-target"), "")
+        proc2 = run_ship_resume(work, sha=candidate, branch="ship/resume-other")
+        self.assertNotEqual(proc2.returncode, 0)
+        self.assertEqual(remote_sha(remote, "refs/heads/ship/resume-other"), "")
+        self.assertEqual(git(work, "rev-parse", "HEAD"), candidate)
+
+    def test_resume_ambiguous_evidence_blocks(self) -> None:
+        work, remote, candidate, run_dir = self.retained_candidate(
+            branch="ship/resume-ambiguous"
+        )
+        copy_dir = work / ".git" / "ship-runs" / "run-copy"
+        shutil.copytree(run_dir, copy_dir)
+        clear_fail_marker(work)
+        proc = run_ship_resume(work, sha=candidate, branch="ship/resume-ambiguous")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("exactly one receipt", proc.stdout + proc.stderr)
+        self.assertEqual(remote_sha(remote, "refs/heads/ship/resume-ambiguous"), "")
+        self.assertEqual(git(work, "rev-parse", "HEAD"), candidate)
+
+    def test_resume_without_prior_receipt_blocks(self) -> None:
+        work, remote = build_fixture(self.base)
+        candidate, run_dir = self.setup_candidate(work, branch="ship/topic-noreceipt")
+        shutil.rmtree(run_dir)
+        proc = run_ship_resume(work, sha=candidate, branch="ship/topic-noreceipt")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("exactly one receipt", proc.stdout + proc.stderr)
+        self.assertEqual(remote_sha(remote, "refs/heads/ship/topic-noreceipt"), "")
+        self.assertEqual(git(work, "rev-parse", "HEAD"), candidate)
+
+    def test_resume_already_uploaded_blocks(self) -> None:
+        work, remote = build_fixture(self.base)
+        write(work / "file.txt", "changed\n")
+        git(work, "add", "file.txt")
+        proc = run_ship_build(work, branch="ship/resume-uploaded")
+        self.assertEqual(proc.returncode, 0,
+                         f"stdout={proc.stdout!r} stderr={proc.stderr!r}")
+        candidate = git(work, "rev-parse", "HEAD")
+        proc2 = run_ship_resume(work, sha=candidate, branch="ship/resume-uploaded")
+        self.assertNotEqual(proc2.returncode, 0)
+        self.assertIn("already equals the candidate", proc2.stdout + proc2.stderr)
+        self.assertEqual(remote_sha(remote, "refs/heads/ship/resume-uploaded"), candidate)
+        self.assertEqual(git(work, "rev-parse", "HEAD"), candidate)
+
+    def test_resume_already_rolled_out_blocks(self) -> None:
+        work, remote = build_fixture(self.base)
+        write(work / "file.txt", "changed\n")
+        git(work, "add", "file.txt")
+        proc = run_ship_build(work, branch="ship/resume-rolled")
+        self.assertEqual(proc.returncode, 0,
+                         f"stdout={proc.stdout!r} stderr={proc.stderr!r}")
+        candidate = git(work, "rev-parse", "HEAD")
+        # The prior rollout succeeded (deploy evidence present) but
+        # the uploaded ref is gone: resume must not duplicate the
+        # rollout; the owner decides.
+        run(["git", "-C", str(remote), "update-ref", "-d",
+             "refs/heads/ship/resume-rolled"], check=True)
+        self.assertEqual(remote_sha(remote, "refs/heads/ship/resume-rolled"), "")
+        proc2 = run_ship_resume(work, sha=candidate, branch="ship/resume-rolled")
+        self.assertNotEqual(proc2.returncode, 0)
+        self.assertIn("already succeeded", proc2.stdout + proc2.stderr)
+        self.assertEqual(remote_sha(remote, "refs/heads/ship/resume-rolled"), "")
+        self.assertEqual(git(work, "rev-parse", "HEAD"), candidate)
+
+    def test_resume_advanced_remote_ref_blocks(self) -> None:
+        work, remote, candidate, _run_dir = self.retained_candidate(
+            branch="ship/resume-advanced"
+        )
+        # Push a competing commit onto the same topic branch from a
+        # second clone, so the destination ref is already advanced.
+        second = self.base / "second-clone-adv"
+        run(["git", "clone", "-q", str(remote), str(second)], check=True)
+        git(second, "config", "user.email", "fixture@example.invalid")
+        git(second, "config", "user.name", "Fixture")
+        git(second, "switch", "-c", "ship/resume-other-topic")
+        write(second / "adv.txt", "competing\n")
+        git(second, "add", "adv.txt")
+        git(second, "commit", "-q", "-m", "competing")
+        competing = git(second, "rev-parse", "HEAD")
+        git(second, "push", "-q", "origin", "HEAD:refs/heads/ship/resume-advanced")
+        self.assertEqual(
+            remote_sha(remote, "refs/heads/ship/resume-advanced"), competing
+        )
+        clear_fail_marker(work)
+        proc = run_ship_resume(work, sha=candidate, branch="ship/resume-advanced")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("already points elsewhere", proc.stdout + proc.stderr)
+        # No overwrite: the remote ref still names the competing commit.
+        self.assertEqual(
+            remote_sha(remote, "refs/heads/ship/resume-advanced"), competing
+        )
+        self.assertEqual(git(work, "rev-parse", "HEAD"), candidate)
+
+    def test_resume_isolated_regenerates_preflight(self) -> None:
+        env, log = isolated_env(self.base)
+        work, remote, candidate, run_dir = self.retained_candidate(
+            branch="ship/resume-isolated", isolated=True, env=env
+        )
+        # The failed attempt's read-only preflight was recorded.
+        self.assertTrue((run_dir / "preflight.json").exists())
+        clear_fail_marker(work)
+        proc = run_ship_resume(
+            work, sha=candidate, branch="ship/resume-isolated", env=env
+        )
+        self.assertEqual(proc.returncode, 0,
+                         f"stdout={proc.stdout!r} stderr={proc.stderr!r}")
+        self.assertIn("removed stale preflight evidence", proc.stdout)
+        self.assertEqual(git(work, "rev-parse", "HEAD"), candidate)
+        self.assertEqual(remote_sha(remote, "refs/heads/ship/resume-isolated"), candidate)
+        preflight_receipt = json.loads((run_dir / "preflight.json").read_text())
+        deploy_receipt = json.loads((run_dir / "deploy.json").read_text())
+        self.assertEqual(preflight_receipt["sha"], candidate)
+        self.assertEqual(deploy_receipt["e2e_mode"], "isolated_oci")
+        self.assertEqual(deploy_receipt["sha"], candidate)
+        log_text = log.read_text(encoding="utf-8")
+        # First attempt preflight (1 inspect), resume preflight
+        # (1 inspect), and the isolated run re-inspection (1 inspect).
+        self.assertEqual(log_text.count("docker image inspect"), 3)
+        self.assertEqual(log_text.count("docker run"), 1)
 
     # --- Isolated (digest-pinned OCI) E2E ---
 

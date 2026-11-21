@@ -5,7 +5,9 @@ non-prod deploy and E2E run, then an open GitHub PR for review. Cal
 owns authority and user decisions; Worker runs only the fleet scripts
 below. The skill is `fleet/skills/ship/SKILL.md` (ID `ship`, frontmatter
 name `Ship`, `opencode/autoinvoke: false`), invoked explicitly as
-`@ship` with no arguments (or via the skill tool by ID `ship`); no
+`@ship` with no arguments (or via the skill tool by ID `ship`), or,
+for recovery only, as the explicit `@ship resume <SHA>` form with a
+full 40-hex candidate SHA (see Resume below); no
 plugin is registered. The PR body template is
 `fleet/skills/ship/resources/PR_TEMPLATE.md`. Keep `scripts/ship/`
 together.
@@ -18,7 +20,12 @@ together.
 - `scripts/ship/ship-destination` — read-only destination selection
   (Step 2). Worker runs it with the repository path and, only when the
   user already named them in explicit prior instructions, an explicit
-  remote and branch. It inspects the configured GitHub remote identity
+  remote and branch. With an explicit `--candidate <full-40-hex-SHA>`
+  (resume only) it instead selects the destination only when HEAD is
+  exactly that candidate on a clean topic checkout; without that
+  flag a clean empty index stays a `staged_empty` blocker even with
+  outgoing commits, so a plain invocation never selects a bare HEAD.
+  It inspects the configured GitHub remote identity
   and current branch and prints versioned JSON (`selected` or
   `blocked`); a small deterministic helper is justified here because
   remote, upstream, and main-tracking resolution is easy to misread by
@@ -30,6 +37,11 @@ together.
 - `scripts/ship/ship-deploy` — fleet pre-push wrapper that runs the
   non-prod rollout and the full E2E suite for the exact outgoing SHA
   before upload (Step 4, nested in the push).
+- `scripts/ship/ship-resume` — resume recovery for an already-committed
+  candidate retained after a failed push. It pushes only the SHA the
+  user named explicitly, creates no new commit, and reruns the real
+  pre-push rollout and full E2E gates through the pinned push; it
+  requires the original commit receipt as proof (see Resume below).
 - `scripts/ship/ship-e2e-runner` — fleet-owned isolated E2E runner
   (the only supported isolated backend: a digest-pinned OCI image).
   It reads the versioned candidate contract from the candidate
@@ -43,13 +55,15 @@ together.
   `scripts/check`), wired from the still-active `.githooks/pre-commit`
   hook. Run it with `./scripts/ship/check`.
 - Ship skill invocation (`fleet/skills/ship/SKILL.md`) — loaded
-  explicitly by ID `ship` (for example `@ship` with no arguments).
-  V2 skill frontmatter cannot register a slash command, so no plugin
-  or Markdown command template registers the ship command; trailing
+  explicitly by ID `ship` (for example `@ship` with no arguments, or
+  the explicit `@ship resume <SHA>` recovery form). V2 skill
+  frontmatter cannot register a slash command, so no plugin or
+  Markdown command template registers the ship command; trailing
   input in such a template would be expanded by shell interpolation
   outside the agent permission flow. The invocation rejects trailing
-  arguments and does not switch agents: on a non-Cal session it
-  reports the wrong agent instead. No plugin file is tracked.
+  arguments beyond the plain and resume forms and does not switch
+  agents: on a non-Cal session it reports the wrong agent instead.
+  No plugin file is tracked.
 - This document and `tests/ship_doctor_test.py`,
   `tests/ship_workflow_test.py`,
   `tests/ship_destination_test.py` — the one strict opt-in standard
@@ -58,7 +72,9 @@ together.
 When the service launch environment points `OPENCODE_CONFIG_DIR` at
 `fleet/` (see README Native setup), the skill is discovered from the
 fleet root. A user loads the skill explicitly as `@ship` with no
-arguments (or via the skill tool by ID `ship`), under the same rules
+arguments (or via the skill tool by ID `ship`), or states the
+explicit resume form with a full 40-hex candidate SHA to recover a
+retained candidate (see Resume above), under the same rules
 and the same authorization contract: the invocation authorizes the
 routine workflow (staged-only, plus the single reviewed
 auto-staging in Step 2 that fills an empty index on a topic branch
@@ -568,6 +584,85 @@ at the mutation boundaries compare the parent, branch, and staged or
 candidate tree rather than file names alone, and the push names the
 pinned candidate SHA so a later `HEAD` move cannot change the upload.
 
+## Resume (explicit candidate recovery)
+
+A failed push can leave the candidate commit retained locally on the
+topic branch with the destination branch still absent. A plain `@ship`
+rerun then stops at `staged_empty` (the index is empty because the
+commit already exists) and never pushes HEAD on its own. Recovery is
+the single explicit `@ship resume <SHA>` form: the user names the
+full 40-hex candidate SHA, Cal carries it into the documented
+arguments (it is never shell-interpolated from the invocation), and
+Worker runs the resume steps in the skill (R1–R4). Resume performs
+no commit, stage, amend, rebase, checkout of the target branch,
+bypass, or force; there is no new commit, and the normal staged path
+and isolated path above are `<SHA>:<ref>`-pinned exactly as before.
+Stale evidence from another commit or run is never treated as
+success for this SHA.
+
+Worker runs:
+
+```sh
+<fleet-checkout>/scripts/ship/ship-destination <repo-path> --candidate <SHA> [--remote <remote>] [--branch <topic>]
+<fleet-checkout>/scripts/ship/ship-resume <repo-path> \
+  --remote <remote> --ref refs/heads/<topic> \
+  [--branch <topic>] --sha <SHA>
+```
+
+All of remote, ref, and SHA are required and explicit at the script
+boundary; there are no defaults. `ship-destination --candidate`
+selects only when HEAD is exactly SHA on a clean topic checkout
+(empty staged, unstaged, and untracked sets) and SHA is not already
+in local `main` history; blocks include `candidate_invalid`,
+`candidate_unknown`, `candidate_not_head`, `candidate_dirty`,
+`candidate_on_main`, `candidate_not_ahead`, and any remote/ref
+ambiguity. The selection string is `candidate_resume/...` so a
+resume decision can never be mistaken for a staged selection.
+`ship-resume` then validates, before any mutation and again at the
+push boundary: the doctor's `local_pass`, the effective Husky
+wiring (the same genuine-v9 and single-line delegation checks as
+`ship-build`), the push-config guards (`mirror`, `pushurl`,
+`tagOpt`), HEAD equals SHA on the topic branch (never `main`) with
+a clean checkout, tree and parent read back from the commit, and
+the deploy entry and package manifest tracked in the candidate
+tree. Local `main` follows the same remote-main rules as
+`ship-build`: fetch the explicit remote first, ahead or diverged
+blocks, and behind-only fast-forwards the `main` ref off-main
+without moving HEAD or changing the candidate.
+
+Proven prior attempt is required. `ship-resume` requires exactly
+one prior commit receipt (`.git/ship-runs/<run-id>/commit.json`)
+whose content matches the SHA, remote, ref, branch, parent, and
+tree; a missing, ambiguous, or mismatched receipt blocks, because
+there is no proof the retained commit was made by the reviewed
+ship commit step. The receipt is immutable and never modified.
+The fresh non-prod rollout and full E2E run inside the resumed
+push write fresh `deploy.json` (and `preflight.json` when isolated)
+beside it in the same run, and the script verifies both receipts
+by content after the push. A stale read-only preflight artifact
+that provably belongs to the same run and candidate is removed
+before the push so fresh preflight evidence is recorded; any other
+evidence (missing deploy receipt check aside) is left untouched,
+and a symlinked or mismatched artifact blocks.
+
+Three outcomes are hard stops, never retried or guessed. When the
+remote ref already equals SHA, resume reports it as already uploaded
+and claims no fresh success. When the remote ref points
+elsewhere, resume refuses to overwrite an advanced ref (no force
+is used or allowed). When deploy evidence already shows the
+non-prod rollout for SHA already succeeded, resume blocks and reports it:
+the rollout may have created immutable side effects (for example
+tags or images) that only the owner can accept duplicating, so no
+rollout is replayed. A failed push is reconciled by reading the
+remote ref exactly as `ship-build` does; the read reports what it
+shows and never proves that nothing was uploaded. The resumed
+push still races a concurrent push from another clone (the
+wrapper holds no distributed lock); `git push` itself rejects a
+non-fast-forward ref creation, and resume re-reads the ref
+immediately before pushing, but neither is a distributed lock.
+Tests prove this boundary with real Git fixtures
+(`tests/ship_workflow_test.py`, `tests/ship_destination_test.py`).
+
 ## PR (Step 5)
 
 Create or reuse a matching open GitHub PR for the topic branch and
@@ -668,7 +763,9 @@ Dispatching work to a browser or a native client (Web/native
 dispatch), and the permissions that allow it, are a separate
 capability with its own explicit authorization and permission review.
 A local pass is never reported as dispatch readiness. To ship, a user
-types `@ship` with no arguments to load the skill; the agent then
+types `@ship` with no arguments, or states the explicit
+`@ship resume <SHA>` recovery form with a full 40-hex candidate SHA,
+to load the skill; the agent then
 follows the fixed Cal-owned workflow above under the same
 authorization contract (routine staged scope, including the single
 reviewed auto-staging on topic branches and on `main` with
@@ -704,7 +801,13 @@ before rollout or before the container run, candidate contract
 invalidity, and an isolated run with a clean host PATH that
 contains no Node or package manager at all (Husky setup itself
 may still need host tooling; only the isolated E2E path is
-host-Node-free). A real local OCI run against an already-present
+host-Node-free). The resume fixtures cover a retained candidate
+after an initially failed pre-push gate with no second commit on
+successful explicit resume, a still-failing gate blocking the
+resumed push, wrong SHA, dirty checkout, wrong remote or branch,
+ambiguous or missing prior commit evidence, an advanced remote
+ref, an already-uploaded and an already-rolled-out refusal, and
+stale isolated preflight regeneration. A real local OCI run against an already-present
 digest-pinned image was also verified manually; fixtures use a
 strict fake OCI runner so no daemon, pull, or live cluster is
 needed in tests.

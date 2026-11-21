@@ -7,8 +7,8 @@ set -euo pipefail
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$repo_root"
 
-shellcheck .githooks/pre-commit scripts/ship/check scripts/ship/ship-build scripts/ship/ship-deploy scripts/ship/ship-e2e-runner
-bash -n .githooks/pre-commit scripts/ship/check scripts/ship/ship-build scripts/ship/ship-deploy scripts/ship/ship-e2e-runner
+shellcheck .githooks/pre-commit scripts/ship/check scripts/ship/ship-build scripts/ship/ship-deploy scripts/ship/ship-resume scripts/ship/ship-e2e-runner
+bash -n .githooks/pre-commit scripts/ship/check scripts/ship/ship-build scripts/ship/ship-deploy scripts/ship/ship-resume scripts/ship/ship-e2e-runner
 
 python3 -m unittest discover -s tests -p "*_test.py"
 
@@ -275,6 +275,9 @@ for required in (
     "staged_empty",
     "never emits a raw remote URL",
     "No commit message is suggested",
+    "--candidate",
+    "candidate_not_head",
+    "candidate_resume",
 ):
     if required not in ship_destination_source:
         raise ValueError(
@@ -301,8 +304,7 @@ ship_frontmatter = ship_skill_text[4:].split("\n---\n", 1)[0]
 for required in (
     "name: Ship",
     "opencode/autoinvoke: false",
-    "Step 1 - Run the ship-doctor script",
-    "Step 2 - Validate the state of the current environment",
+    "Step 1 - Run the ship-doctor script",    "Step 2 - Validate the state of the current environment",
     "Step 3 - Run the ship-build script",
     "Step 4 - Run the ship-deploy script",
     "Step 5 - Create a PR",
@@ -350,6 +352,14 @@ for required in (
     "preflight",
     "check, deploy, run",
     ".ship/e2e-runner.json",
+    "@ship resume",
+    "full 40-hex",
+    "scripts/ship/ship-resume",
+    "--candidate",
+    "prior commit receipt",
+    "no new commit",
+    "already succeeded",
+    "candidate_resume",
 ):
     if required not in ship_skill_text:
         raise ValueError(f"{ship_skill}: missing required phrase {required!r}")
@@ -396,6 +406,7 @@ for stale in ("fleet/plugins/ship.ts", "fleet.ship"):
 for script_name, required_snippets in (
     ("scripts/ship/ship-build", ("--remote", "--ref", "--message", "diff --cached", "ls-remote", "ship-e2e-runner", "e2e_mode")),
     ("scripts/ship/ship-deploy", ("scripts/ship-deploy", "test:e2e", "commit.json", "ship-e2e-runner", "preflight", "e2e_mode", "isolated_oci", "legacy_host")),
+    ("scripts/ship/ship-resume", ("--remote", "--ref", "--sha", "$SHA:$REF", "commit.json", "deploy.json", "preflight.json", "resume.json", "ship-e2e-runner", "e2e_mode")),
     ("scripts/ship/ship-e2e-runner", ("preflight", "image inspect", "--pull never", "test:e2e", ".ship/e2e-runner.json")),
 ):
     script_path = Path(script_name)
@@ -415,6 +426,36 @@ for line in ship_build_text.splitlines():
     if "git -C" in line and " push " in line and "$candidate:$REF" not in line:
         raise ValueError(
             "scripts/ship/ship-build: push must be $candidate:$REF, never a bare ref or HEAD:<ref>"
+        )
+# Ship resume is recovery only: it must push the pinned $SHA:$REF and
+# must never create, stage, move, or rewrite history, nor use force or
+# bypass flags. A plain @ship stays staged_empty (see the
+# destination helper), so resume is the only script that may push an
+# already-committed HEAD, and only for the named SHA.
+ship_resume_text = Path("scripts/ship/ship-resume").read_text(encoding="utf-8")
+for line in ship_resume_text.splitlines():
+    if "git -C" in line and " push " in line and "$SHA:$REF" not in line:
+        raise ValueError(
+            "scripts/ship/ship-resume: push must be $SHA:$REF, never a bare ref or HEAD:<ref>"
+        )
+    if "git -C" in line:
+        for mutating in (" commit ", " add ", " checkout ", " switch ",
+                         " amend", " rebase ", " reset ", " restore ",
+                         " stash ", " clean "):
+            if mutating in line:
+                raise ValueError(
+                    "scripts/ship/ship-resume: resume must never use a "
+                    f"mutating Git invocation {mutating.strip()!r} "
+                    f"(line: {line.strip()!r})"
+                )
+    if "git -C" in line and "--no-verify" in line:
+        raise ValueError(
+            "scripts/ship/ship-resume: must never pass --no-verify to a Git command"
+        )
+for banned in ("--force", "git commit"):
+    if banned in ship_resume_text:
+        raise ValueError(
+            f"scripts/ship/ship-resume: banned mechanism {banned!r}"
         )
 
 # The ship standard document must state the one strict opt-in
@@ -488,6 +529,13 @@ for required in (
     ".ship/e2e-runner.json",
     "e2e.runner_contract",
     "no implicit pull",
+    "@ship resume",
+    "scripts/ship/ship-resume",
+    "--candidate",
+    "prior commit receipt",
+    "no new commit",
+    "already succeeded",
+    "already uploaded",
 ):
     if required not in ship_doc_text:
         raise ValueError(f"{ship_doc}: missing required phrase {required!r}")
